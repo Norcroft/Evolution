@@ -2,12 +2,13 @@
  * cse.h: Common sub-expression elimination
  * Copyright (C) Acorn Computers Ltd., 1988-1990.
  * Copyright (C) Advanced RISC Machines Limited, 1991-92.
+ * SPDX-Licence-Identifier: Apache-2.0
  */
 
 /*
- * RCS $Revision: 1.4 $
- * Checkin $Date: 1993/10/07 17:25:30 $
- * Revising $Author: irickard $
+ * RCS $Revision$
+ * Checkin $Date$
+ * Revising $Author$
  */
 
 /*

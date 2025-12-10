@@ -1,6 +1,7 @@
 /*
  * Tool to translate between ANSI and pcc-style function headers.
  * Copyright (C) Acorn Computers, 1988, 1989.
+ * SPDX-Licence-Identifier: Apache-2.0
  */
 
 #include <stdio.h>
@@ -93,7 +94,7 @@ static int getch(int last_ch)
  */
   if (line_no != 0) {
     if (lookaside)
-      *lookaside++ = last_ch; 
+      *lookaside++ = last_ch;
     else {
       if (last_ch == '\n')  {
         copied_line_len = 0;
@@ -175,7 +176,7 @@ static int get_tokch(int ch)
       }
     }
     else ch = skip_blanks(ch);
-    /* 
+    /*
      * skip comments
      */
     if (ch == '/') {
@@ -451,7 +452,7 @@ static void rewrite_fn_defn(void)
   int j, width;
   char *decl, *s;
   char buf[ID_MAX];
-  
+
   if (narg_ids == 0) fprintf(out_file, "void)\n");
   width = copied_line_len;
   for (j = 0;  j < narg_ids; ++j) {

@@ -3,17 +3,18 @@
  * C compiler file dbx.c, version 5
  * Copyright (C) Acorn Computers Ltd., 1988.
  * Copyright (C) Codemist Ltd., 1988.
+ * SPDX-Licence-Identifier: Apache-2.0
  */
 
 /*
- * RCS $Revision: 1.6 $
- * Checkin $Date: 1994/10/17 11:34:48 $
- * Revising $Author: hmeekings $
+ * RCS $Revision$
+ * Checkin $Date$
+ * Revising $Author$
  */
 
 #ifndef NO_VERSION_STRINGS
 extern char dbx_version[];
-char dbx_version[] = "\ndbx.c $Revision: 1.6 $ 5\n";
+char dbx_version[] = "\ndbx.c $Revision$ 5\n";
 #endif
 
 /* This file contains routines to buffer information required for         */
@@ -62,8 +63,17 @@ char dbx_version[] = "\ndbx.c $Revision: 1.6 $ 5\n";
 #include "feext.h"     /* syn_equivcheck */
 #endif
 
-#ifndef __STDC__
+#if !defined(__STDC__) || (defined(__sparc) && defined(P_tmpdir) && \
+                           !defined(__svr4__)) && !defined(__cplusplus)
 #  define sprintf ansi_sprintf
+static int sprintf(char *buf,const char *format,...)
+{
+  va_list ap;
+  va_start(ap, format);
+  vsprintf(buf, format, ap);
+  va_end(ap);
+  return strlen(buf);
+}
 #endif
 
 #ifdef TARGET_HAS_DEBUGGER
@@ -854,7 +864,7 @@ case bitofstg_(s_auto):
                  * later definition taking precedence in dbx.
                  */
                 dbg_addvar_t(name, loc->typerep, loc->pos,
-                             CLASS_PARAM, local_fpaddress(addr));
+                             CLASS_PARAM, local_fpaddress(b));
                 loc->pos += (1L << 22); /* one char later... */
             }
             dbxclass = CLASS_REG;
@@ -869,11 +879,11 @@ case bitofstg_(s_auto):
 #else
                 dbxclass = CLASS_PARAM;
 #endif
-                addr = local_fpaddress(addr);
+                addr = local_fpaddress(b);
                 break;
             case BINDADDR_LOC:
                 dbxclass = CLASS_AUTO;
-                addr = local_fpaddress(addr);
+                addr = local_fpaddress(b);
                 break;
             default:
                 goto defolt;
@@ -939,8 +949,11 @@ bool dbg_scope(BindListList *newbll, BindListList *oldbll)
     return YES;
 }
 
-void dbg_proc(Symstr *name, TypeExpr *t, bool ext, FileLine fl)
+void dbg_proc(Binder *b, TagBinder *parent, bool ext, FileLine fl)
 {
+    Symstr *name = bindsym_(b);
+    TypeExpr *t = princtype(bindtype_(b));
+
     if (debugging(DEBUG_Q)) cc_msg("-- proc(%s)\n", symname_(name));
     if (usrdbg(DBG_ANY))
     {   DbgList *p = (DbgList*)DbgAlloc(DbgListVarSize(DEB_PROC));
@@ -1189,3 +1202,13 @@ void dbg_init()
 #endif /* TARGET_HAS_DEBUGGER */
 
 /* End of section dbx.c */
+
+bool dbg_needsframepointer(void) { return TRUE; }
+
+void dbg_finalise(void) {}
+
+void dbg_setformat(int format) {}
+
+void dbg_final_src_codeaddr(int32 a, int32 b) {
+    IGNORE(a); IGNORE(b);
+}

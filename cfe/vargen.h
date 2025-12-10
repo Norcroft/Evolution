@@ -2,12 +2,13 @@
  * cfe/vargen.h:
  * Copyright (C) Acorn Computers Ltd., 1988
  * Copyright (C) Codemist Ltd., 1988.
+ * SPDX-Licence-Identifier: Apache-2.0
  */
 
 /*
- * RCS $Revision: 1.15 $ Codemist 4
- * Checkin $Date: 1995/09/18 14:46:49 $
- * Revising $Author: enevill $
+ * RCS $Revision$ Codemist 4
+ * Checkin $Date$
+ * Revising $Author$
  */
 
 #ifndef _vargen_h
@@ -17,6 +18,7 @@
 #  include "defs.h"
 #endif
 
+#if !defined(CALLABLE_COMPILER)
 /*
  * ****** NASTY EXPORT - RECONSIDER ******
  * Should be static except for initstaticvar(datasegment) in compiler.c
@@ -35,9 +37,17 @@ extern Expr *genstaticparts(DeclRhsList * const d, bool topflag,
         bool dummy_call, Expr *dyninit);
 /* @@@ since the 'const' isn't part of the function type in the line    */
 /* @@@ above, AM wonders why it has been added.  C++ namemunge oddity!  */
+#else
+#define initstaticvar(b,f)              ((void)0)
+#define genstaticparts(d,f,dc,e)        ((Expr *)0)
+#endif
 
-#if defined CPLUSPLUS && !defined TARGET_IS_INTERPRETER
-
+#ifdef CALLABLE_COMPILER
+#define vg_generate_deferred_const(a)   ((void)(a))
+#else
+extern void vg_generate_deferred_const(Binder *);
+#endif
+#if (defined(CPLUSPLUS) && !defined(CALLABLE_COMPILER))
 extern void vg_note_vtable(TagBinder *cl, int32 sz, Symstr *name);
 extern Binder *generate_wrapper(Binder *a);
 extern TopDecl *vg_dynamic_init(void);
@@ -45,17 +55,13 @@ extern void vg_ref_dynamic_init(void);
 extern void vargen_init(void);
 extern int32 ddtor_vecsize(void);
 #else
-
-#ifdef TARGET_IS_INTERPRETER
-#define generate_wrapper(a) ((a),0)
-#define vg_generate_deferred_const(a) ((void)(a))
-#endif
-#define vg_note_vtable(cl, sz, name) 0
-#define vg_dynamic_init() 0
-#define vg_ref_dynamic_init() 0
-#define vargen_init() 0
-#define vg_currentdecl_inits 0
-#define ddtor_vecsize() 0
+#define generate_wrapper(a)             ((void)(a), (Binder *)0)
+#define vg_note_vtable(cl,sz,name)      ((void)0)
+#define vg_dynamic_init()               ((TopDecl *)0)
+#define vg_ref_dynamic_init()           ((void)0)
+#define vargen_init()                   ((void)0)
+#define vg_currentdecl_inits            0
+#define ddtor_vecsize()                 ((int32)0)
 #endif
 
 #endif

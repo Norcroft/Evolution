@@ -3,12 +3,13 @@
  * Copyright (C) Codemist Ltd, 1988-1992.
  * Copyright (C) Acorn Computers Ltd., 1988-1990.
  * Copyright (C) Advanced RISC Machines Limited, 1991-1992.
+ * SPDX-Licence-Identifier: Apache-2.0
  */
 
 /*
- * RCS $Revision: 1.83 $  Codemist 46
- * Checkin $Date: 1996/01/10 14:53:58 $
- * Revising $Author: hmeeking $
+ * RCS $Revision$  Codemist 46
+ * Checkin $Date$
+ * Revising $Author$
  */
 
 /* AM memo: for C++ soon suppress static const's until first &taken.        */
@@ -52,11 +53,18 @@
 #include "aeops.h"
 #include "util.h"      /* for padsize */
 #include "xrefs.h"
+#include "inline.h"
 #include "errors.h"
-/* and cor C-only compiler... */
-#define vg_note_topdtor(b, topflag) 0
+
+#include "dump.h"
+
+/* and for C-only compiler... */
+#define vg_note_topdtor(b, topflag) (void)0
 #define vg_get_dyninit(topflag) 0
-#define dynamic_init(init, fl) 0
+#define dynamic_init(init, fl) (void)0
+#define Vargen_cpp_LoadState(f) (void)0
+#define Vargen_cpp_DumpState(f) (void)0
+
 #endif /*_VARGEN_H */
 
 static FileLine init_fl;        /* @@@ not always set just before use! */
@@ -76,11 +84,7 @@ static void vg_acton_globreg(DeclRhsList *d, Binder *b)
     TypeExpr *t = princtype(bindtype_(b));
     int32 rno = declstgval_(d) >> 1;
 #ifndef TARGET_SHARES_INTEGER_AND_FP_REGISTERS
-    if (declstgval_(d) & 1
-#ifdef SOFTWARE_FLOATING_POINT
-                && !software_floating_point_enabled
-#endif
-       )
+    if (declstgval_(d) & 1)
     {
         if (rno <= 0 || rno > MAXGLOBFLTREG)
             cc_err(vargen_err_overlarge_reg);
@@ -96,18 +100,12 @@ static void vg_acton_globreg(DeclRhsList *d, Binder *b)
 #endif
     {
         {
-
-#ifdef TARGET_IS_MIPS
-            if (18 <= rno && rno <= 23)
-                reg = R_V1+rno-16;
-#else
             if (0 < rno && rno <= MAXGLOBINTREG)
                 reg = R_V1+rno-1;
 #ifdef TARGET_IS_AIH324
 /* Prefered form, also prepares for use of a0...d31 etc.                */
             else if (160 <= rno && rno < 160+32)
                 reg = R_V1 + rno - 160;
-#endif
 #endif
             else
                 cc_err(vargen_err_overlarge_reg);
@@ -123,17 +121,9 @@ static void vg_acton_globreg(DeclRhsList *d, Binder *b)
                                         bitoftype_(s_int) |
                                         bitoftype_(s_enum) ))
                     break;
-#ifdef SOFTWARE_FLOATING_POINT
-                if (software_floating_point_enabled &&
-                      typespecmap_(t) & bitoftype_(s_double) &&
-                      typespecmap_(t) & bitoftype_(s_short))
-                    break;
-#endif
                 /* no one_word structs, unions - cg isn't up to the
                    notion that they might be in registers (?) */
                 /* @@@AM: it ought to be! */
-                /* AM: However, it does fail on non-one-word structs but */
-                /* structs/unions with mcrepof = 0x00000004 should be OK */
             default:
                 cc_err(vargen_err_not_int);
                 reg = GAP;
@@ -148,8 +138,8 @@ static void vg_acton_globreg(DeclRhsList *d, Binder *b)
             cc_rerr(bind_err_conflicting_globalreg, b);
         bindxx_(b) = reg;
         globalregistervariable(reg);
+        asm_setregname(reg, symname_(bindsym_(b)));
     }
-    else bindstg_(b) = bitofstg_(s_extern) | b_undef;
 }
 
 static Expr *reduce(Expr *e, Binder *whole)
@@ -178,7 +168,7 @@ static Expr *rdinit(TypeExpr *t, Binder *whole, int32 flag)
     else
     {
 /* The code for C and C++ has diverged -- share the above code soon.    */
-      e = syn_rdinit(t, 0, flag);
+      e = syn_rdinit(t, whole, flag|8);
       if (e) e = optimise0(e);
     }
     if (e && h0_(e) == s_error) e = 0;
@@ -262,6 +252,26 @@ static int32 int_of_init(Expr *init)
     return ival;
 }
 
+static Int64Con *int64_of_init(Expr *init)
+{   static Int64Con zero = {
+      s_int64con,
+      bitoftype_(s_short)|bitoftype_(s_long)|bitoftype_(s_int),
+      { 0, 0}
+    };
+    Int64Con *fval = &zero;
+    if (init != 0)
+    {   if (h0_(init) == s_int64con)
+            fval = (Int64Con *)init;
+        else if (LanguageIsCPlusPlus)
+            dynamic_init(init, 0);
+        else
+            moan_nonconst(init, moan_static_int_type_nonconst,
+                          moan_static_int_type_nonconst1,
+                          moan_static_int_type_nonconst2);
+    }
+    return fval;
+}
+
 static FloatCon *float_of_init(Expr *init)
 {   FloatCon *fval = fc_zero.d;
     if (init != 0)
@@ -287,10 +297,13 @@ static String *string_of_init(Expr *init, bool wide)
 }
 
 static int32 rd_bitinit(TypeExpr *t, int32 size)
-{  t = unbitfield_type(t);
+{   t = unbitfield_type(t);
 /* Apr 92: for type-safe enums, now use 't' instead of prev. te_int     */
 /* The current version of unbitbields returns te_int/enum type.         */
-    return int_of_init(rdinit(t, 0, 0))  &  (((unsigned32)1 << size)-1);
+    {   int32 i = int_of_init(rdinit(t, 0, 0));
+        if (size < 32) i &= ((unsigned32)1 << size)-1;
+        return i;
+    }
 /* One day it might be nice to compare the value read with size...      */
 }
 
@@ -329,6 +342,8 @@ static void genpointer(Expr *einit)
             if (h0_(y) != s_binder)
                 syserr(syserr_genpointer, (long)h0_(y));
             b = (Binder *)y;
+            if (bindstg_(b) & b_fnconst)
+                Inline_RealUse(b);
             if ((bindstg_(b) & (bitofstg_(s_static) | u_loctype))
                  == bitofstg_(s_static))
             {   /* now statics may be local (and hence use datasegment
@@ -346,7 +361,7 @@ static void genpointer(Expr *einit)
 #ifdef CONST_DATA_IN_CODE
                 gendcA(
                     (bindstg_(b) & u_constdata) ? bindsym_(constdatasegment) :
-                        bindsym_(bsssegment),
+                                                  bindsym_(bsssegment),
                             bindaddr_(b)+offset, 0);
 #else
                 gendcA(bindsym_(bsssegment), bindaddr_(b)+offset, 0);
@@ -384,7 +399,7 @@ static void genpointer(Expr *einit)
                *  will be sought out again and updated.
                */
               gendcA(bindsym_(datasegment), offset, 0);  /* dataseg relative */
-              str_lits = (struct StrLit *) syn_list3(str_lits, datap->tail, x);
+              str_lits = (struct StrLit *) syn_list3(str_lits, get_datadesc_ht(NO), x);
 /*
  * Here is the reason that (as a temporary hack?) I make gendcA only generate
  * 4 bytes if sizeof_ptr == 8 and target_lsbytefirst.  It is because the fudge
@@ -444,13 +459,9 @@ static void genpointer(Expr *einit)
 static void initbitfield(unsigned32 bfval, int32 bfsize, bool pad_to_int)
 {
     int32 j;
-    /* one day AM will extend this code to deal with long bit fields,   */
-    /* e.g. a la mips.                                                  */
-    if (!(feature & FEATURE_PCC))
-    {   padstatic(alignof_int);
-        gendcI(sizeof_int, bfval);
-        return;
-    }
+    /* Bitfield initialisers may start on any container boundary, so    */
+    /* (except in strict ANSI mode) they aren't necessarily int-aligned */
+    /* nor int-sized                                                    */
     bfsize = (bfsize + 7) & ~7;
     if (debugging(DEBUG_DATA))
         cc_msg("initbitfield(%.8lx, %lu, %i)\n", bfval, bfsize, pad_to_int);
@@ -487,6 +498,16 @@ case s_typespec:
                         /* these are all supposedly done as part of the
                          * enclosing struct or union.
                          */
+                    if (int_islonglong_(m)) {
+
+                        if (einit == 0 && syn_canrdinit())
+                            einit = rdinit(t,whole,0);
+                        {   Int64Con *ic = int64_of_init(einit);
+                            gendcI_a(sizeof_long, ((int32 *)&ic->bin.i)[0], aligned);
+                            gendcI_a(sizeof_long, ((int32 *)&ic->bin.i)[1], aligned);
+                        }
+                        break;
+                    }
 #ifndef REVIEW_AND_REMOVE     /* in by default */
 /*    This code to be reviewed now that the front end reduces some
       such expressions to integers.  AM and ??? to discuss.
@@ -561,22 +582,18 @@ case s_typespec:
                                 }
                             }
                             if (woffset < memwoff_(l))
-                            {   initbitfield(bfval, bfsize, 1);
+                            {   initbitfield(bfval, bfsize, 0);
                                 bfsize = bfval = 0;
                                 woffset = memwoff_(l);
                             }
                             /* accumulate bitfield in bfval */
                             {   int32 leftshift = memboff_(l);
-                                if (!target_lsbitfirst)
-                                    leftshift = MAXBITSIZE - k - leftshift;
                                 if (woffset != memwoff_(l))
-                                {   if (target_lsbytefirst)
-                                        leftshift -= (woffset-memwoff_(l))*8;
-                                    else
-                                        leftshift += (woffset-memwoff_(l))*8;
-                                }
+                                    leftshift -= (woffset-memwoff_(l))*8;
                                 if ((leftshift + k) > bfsize)
                                     bfsize = leftshift + k;
+                                if (!target_lsbitfirst)
+                                    leftshift = MAXBITSIZE - k - leftshift;
                                 /* ANSI 3rd draft says unnamed bitfields */
                                 /* never consume initialisers.           */
                                 /* (even for unions)                     */
@@ -586,8 +603,10 @@ case s_typespec:
                             }
                         }
                         else
-                        {   if (bfsize)
-                            {   initbitfield(bfval, bfsize, 0);
+                        {   if (bfsize != 0)
+                            {   int32 align = memwoff_(l) & -memwoff_(l);
+                                initbitfield(bfval, bfsize, 0);
+                                padstatic(align > alignof_int ? alignof_int : align);
                                 bfsize = bfval = 0;
                             }
                             if (!(tagbindbits_(b) & TB_UNALIGNED))
@@ -629,12 +648,20 @@ case s_typespec:
                     break;
             }
             break;
+case t_unknown:
+    /* stash it away */
+    {   Expr *e = (einit == 0 && syn_canrdinit()) ? rdinit(t, whole, 0) : einit;
+        if (whole)
+            bindconst_(whole) = e;
+        break;
+    }
 case t_fnap:  /* spotted earlier */
 default:
         syserr(syserr_initstatic1, (long)h0_(t));
 case t_subscript:
         {   int32 note = syn_begin_agg();          /* skips and notes if '{' */
-            int32 i, m = typesubsize_(t) ? evaluate(typesubsize_(t)):0xffffff;
+            int32 i, m = (typesubsize_(t) && h0_(typesubsize_(t)) != s_binder) ?
+                evaluate(typesubsize_(t)):0xffffff;
             TypeExpr *t2;
             if (m == 0)
             {   syn_end_agg(note);
@@ -646,7 +673,7 @@ case t_subscript:
 /* ensures (by copying types if necessary) that this does not clobber      */
 /* a typedef in things like: typedef int a[]; a b = {1,2};                 */
             if (!syn_canrdinit())
-            {   if (typesubsize_(t) == 0)
+            {   if (typesubsize_(t) == 0 || h0_(typesubsize_(t)) == s_binder)
                     cc_err(vargen_err_open_array);
             }
             else if (t2 = princtype(typearg_(t)), isprimtype_(t2,s_char))
@@ -655,7 +682,7 @@ case t_subscript:
                 {   int32 k = genstring(s, m);
                     if (s != string_of_init(rdinit(0,0,0), 0))
                         syserr("vargen(string-peep)");
-                    if (typesubsize_(t) == 0)
+                    if (typesubsize_(t) == 0 || h0_(typesubsize_(t)) == s_binder )
                         typesubsize_(t) = globalize_int(k);
                     syn_end_agg(note);
                     break;
@@ -666,15 +693,15 @@ case t_subscript:
 /* wchar_t.  This needs to be improved if wchar_t can be some sort of   */
 /* char. */
             else if (h0_(t2) == s_typespec && (typespecmap_(t2) &
-                              (bitoftype_(s_int)|bitoftype_(s_long)|
-                               bitoftype_(s_short)|bitoftype_(s_unsigned))) ==
-                           typespecmap_(te_wchar))
+                            (bitoftype_(s_int)|bitoftype_(s_long)|
+                             bitoftype_(s_short)|bitoftype_(s_unsigned)))
+                            == typespecmap_(te_wchar))
             {   String *s = string_of_init(rdinit(0,0,1), 1);
                 if (s)
                 {   int32 k = genstring(s, m);
                     if (s != string_of_init(rdinit(0,0,0), 1))
                         syserr("vargen(string-peep)");
-                    if (typesubsize_(t) == 0)
+                    if (typesubsize_(t) == 0 || h0_(typesubsize_(t)) == s_binder)
                         typesubsize_(t) = globalize_int(k);
                     syn_end_agg(note);
                     break;
@@ -685,7 +712,7 @@ case t_subscript:
 #define vg_init_to_null(t) (TARGET_NULL_BITPATTERN == 0)
             for (i = 0; i < m; i++)
             {   if (!syn_canrdinit())
-                {   if (typesubsize_(t) == 0)
+                {   if (typesubsize_(t) == 0 || h0_(typesubsize_(t)) == s_binder)
                     {   typesubsize_(t) = globalize_int(i);
                         break;  /* set size to number of elements read. */
                     }
@@ -713,38 +740,52 @@ case t_ref:
     }
 }
 
-static void initstaticvar_1(Binder *b, bool topflag, Expr *einit)
+static void initstaticvar_1(
+    Binder *b, bool topflag, TentativeDefn *tentative, Expr *einit)
 {
-    DataInit *oldtail;
     TypeExpr *btype = bindtype_(b);
+    bool changingtoconst = LanguageIsCPlusPlus && !is_constdata()
+                           && (qualifiersoftype(btype) & bitoftype_(s_const));
+    DataInit *oldtail;
     int32 oldsize;
-    DataXref *oldxrefs = datap->xrefs;
+    DataXref *oldxrefs;
 
+    if (tentative != NULL) {
+        if (changingtoconst) {
+            DataAreaSort da = SetDataArea(DS_Const);
+            save_vargen_state(tentative);
+            SetDataArea(da);
+        } else
+            save_vargen_state(tentative);
+    }
     if (debugging(DEBUG_DATA))
-        cc_msg("%.6lx: %s%s (%s)\n", (long)datap->size, topflag ? "" : "; ",
+        cc_msg("%.6lx: %s%s (%s)\n", (long)get_datadesc_size(), topflag ? "" : "; ",
                symname_(bindsym_(b)),
 #ifdef CONST_DATA_IN_CODE
-               (datap == &constdata) ? "constdata" :
+               (is_constdata()) ? "constdata" :
 #endif
                "data");
-    if (b != datasegment)
-        padstatic(alignoftype(btype));
+    if (b != datasegment) padstatic(alignoftype(btype));
 
 /* ECN: Defer setting of oldtail & oldsize until after we have done padstatic
  *      because padstatic applies to the original datap so if we switch to
  *      datap = &constdata we will need to apply padstatic again and not simply
  *      reuse the old padding as this may be wrong for constdata.
  */
-    oldtail = datap->tail;
-    oldsize = datap->size;
-    bindaddr_(b) = datap->size;
+    if (changingtoconst) {
+        labeldata(NULL);
+        oldtail = get_datadesc_ht(NO);
+        oldsize = get_datadesc_size();
+        oldxrefs = get_datadesc_xrefs();
+    }
+    bindaddr_(b) = get_datadesc_size();
     if (topflag) /* note: names of local statics may clash but cannot be
                     forward refs (except for fns which don't come here) */
     {   labeldata(bindsym_(b));
         (void)obj_symref(bindsym_(b),
                 bindstg_(b) & bitofstg_(s_extern) ?
-                datap->xrarea+xr_defext : datap->xrarea+xr_defloc,
-                datap->size);
+                get_datadesc_xrarea()+xr_defext : get_datadesc_xrarea()+xr_defloc,
+                get_datadesc_size());
     }
     if (b == datasegment) return;      /* not really tidy */
     {
@@ -755,7 +796,8 @@ static void initstaticvar_1(Binder *b, bool topflag, Expr *einit)
      */
         if (isprimtype_(btype, s_typedefname))
         {   TypeExpr *t = prunetype(btype);
-            if (h0_(t)==t_subscript && typesubsize_(t) == 0)
+            if (h0_(t)==t_subscript &&
+                (typesubsize_(t) == 0 || h0_(typesubsize_(t)) == s_binder))
             /* the next line is idle, since case is rare...             */
             /* (We must alloc. glob store since b maybe top level       */
             /*  and hence its type will already be globalised, but      */
@@ -784,43 +826,45 @@ static void initstaticvar_1(Binder *b, bool topflag, Expr *einit)
         }
     }
 #ifdef CONST_DATA_IN_CODE
-    if (LanguageIsCPlusPlus && datap != &constdata
-        && (qualifiersoftype(btype) & bitoftype_(s_const))
-        && !vg_currentdecl_inits)
-    {   DataInit *newtail = datap->tail, *newinits;
+    if (changingtoconst && vg_currentdecl_inits == NULL)
+    {   DataInit *newtail, *newinits;
+        labeldata(NULL);
+        newtail = get_datadesc_ht(NO);
         if (oldtail != NULL)
         {   newinits = oldtail->datacdr;
-            oldtail->datacdr = 0;
-            datap->tail = oldtail;
+            oldtail->datacdr = NULL;
+            set_datadesc_ht(NO, oldtail);
         }
         else
-        {   newinits = datap->head;
-            datap->head = datap->tail = 0;
+        {   newinits = get_datadesc_ht(YES);
+            set_datadesc_ht(YES, NULL);
+            set_datadesc_ht(NO, NULL);
         }
-        datap = &constdata;
+        SetDataArea(DS_Const);
         padstatic(alignoftype(btype));
-        bindaddr_(b) = constdata.size;
+        labeldata(NULL);
+        bindaddr_(b) = get_datadesc_size();     /* constdata.size */
         /* the following lines are a hack but reused store allocated and
            fewer things to unhook */
         if (topflag)
         {   symext_(bindsym_(b))->extflags = 0;
             (void)obj_symref(bindsym_(b),
                 bindstg_(b) & bitofstg_(s_extern) ?
-                constdata.xrarea+xr_defext : constdata.xrarea+xr_defloc,
-                constdata.size);
+                get_datadesc_xrarea()+xr_defext : get_datadesc_xrarea()+xr_defloc,
+                get_datadesc_size());
         }
 
         if (newinits != NULL)
-        {   if (constdata.head == NULL)
-                constdata.head = newinits;
+        {   if (get_datadesc_ht(YES) == NULL)
+                set_datadesc_ht(YES, newinits);
             else
-                constdata.tail->datacdr = newinits;
-            constdata.tail = newtail;
+                get_datadesc_ht(NO)->datacdr = newinits;
+            set_datadesc_ht(NO, newtail);
         }
         /* Assert: (data.xrefs == NULL) -> (data.xrefs == oldxrefs) */
-        if (data.xrefs != oldxrefs)
-        {   DataXref *xref = data.xrefs;
-            int32 roffdelta = constdata.size - oldsize;
+        if (data_xrefs() != oldxrefs)
+        {   DataXref *xref = data_xrefs();
+            int32 roffdelta = constdata_size() - oldsize;
             while (xref != NULL)
             {   xref->dataxroff += roffdelta;
                 if (xref->dataxrcdr == oldxrefs)
@@ -828,14 +872,14 @@ static void initstaticvar_1(Binder *b, bool topflag, Expr *einit)
                 xref = xref->dataxrcdr;
             }
             if (xref == NULL) syserr("can't find oldxref");
-            xref->dataxrcdr = constdata.xrefs;
-            constdata.xrefs = data.xrefs;
-            data.xrefs = oldxrefs;
+            xref->dataxrcdr = constdata_xrefs();
+            set_datadesc_xrefs(data_xrefs());
+            SetDataArea(DS_ReadWrite); set_datadesc_xrefs(oldxrefs); SetDataArea(DS_Const);
         }
         if (debugging(DEBUG_DATA))
-            cc_msg("        moved to const data %.6lx\n", (long)constdata.size);
-        constdata.size += data.size - oldsize;
-        data.size = oldsize;
+            cc_msg("        moved to const data %.6lx\n", (long)constdata_size());
+        set_datadesc_size(constdata_size() + data_size() - oldsize);
+        SetDataArea(DS_ReadWrite); set_datadesc_size(oldsize); SetDataArea(DS_Const);
         bindstg_(b) |= u_constdata;
         bindstg_(b) |= b_generated;
     }
@@ -845,7 +889,7 @@ static void initstaticvar_1(Binder *b, bool topflag, Expr *einit)
 
 /* Should be static except for initstaticvar(datasegment) in compiler.c */
 void initstaticvar(Binder *b, bool topflag)
-{   initstaticvar_1(b, topflag, 0);
+{   initstaticvar_1(b, topflag, NULL, 0);
 }
 
 static Expr *quietaddrof(Binder *b)
@@ -877,7 +921,7 @@ static Expr *vg_zeroobj(Binder *b, int32 offset, int32 zeros)
               (Expr *)mkExprList(
                 mkExprList(
                   mkExprList(0, mkintconst(te_int,zeros,0)),
-                  mkintconst(te_int,0,0)),
+                  lit_zero),
                 mk_expr2(s_plus, typeofexpr(addrb), addrb,
                          mkintconst(te_int, offset, 0))));
 }
@@ -955,12 +999,12 @@ case bitofstg_(s_auto):                 /* includes register vars too   */
                 if ( /*!LanguageIsCPlusPlus &&*/
                      (!(config & CONFIG_REENTRANT_CODE) ||
                       pointerfree_type(bindtype_(b))))
-                {   datap = &constdata;
+                {   SetDataArea(DS_Const);
                     binduses_(sb) |= u_constdata;
                     cur_initlhs = b;
                 }
 #endif
-                start = (datap->head == NULL) ? NULL : datap->tail;
+                start = (get_datadesc_ht(YES) == NULL) ? NULL : get_datadesc_ht(NO);
                 /*
                  * Create hidden static for auto initialiser.
                  */
@@ -1004,7 +1048,7 @@ case bitofstg_(s_auto):                 /* includes register vars too   */
                     if (e != 0)
                         dyninit = mkbinary(s_comma, dyninit, e);
                 }
-                datap = &data;
+                SetDataArea(DS_ReadWrite);
             }
             else
             {   Expr *e = syn_rdinit(d->decltype, b, 0);   /* no optimise0 */
@@ -1085,10 +1129,10 @@ case bitofstg_(s_extern):
 #ifdef CONST_DATA_IN_CODE
                 if (bindstg_(b) & u_constdata)
                 {   bindstg_(b) |= b_generated;
-                    datap = &constdata;
+                    SetDataArea(DS_Const);
                 }
 #endif
-                initstaticvar_1(b, topflag, dyninit);
+                initstaticvar_1(b, topflag, d->tentative, dyninit);
             }
             /* Put out debug info AFTER initialised array size has      */
             /* been filled in by initstaticvar():                       */
@@ -1110,7 +1154,7 @@ case bitofstg_(s_extern):
                  * am nervous about int a[][]; in pcc mode.
                  */
                 for (; h0_(t) == t_subscript; t = princtype(typearg_(t)))
-                {   if (typesubsize_(t) == 0)
+                {   if (typesubsize_(t) == 0 || h0_(typesubsize_(t)) == s_binder)
                     {
 #ifndef TARGET_IS_UNIX
                         /* Add debug info for open arrays (ASD only) */
@@ -1195,7 +1239,7 @@ switch_break:
     * 'reset_vg_after_init_of_...()' below to fix the tables.
     */
     reset_vg_after_init_of_tentative_defn();
-    datap = &data;
+    SetDataArea(DS_ReadWrite);
     /*
      * Now generate the string literals we have delayed generating.
      * Also, we relocate the references to them by updating the
@@ -1206,7 +1250,7 @@ switch_break:
      */
     {   struct StrLit *p = (struct StrLit *) dreverse((List *)str_lits);
         for (; p != NULL;  p = p->next)
-        {   p->d->val += data.size;      /* real offset of generated lit */
+        {   p->d->val += data_size();      /* real offset of generated lit */
             genstring(p->s, 0xffffff);   /* literal dumped in data area  */
             padstatic(alignof_toplevel_static);
         }
@@ -1222,5 +1266,21 @@ void vg_generate_deferred_const(Binder *b)
     declinit_(d) = 0;
     (void) genstaticparts(d, YES, NO, dyninit);
 }
+
+#ifndef NO_DUMP_STATE
+void Vargen_LoadState(FILE *f) {
+    if (LanguageIsCPlusPlus)
+        Vargen_cpp_LoadState(f);
+    else
+        IGNORE(f);
+}
+
+void Vargen_DumpState(FILE *f) {
+    if (LanguageIsCPlusPlus)
+        Vargen_cpp_DumpState(f);
+    else
+        IGNORE(f);
+}
+#endif
 
 /* end of vargen.c */

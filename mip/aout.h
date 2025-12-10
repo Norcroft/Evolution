@@ -6,13 +6,14 @@
  */
 
 /*
- * RCS $Revision: 1.3 $
- * Checkin $Date: 1993/10/07 17:19:30 $
- * Revising $Author: irickard $
+ * RCS $Revision$
+ * Checkin $Date$
+ * Revising $Author$
  */
 
 /*
  * Copyright (c) 1980 Regents of the University of California.
+ * SPDX-Licence-Identifier: BSD-1-Clause
  * All rights reserved.  The Berkeley software License Agreement
  * specifies the terms and conditions for redistribution.
  *

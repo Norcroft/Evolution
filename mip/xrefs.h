@@ -1,12 +1,13 @@
 /*
  * xrefs.h, version 2q
  * Copyright (C) Codemist Ltd, 1988.
+ * SPDX-Licence-Identifier: Apache-2.0
  */
 
 /*
- * RCS $Revision: 1.13 $
- * Checkin $Date: 1995/08/14 16:41:30 $
- * Revising $Author: enevill $
+ * RCS $Revision$
+ * Checkin $Date$
+ * Revising $Author$
  */
 
 #ifndef _xrefs_LOADED
@@ -58,40 +59,10 @@ struct DataXref {
 #define X_DataAddr1   0x06000000L   /* Immediate field (high part-word) */
 #define X_DataVal1    0x07000000L
 
-#ifdef TARGET_IS_HELIOS
-#define X_DataSymb    0x08000000L   /* same as DataAddr/DataVal???      */
-#define X_DataModule  0x09000000L
-#define X_Modnum      0x0a000000L
-#define X_Init        0x0b000000L
-#ifdef TARGET_IS_ARM
-/* I think I have more of these than are really needed... prune someday */
-#  define X_PCreloc1  0x0c000000L   /* pc reloc but in ADD instr        */
-#  define X_DataSymb1 0x0d000000L   /* address of data using ADD instr  */
-#  define X_PCreloc2  0x0e000000L   /* pc reloc but in ADD instr        */
-#  define X_DataSymb2 0x0f000000L   /* address of data using ADD instr  */
-#  define X_PCreloc3  0x10000000L   /* pc reloc but in ADD instr        */
-#  define X_DataSymb3 0x11000000L   /* address of data using ADD instr  */
-#  define X_PCreloc4  0x12000000L   /* pc reloc but in ADD instr        */
-#  define X_DataSymb4 0x13000000L   /* address of data using ADD instr  */
-#  define X_PCreloc5  0x14000000L   /* pc reloc but in ADD instr        */
-#  define X_DataSymb5 0x15000000L   /* address of data using ADD instr  */
-#  define X_DataSymb6 0x16000000L
-#endif
-#else /* not helios */
 #define X_TailCall    0x08000000L
-#endif
 
 #ifdef THUMB_CPLUSPLUS
 #  define X_PCreloc_32 0x17000000L
-#endif
-
-#ifdef TARGET_IS_ACW
-#  define X_codelink  0x0c000000L    /* WGD: for ACW  */
-#  define X_datalink  0x0d000000L    /* WGD: for ACW  */
-#  define X_sysname   0x10000000L    /* WGD: for ACW  */
-#endif
-#ifdef TARGET_IS_SPARC
-#  define X_PCw30reloc        0x08000000L
 #endif
 
 struct ExtRef
@@ -101,6 +72,7 @@ struct ExtRef
   int extflags;            /* xr_xxx things below */
   int32 extoffset;
   Symstr *codesym;         /* for code defs when one area per fn */
+  RealRegSet usedregs;
 };
 
 /*
@@ -203,6 +175,8 @@ struct ExtRef
 /* ECN: Support for embedding 32 bit ARM instructions in a Thumb code sequence */
 #define LIT_OPCODE_32 0x19
 #endif
+#define LIT_INT64_1 0x1a
+#define LIT_INT64_2 0x1b
 
 extern CodeXref *codexrefs;
 extern ExtRef *obj_symlist;

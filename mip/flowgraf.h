@@ -2,12 +2,13 @@
  * mip/flowgraf.h
  * Copyright (C) Acorn Computers Ltd., 1988.
  * Copyright (C)  Codemist Ltd., 1988.
+ * SPDX-Licence-Identifier: Apache-2.0
  */
 
 /*
- * RCS $Revision: 1.8 $
- * Checkin $Date: 1994/11/29 15:38:20 $
- * Revising $Author: hmeekings $
+ * RCS $Revision$
+ * Checkin $Date$
+ * Revising $Author$
  */
 
 #ifndef _flowgraf_LOADED
@@ -57,9 +58,10 @@ extern void reopen_block(BlockHead *p);
 #define start_new_basic_block(l) \
     start_basic_block_at_level(l, active_binders)
 
-extern BlockHead *insertblockbetween(BlockHead *before, BlockHead *after);
+extern BlockHead *insertblockbetween(BlockHead *before, BlockHead *after, bool insertingraph);
 /* make a new block, and insert it between blocks  before  and  after
-   (both in the blockup_/down_ sense, and in the blknext_ sense.
+   in the blockup_/down_ sense. If insertingraph is true, also insert
+   it between before and after in the blknext_ sense.
    (error if there is no arc from before to after).
  */
 
@@ -76,7 +78,7 @@ extern bool is_exit_label(LabelNumber *ll);
 
 extern void emitfl(J_OPCODE op, FileLine fl);
 
-extern void emit5(J_OPCODE op, VRegnum r1, VRegnum r2, VRegnum r3, int32 m);
+extern void emitshift(J_OPCODE op, VRegnum r1, VRegnum r2, VRegnum r3, int32 m);
 
 extern void emitstring(J_OPCODE op, VRegnum r1, StringSegList *m);
 
@@ -88,7 +90,11 @@ extern void emitvk(J_OPCODE op, VRegnum r1, int32 n, Binder *m);
 
 extern void emitreg(J_OPCODE op, VRegnum r1, VRegnum r2, VRegnum m);
 
+extern void emitreg4(J_OPCODE op, int flags, VRegnum r1, VRegnum r2, VRegnum r3, VRegnum r4);
+
 extern void emitfloat(J_OPCODE op, VRegnum r1, VRegnum r2, FloatCon *m);
+
+extern void emitint64(J_OPCODE op, VRegnum r1, VRegnum r2, Int64Con *m);
 
 extern void emitsetsp(J_OPCODE op, BindList *b2);
 
@@ -105,6 +111,8 @@ extern void emitsetspenv(BindList *r2, BindList *m);
 extern void emitcasebranch(J_OPCODE op, VRegnum r1, LabelNumber **r2, int32 m);
 
 extern void emit(J_OPCODE op, VRegnum r1, VRegnum r2, int32 m);
+
+extern void emitic(const Icode *const ic);
 
 extern bool is_compare(J_OPCODE op);
 

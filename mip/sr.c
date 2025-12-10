@@ -1,12 +1,13 @@
 /*
  * sr.c: Live range splitting
- * Copyright (C) Advanced Risc Machines Ltd., 1993
+ * Copyright 1993-1997 Advanced Risc Machines Limited. All rights reserved
+ * SPDX-Licence-Identifier: Apache-2.0
  */
 
 /*
- * RCS $Revision: 1.39 $ Codemist 2
- * Checkin $Date: 1996/01/10 14:54:36 $
- * Revising $Author: hmeeking $
+ * RCS $Revision$ Codemist 2
+ * Checkin $Date$
+ * Revising $Author$
  */
 
 #include <stdio.h>
@@ -75,12 +76,13 @@ struct AdconvList {
   Binder *b;
 };
 #define mkAdconvList(a,b,c) (AdconvList *)syn_list3(a,b,c)
+#define AdconvList_DiscardOne(p) ((AdconvList *)discard3(p))
 
 static VKList *vklist;
 static VKUse *setsplist;
 static MOVCList *movclist, **movctail;
 
-static unsigned const memsize[] = {
+static int const memsize[] = {
   1,
   2,
   4,
@@ -93,25 +95,30 @@ static unsigned const memsize[] = {
   (!(bindstg_(b) & b_bindaddrlist) && /* (implies BINDADDR_LOC) */ \
    (bindaddr_(b) & BINDADDR_MASK) == BINDADDR_ARG)
 
+static VRegnum ArgumentRegister(Binder *b) {
+  return (bindaddr_(b) & ~BINDADDR_MASK) / alignof_toplevel_auto -
+         currentfunction.fltargwords;
+}
+
 static BindList *bindlist_member(Binder *b, BindList *bl) {
-  for (; bl != NULL; bl = bl->bindlistcdr)
+  for (; bl != NULL; bl = cdr_(bl))
     if (bl->bindlistcar == b) return bl;
   return NULL;
 }
 
 static void SpliceInBL(BindList *bl, VKLoc *locs, bool setbindaddr) {
   if (bl != NULL) {
-    BindList *newbl, *q = bl->bindlistcdr;
+    BindList *newbl, *q = cdr_(bl);
     Binder *b = locs->bind;
     bl->bindlistcar = b;
     if (setbindaddr) bindbl_(b) = bl;
     for (; (locs = cdr_(locs)) != NULL; bl = newbl) {
       b = locs->bind;
       newbl = mkBindList(NULL, b);
-      bl->bindlistcdr = newbl;
+      cdr_(bl) = newbl;
       if (setbindaddr) bindbl_(b) = newbl;
     }
-    bl->bindlistcdr = q;
+    cdr_(bl) = q;
   }
 }
 
@@ -121,7 +128,7 @@ static bool Overlap(int typea, int32 offseta, int typeb, int32 offsetb) {
 }
 
 static VKLoc *VKLoc_New(VKLoc *next, int32 offset, int type, VRegnum ruse) {
-  VKLoc *p = (VKLoc *)SynAlloc(sizeof(VKLoc));
+  VKLoc *p = NewSyn(VKLoc);
   cdr_(p) = next;
   p->type = type;
   p->offset = offset;
@@ -134,7 +141,7 @@ static VKLoc *VKLoc_New(VKLoc *next, int32 offset, int type, VRegnum ruse) {
 static VKLoc *VKLoc_ReverseCopy(VKLoc *locs) {
   VKLoc *res = NULL;
   for (; locs != NULL; locs = cdr_(locs)) {
-    VKLoc *p = (VKLoc *)SynAlloc(sizeof(VKLoc));
+    VKLoc *p = NewSyn(VKLoc);
     *p = *locs;
     cdr_(p) = res;
     res = p;
@@ -149,12 +156,12 @@ static VKList *GetVKList(Binder *b) {
     return NULL;
   if (BinderIsArg(b)) {
     /* Only attempt to split argument structures passed entirely in registers */
-    int32 offset = bindaddr_(b) & ~BINDADDR_MASK;
+    VRegnum argreg = ArgumentRegister(b);
     int32 size = bindmcrep_(b) & MCR_SIZE_MASK;
-    if (offset + size > NARGREGS * sizeof_int) return NULL;
+    if (argreg + size / sizeof_int > NARGREGS) return NULL;
   }
   if (!(bindstg_(b) & u_loctype)) {
-     VKList *vk = (VKList *)SynAlloc(sizeof(VKList));
+     VKList *vk = NewSyn(VKList);
      cdr_(vk) = vklist;
      vklist = vk;
      vk->bindxx = bindxx_(b);
@@ -171,6 +178,8 @@ static VKList *GetVKList(Binder *b) {
 static void MarkAdconvUnsplittable(VRegnum r, AdconvList *p) {
   for (; p != NULL; p = cdr_(p))
     if (r == p->r) {
+      if (debugging(DEBUG_SR))
+        cc_msg("Mark adconv unsplittable $b\n", p->b);
       bindvklist_(p->b)->splittable = NO;
       break;
     }
@@ -178,34 +187,64 @@ static void MarkAdconvUnsplittable(VRegnum r, AdconvList *p) {
 
 static void MarkBinderUnsplittable(Binder *b) {
   VKList *vk = GetVKList(b);
-  if (vk != NULL) vk->splittable = NO;
+  if (vk != NULL) {
+    if (debugging(DEBUG_SR))
+      cc_msg("Mark binder unsplittable $b\n", b);
+    vk->splittable = NO;
+  }
 }
 
 static AdconvList *adconv_unused;
 static RegList *movc_unknown;
 
 static void AddStructsInBL(BindList const *bl) {
-  for (; bl != NULL; bl = bl->bindlistcdr) {
+  for (; bl != NULL; bl = cdr_(bl)) {
     Binder *b = bl->bindlistcar;
     if ((bindmcrep_(b) & MCR_SORT_MASK) == MCR_SORT_STRUCT)
       GetVKList(b);
   }
 }
 
+static void OpRewritten(Icode const *c) {
+  if (debugging(DEBUG_SR)) {
+    cc_msg("rewritten: ");
+    print_jopcode(c);
+  }
+}
+
 static void SplitStructs_ScanBlock(BlockHead const *block) {
   Icode *c, *limit;
   AdconvList *adconvs = NULL;
+  if (debugging(DEBUG_SR))
+    cc_msg("L%li:\n", (long)lab_name_(blklab_(block)));
   AddStructsInBL(blkstack_(block));
   for (c = blkcode_(block), limit = c + blklength_(block); c < limit; ++c) {
     VKList *vk;
+    if (debugging(DEBUG_SR))
+        print_jopcode(c);
+
     switch (c->op & J_TABLE_BITS) {
+    case J_LDRK: case J_STRK:
+      { AdconvList *p = adconvs;
+        for (; p != NULL; p = cdr_(p)) {
+          if (p->r == c->r2.r) {
+            c->op = J_addvk(c->op);
+            c->r2 = c->r3;
+            c->r3.b = p->b;
+            OpRewritten(c);
+            break;
+          }
+        }
+        if (p == NULL) break;
+      }
+      /* Fall through */
     case J_LDRVK:  case J_LDRLVK:
     case J_LDRFVK: case J_LDRDVK:
     case J_STRVK:  case J_STRLVK:
     case J_STRFVK: case J_STRDVK:
-      vk = GetVKList(c->m.b);
+      vk = GetVKList(c->r3.b);
       if (vk != NULL && vk->splittable) {
-        int32 offset = c->r2.i;
+        uint32 offset = c->r2.i;
         int type = (int)j_memsize(c->op);
         VKLoc *locs, **locp = &vk->locs;
         bool add = YES;
@@ -214,6 +253,8 @@ static void SplitStructs_ScanBlock(BlockHead const *block) {
             add = NO;
             break;
           } else if (Overlap(type, offset, locs->type, locs->offset)) {
+            if (debugging(DEBUG_SR))
+              cc_msg("Mark binder unsplittable $b\n", c->r3.b);
             vk->splittable = NO;
             goto ExitSwitch;
           } else if (offset < locs->offset)
@@ -228,13 +269,13 @@ ExitSwitch:
 
     case J_LDRBVK: case J_LDRWVK:
     case J_STRBVK: case J_STRWVK:
-      MarkBinderUnsplittable(c->m.b);
+      MarkBinderUnsplittable(c->r3.b);
       continue;
 
     case J_ADCONV:
-      vk = GetVKList(c->m.b);
+      vk = GetVKList(c->r3.b);
       if (vk != NULL && vk->splittable)
-        adconvs = mkAdconvList(adconvs, c->r1.r, c->m.b);
+        adconvs = mkAdconvList(adconvs, c->r1.r, c->r3.b);
       continue;
 
     case J_MOVC:
@@ -250,12 +291,12 @@ ExitSwitch:
             pp = &cdr_(p);
             continue;
           }
-          *pp = (AdconvList *)discard3(p);
+          *pp = AdconvList_DiscardOne(p);
         }
         if (b1 == NULL) movc_unknown = (RegList *)syn_list2(movc_unknown, c->r1.r);
         if (b2 == NULL) movc_unknown = (RegList *)syn_list2(movc_unknown, c->r2.r);
         adconvs = q;
-        if (c->m.i <= NARGREGS * sizeof_int) {
+        if (c->r3.i <= NARGREGS * sizeof_int) {
           if (b1 != NULL || b2 != NULL) {
             MOVCList *p = mkMOVCList(NULL, block, c, b1, b2);
             *movctail = p;
@@ -269,7 +310,7 @@ ExitSwitch:
       continue;
 
     case J_SETSPENV:
-      AddStructsInBL(c->m.bl);
+      AddStructsInBL(c->r3.bl);
     case J_SETSPGOTO:
       AddStructsInBL(c->r2.bl);
       setsplist = mkVKUse(setsplist, c);
@@ -282,12 +323,12 @@ ExitSwitch:
        */
         AdconvList *p;
         for (p = adconvs; p != NULL; p = cdr_(p))
-          if (p->r == c->m.r) {
+          if (p->r == c->r3.r) {
             adconvs = mkAdconvList(adconvs, c->r1.r, p->b);
             break;
           }
         for (p = adconv_unused; p != NULL; p = cdr_(p))
-          if (p->r == c->m.r) {
+          if (p->r == c->r3.r) {
             adconvs = mkAdconvList(adconvs, c->r1.r, p->b);
             break;
           }
@@ -299,13 +340,28 @@ ExitSwitch:
     case J_LDRLV: case J_STRLV:
     case J_LDRFV: case J_STRFV:
     case J_LDRV: case J_STRV:
-      MarkBinderUnsplittable(c->m.b);
+      MarkBinderUnsplittable(c->r3.b);
       break;
     }
     if (adconvs != NULL) {
       if (reads_r1(c->op)) MarkAdconvUnsplittable(c->r1.r, adconvs);
       if (reads_r2(c->op)) MarkAdconvUnsplittable(c->r2.r, adconvs);
-      if (reads_r3(c->op)) MarkAdconvUnsplittable(c->m.r, adconvs);
+      if (reads_r3(c->op)) MarkAdconvUnsplittable(c->r3.r, adconvs);
+      if (reads_r4(c->op)) MarkAdconvUnsplittable(c->r4.r, adconvs);
+    }
+  }
+  if (debugging(DEBUG_SR) && !(blkflags_(block) & BLKSWITCH)) {
+    Icode ic;
+    INIT_IC(ic, J_NOOP);
+    if (blkflags_(block) & BLK2EXIT) {
+      ic.op = J_B + (blkflags_(block) & Q_MASK);
+      ic.r3.l = blknext1_(block);
+      print_jopcode(&ic);
+    }
+    if (!(blkflags_(block) & BLK0EXIT)) {
+      ic.op = J_B;
+      ic.r3.l = blknext_(block);
+      print_jopcode(&ic);
     }
   }
   if (blkflags_(block) & BLKREXPORTED) {
@@ -315,9 +371,12 @@ ExitSwitch:
       if (loads_r1(c->op) && !isany_realreg_(c->r1.r))
         exportedr = c->r1.r;
     }
-    for (; adconvs != NULL; adconvs = (AdconvList *)discard3(adconvs))
-      if (exportedr == GAP || exportedr == adconvs->r)
+    for (; adconvs != NULL; adconvs = AdconvList_DiscardOne(adconvs))
+      if (exportedr == GAP || exportedr == adconvs->r) {
+        if (debugging(DEBUG_SR))
+          cc_msg("Binder $b unsplittable (exportedr)\n", adconvs->b);
         bindvklist_(adconvs->b)->splittable = NO;
+      }
   } else if (adconvs != NULL) {
     AdconvList **pp = &adconvs;
     for (; *pp != NULL; pp = &cdr_(*pp)) continue;
@@ -332,10 +391,9 @@ static void FillInFields(Binder *b, unsigned32 n) {
   VKLoc *locs;
   unsigned32 offset = 0;
   if (v->splittable) {
-      /* Even a structure referenced only as a whole (*locsp == NULL here) is
-         worth splitting: it's the only way that unwanted writes to it can be
-         discarded.
-       */
+      /* Even a structure referenced only as a whole (*locsp == NULL    */
+      /* here) is worth splitting: it's the only way that unwanted      */
+      /* writes to it can be discarded.                                 */
     for (; offset < n; locsp = &cdr_(locs)) {
       locs = *locsp;
       if (locs != NULL && offset == locs->offset)
@@ -388,6 +446,8 @@ static bool CheckSameStructure(Binder *b1, Binder *b2, unsigned32 n) {
       } else
         *locs2p = locs2 = VKLoc_New(locs2, offset, locs1->type, locs1->ruse);
 
+      locs1p = &cdr_(locs1); locs2p = &cdr_(locs2);
+
     } else if (locs2 != NULL && offset == locs2->offset) {
       size = memsize[locs2->type];
       if (locs1 != NULL && offset+size > locs1->offset) {
@@ -395,6 +455,7 @@ static bool CheckSameStructure(Binder *b1, Binder *b2, unsigned32 n) {
         break;
       } else
         *locs1p = locs1 = VKLoc_New(locs1, offset, locs2->type, locs2->ruse);
+      locs1p = &cdr_(locs1); locs2p = &cdr_(locs2);
 
     } else {
       unsigned32 isize = memsize[MEM_I];
@@ -414,7 +475,6 @@ static bool CheckSameStructure(Binder *b1, Binder *b2, unsigned32 n) {
         *locs2p = p; locs2p = &cdr_(p);
       }
     }
-    locs1p = &cdr_(locs1); locs2p = &cdr_(locs2);
   }
   if (offset != n) {
     v1->splittable = v2->splittable = NO;
@@ -451,13 +511,12 @@ static Binder *SR_NewBinder(char *name, VRegnum oldr) {
 }
 
 static void SplitStructs(BindList *local_binders, BindList *regvar_binders) {
-  /* Here we turn non address taken local structures into a set of binders, one
-     per field. Fields must be disjoint, and accessed only in one way (unions
-     of machine-level distinct types not allowed). For structures accessed only
-     by loads and stores, ({LD/ST}RxVK) this transformation is regardless of
-     size: those assigned to and from (MOVC) are transformed only if they are
-     sufficiently small.
-   */
+  /* Here we turn non address taken local structures into a set of      */
+  /* binders, one per field. Fields must be disjoint, and accessed only */
+  /* in one way (unions of machine-level distinct types not allowed).   */
+  /* For structures accessed only by loads and stores, ({LD/ST}RxVK)    */
+  /* this transformation is regardless of size: those assigned to and   */
+  /* from (MOVC) are transformed only if they are sufficiently small.   */
   BlockHead *b;
   int32 argwords = 0;
   vklist = NULL;
@@ -465,14 +524,19 @@ static void SplitStructs(BindList *local_binders, BindList *regvar_binders) {
   movclist = NULL, movctail = &movclist;
   adconv_unused = NULL;
   movc_unknown = NULL;
+  if (debugging(DEBUG_SR))
+    cc_msg("Splitting structures\n\n");
   for (b = top_block; b != NULL; b = blkdown_(b))
     SplitStructs_ScanBlock(b);
+
   { RegList *rl = movc_unknown;
     for (; rl != NULL; rl = rl->rlcdr) {
       AdconvList *a = adconv_unused;
       VRegnum r = rl->rlcar;
       for (; a != NULL; a = cdr_(a))
         if (a->r == r) {
+          if (debugging(DEBUG_SR))
+            cc_msg("$b unsplittable (adconv_unused)\n", a->b);
           MarkBinderUnsplittable(a->b);
           break;
         }
@@ -481,18 +545,21 @@ static void SplitStructs(BindList *local_binders, BindList *regvar_binders) {
   { MOVCList *p = movclist;
     for (; p != NULL; p = cdr_(p))
       if (p->b1 == NULL)
-        FillInFields(p->b2, p->ic->m.i);
+        FillInFields(p->b2, p->ic->r3.i);
       else if (p->b2 == NULL)
-        FillInFields(p->b1, p->ic->m.i);
+        FillInFields(p->b1, p->ic->r3.i);
       else
-        CheckSameStructure(p->b1, p->b2, p->ic->m.i);
+        CheckSameStructure(p->b1, p->b2, p->ic->r3.i);
   }
   { VKList *p; VKLoc *loc;
-    /* Argument structures some of whose fields aren't integers can't be split */
+    /* Argument structures some of whose fields aren't integers can't   */
+    /* be split                                                         */
     for (p = vklist; p != NULL; p = cdr_(p))
       if (BinderIsArg(p->b))
         for (loc = p->locs; loc != NULL; loc = cdr_(loc))
           if (loc->type != MEM_I) {
+            if (debugging(DEBUG_SR))
+              cc_msg("$b unsplittable (argument with non-int field)\n", p->b);
             p->splittable = NO;
             break;
           }
@@ -500,17 +567,22 @@ static void SplitStructs(BindList *local_binders, BindList *regvar_binders) {
       if (p->splittable) {
         Binder *oldb = p->b;
         bool isarg = BinderIsArg(oldb);
-        /* p->locs == NULL and p->splittable means completely unused. (Probably
-           CSE discarded uses). Splitting the struct is the easy way to discard
-           it.
-         */
+        /* p->locs == NULL and p->splittable means completely unused.   */
+        /* (Probably CSE discarded uses). Splitting the struct is the   */
+        /* easy way to discard it.                                      */
         if (p->locs == NULL) {
           if ((bindmcrep_(oldb) & MCR_SIZE_MASK) >= sizeof_int)
             FillInFields(oldb, sizeof_int);
-          else
+          else {
+            if (debugging(DEBUG_SR))
+              cc_msg("$b unsplittable (referenced argument)\n", p->b);
             p->splittable = NO;
+          }
           if (!p->splittable) continue;
         }
+        if (debugging(DEBUG_SR | DEBUG_CG))
+          cc_msg("split $b\n", oldb);
+
         for (loc = p->locs; loc != NULL; loc = cdr_(loc)) {
           char name[128];
           VKUse *use;
@@ -527,7 +599,7 @@ static void SplitStructs(BindList *local_binders, BindList *regvar_binders) {
             Icode *c = use->use;
             c->op = J_XtoY(c->op, J_LDRVK, J_LDRV);
             c->r2.r = GAP;
-            c->m.b = newb;
+            c->r3.b = newb;
           }
           loc->bind = newb;
         }
@@ -541,7 +613,7 @@ static void SplitStructs(BindList *local_binders, BindList *regvar_binders) {
             for (sp = setsplist; sp != NULL; sp = cdr_(sp)) {
               bl = bindlist_member(p->b, sp->use->r2.bl);
               if (bl == NULL && sp->use->op == J_SETSPENV)
-                bl = bindlist_member(p->b, sp->use->m.bl);
+                bl = bindlist_member(p->b, sp->use->r3.bl);
               if (bl != NULL) break;
             }
           }
@@ -578,11 +650,10 @@ static void SplitStructs(BindList *local_binders, BindList *regvar_binders) {
         VKLoc *loc;
         if (vk->splittable && BinderIsArg(vk->b))
           for (loc = vk->locs; loc != NULL; loc = cdr_(loc), newic++) {
-            int32 ir = (bindaddr_(loc->bind) & ~BINDADDR_MASK) / alignof_toplevel_auto;
-            newic->op = J_MOVR;
+            VRegnum ir = ArgumentRegister(loc->bind);
+            INIT_IC(*newic, J_MOVR);
             newic->r1.r = bindxx_(loc->bind);
-            newic->r2.r = GAP;
-            newic->m.r = R_P1+ir;
+            newic->r3.r = R_P1+ir;
           }
       }
       memcpy(newic, oldic, (size_t)(oldl-n) * sizeof(Icode));
@@ -592,7 +663,7 @@ static void SplitStructs(BindList *local_binders, BindList *regvar_binders) {
       MOVCList *q;
       int32 n = 0;
       for (q = p; q != NULL && q->block == b; q = cdr_(q)) {
-        unsigned32 size = q->ic->m.i;
+        unsigned32 size = q->ic->r3.i;
         Binder *b = q->b1 == NULL ? q->b2 : q->b1;
         VKLoc *loc = bindvklist_(b)->locs;
         for (; loc != NULL; loc = cdr_(loc))
@@ -609,7 +680,7 @@ static void SplitStructs(BindList *local_binders, BindList *regvar_binders) {
           if (p == q || &oldic[i] != p->ic)
             *newic++ = oldic[i];
           else {
-            unsigned32 size = p->ic->m.i;
+            unsigned32 size = p->ic->r3.i;
             Binder *b1 = p->b1,
                    *b2 = p->b2;
             VKLoc *loc, *loc2;
@@ -625,26 +696,26 @@ static void SplitStructs(BindList *local_binders, BindList *regvar_binders) {
               } else {
                 VRegnum r = vregister(SortOfReg(loc->ruse));
                 if (b2 == NULL) {
-                  newic->op = J_XtoY(LDRV_Op(loc->type), J_LDRV, J_LDRK);
+                  INIT_IC(*newic, J_XtoY(LDRV_Op(loc->type), J_LDRV, J_LDRK));
+                  newic->r1.r = r;
                   newic->r2 = p->ic->r2;
-                  newic->m.i = loc->offset;
+                  newic->r3.i = loc->offset;
                 } else {
-                  newic->op = LDRV_Op(loc->type);
-                  newic->r2.r = GAP;
-                  newic->m.b = loc2->bind;
+                  INIT_IC(*newic, LDRV_Op(loc->type));
+                  newic->r1.r = r;
+                  newic->r3.b = loc2->bind;
                   loc2 = cdr_(loc2);
                 }
-                newic->r1.r = r;
                 newic++;
-                newic->r1.r = r;
                 if (b1 == NULL) {
-                  newic->op = J_LDtoST(J_XtoY(LDRV_Op(loc->type), J_LDRV, J_LDRK));
+                  INIT_IC(*newic, J_LDtoST(J_XtoY(LDRV_Op(loc->type), J_LDRV, J_LDRK)));
+                  newic->r1.r = r;
                   newic->r2 = p->ic->r1;
-                  newic->m.i = loc->offset;
+                  newic->r3.i = loc->offset;
                 } else {
-                  newic->op = J_LDtoST(LDRV_Op(loc->type));
-                  newic->r2.r = GAP;
-                  newic->m.b = loc->bind;
+                  INIT_IC(*newic, J_LDtoST(LDRV_Op(loc->type)));
+                  newic->r1.r = r;
+                  newic->r3.b = loc->bind;
                 }
                 newic++;
               }
@@ -662,14 +733,14 @@ static void SplitStructs(BindList *local_binders, BindList *regvar_binders) {
   }
 }
 
-struct CSEBlockHead {
+struct SRBlockHead {
   VRegSetP reach, gen, kill, use;
 };
 
-#define sr_kill_(p) ((p)->cse->kill)
-#define sr_use_(p) ((p)->cse->use)
-#define sr_gen_(p) ((p)->cse->gen)
-#define sr_reach_(p) ((p)->cse->reach)
+#define sr_kill_(p) (blksr_(p)->kill)
+#define sr_use_(p) (blksr_(p)->use)
+#define sr_gen_(p) (blksr_(p)->gen)
+#define sr_reach_(p) (blksr_(p)->reach)
 
 typedef struct SR_UseList SR_UseList;
 typedef struct SR_DefList SR_DefList;
@@ -730,7 +801,6 @@ static SR_Binder **binderindex[SRINDEXSIZE];
 static SR_Binder **binderhash;
 
 static unsigned32 bindercount;
-static unsigned32 nonargument_index;
 static unsigned32 defcount;
 
 static VRegSetAllocRec allocrec;
@@ -746,13 +816,13 @@ static SR_Binder *LookupBinder(Binder *b) {
     if (p->binder == b) return p;
   { unsigned32 id = bindercount++;
     SR_Binder **index = binderindex[id>>SRSEGBITS];
-    p = (SR_Binder *)SynAlloc(sizeof(SR_Binder));
+    p = NewSyn(SR_Binder);
     cdr_(p) = NULL; p->index = id; p->binder = b;
     p->defs = NULL; p->uses = NULL; p->defset = NULL;
     p->super = NULL;
     *pp = p;
     if (index == NULL) {
-      index = (SR_Binder **)SynAlloc(SRSEGSIZE * sizeof(SR_Binder **));
+      index = NewSynN(SR_Binder *, SRSEGSIZE);
       binderindex[id>>SRSEGBITS] = index;
       ClearToNull((void **)index, SRSEGSIZE);
     }
@@ -765,7 +835,7 @@ static SR_Binder *AddDef(Binder *b, BlockHead *block, int32 ic) {
   SR_Binder *sr = LookupBinder(b);
   if (sr != NULL) {
     unsigned32 n = defcount++;
-    SR_Def *p = (SR_Def *)SynAlloc(sizeof(SR_Def));
+    SR_Def *p = NewSyn(SR_Def);
     cdr_(p) = sr->defs; sr->defs = p;
     p->index = n;
     p->block = block; p->ic = ic;
@@ -793,27 +863,18 @@ static void ScanBlock(BlockHead *block) {
      use   the set of binders read in the block where the read is reached by
            definitions entering the block.
    */
-  if (block == top_block) {
-    BindList *bl = argument_bindlist;
-    for (; bl != NULL; bl = bl->bindlistcdr) {
-      SR_Binder *sr = AddDef(bl->bindlistcar, block, 0);
-      if (sr != NULL) gen = vregset_insert(sr->index, gen, NULL, &allocrec);
-    }
-    nonargument_index = bindercount;
-  }
   for (c = blkcode_(block), limit = c + blklength_(block); c < limit; ++c)
     switch (c->op & J_TABLE_BITS) {
     case J_LDRBV: case J_LDRWV:
     case J_LDRV:  case J_LDRLV:
     case J_LDRFV: case J_LDRDV:
-      { SR_Binder *sr = LookupBinder(c->m.b);
+      { SR_Binder *sr = LookupBinder(c->r3.b);
         if (sr != NULL) {
-          SR_Use *p = (SR_Use *)SynAlloc(sizeof(SR_Use));
+          SR_Use *p = NewSyn(SR_Use);
           cdr_(p) = sr->uses; sr->uses = p;
           p->block = block; p->ic = c - blkcode_(block);
-          /* Uses with a definition in the same block do not get added to the use
-             set, but must be linked to the definition immediately.
-           */
+          /* Uses with a definition in the same block do not get added to   */
+          /* the use set, but must be linked to the definition immediately. */
           if (!vregset_member(sr->index, gen)) {
             use = vregset_insert(sr->index, use, NULL, &allocrec);
             p->def = NULL;
@@ -823,11 +884,29 @@ static void ScanBlock(BlockHead *block) {
         break;
       }
 
+    case J_MOVR: case J_MOVIDR: case J_MOVIFR:
+    case J_MOVDR: case J_MOVDFR:
+    /* Special case of initialisation of the binder for an argument passed  */
+    /* in a register. It's a pain that these aren't handled in the natural  */
+    /* way, by stores into the binder.                                      */
+      if (block == top_block && isany_realreg_(c->r3.r)) {
+        BindList *bl = argument_bindlist;
+        for (; bl != NULL; bl = cdr_(bl))
+          if (bindxx_(bl->bindlistcar) == c->r1.r) {
+            SR_Binder *sr = AddDef(bl->bindlistcar, block, c - blkcode_(block));
+            if (sr != NULL) gen = vregset_insert(sr->index, gen, NULL, &allocrec);
+            break;
+          }
+      }
+      break;
+    case J_LDRV1: case J_LDRLV1:
+    case J_LDRFV1: case J_LDRDV1:
+    /* Initialisation of the binder for an argument passed on the stack.    */
     case J_INIT: case J_INITF: case J_INITD:
     case J_STRBV: case J_STRWV:
     case J_STRV:  case J_STRLV:
     case J_STRFV: case J_STRDV:
-      { SR_Binder *sr = AddDef(c->m.b, block, c - blkcode_(block));
+      { SR_Binder *sr = AddDef(c->r3.b, block, c - blkcode_(block));
         if (sr != NULL) {
           kill = vregset_insert(sr->index, kill, NULL, &allocrec);
           gen = vregset_insert(sr->index, gen, NULL, &allocrec);
@@ -867,23 +946,38 @@ static bool ReachSucc(LabelNumber *lab, VRegSetP reachpred) {
 static void ReplaceBinder(SR_Def *def, Binder *newb, Binder *oldb) {
   SR_UseList *p = def->uses;
   Icode *ip = &blkcode_(def->block)[def->ic];
-  ip->m.b = newb;
   switch (ip->op & J_TABLE_BITS)
   {
-case J_INIT: case J_INITF: case J_INITD:
+  case J_INIT: case J_INITF: case J_INITD:
+    ip->r3.b = newb;
     ip->r1.r = bindxx_(newb);
     if (p != NULL && (feature & FEATURE_ANOMALY))
       cc_warn(regalloc_warn_use_before_set, oldb);
+    break;
+  case J_LDRV1: case J_LDRLV1:
+  case J_LDRFV1: case J_LDRDV1:
+    ip->r3.b = newb;
+    ip->r1.r = bindxx_(newb);
+    break;
+  case J_MOVR: case J_MOVIDR: case J_MOVIFR:
+  case J_MOVDR: case J_MOVDFR:
+  /* Special case of initialisation of the binder for an argument passed
+   * in registers
+   */
+    ip->r1.r = bindxx_(newb);
+    break;
+  default:
+    ip->r3.b = newb;
   }
   for (; p != NULL; p = cdr_(p))
-    blkcode_(p->use->block)[p->use->ic].m.b = newb;
+    blkcode_(p->use->block)[p->use->ic].r3.b = newb;
 }
 
 static Binder *SubBinder(SR_Binder *p, SR_Def *def) {
   Binder *newb;
   Binder *oldb = p->binder;
   if (p->super == NULL) {
-    SuperBinder *super = (SuperBinder *)BindAlloc(sizeof(SuperBinder));
+    SuperBinder *super = NewBind(SuperBinder);
     cdr_(super) = superbinders; superbinders = super;
     super->binder = oldb;
     super->spillcount = 0;
@@ -913,11 +1007,11 @@ static BindList *splitranges_i(BindList *local_binders, BindList *regvar_binders
     phasename = "SplitRanges";
     defcount = bindercount = 0;
     vregset_init();
-    binderhash = (SR_Binder **)SynAlloc(SRHASHSIZE * sizeof(SR_Binder *));
+    binderhash = NewSynN(SR_Binder *, SRHASHSIZE);
     ClearToNull((void **)binderhash, SRHASHSIZE);
     ClearToNull((void **)binderindex, SRINDEXSIZE);
     for (b = top_block; b != NULL; b = blkdown_(b)) {
-      b->cse = (CSEBlockHead *)SynAlloc(sizeof(CSEBlockHead));
+      blksr_(b) = NewSyn(SRBlockHead);
       ScanBlock(b);
     }
     for (b = top_block; b != NULL; b = blkdown_(b)) {
@@ -948,12 +1042,7 @@ static BindList *splitranges_i(BindList *local_binders, BindList *regvar_binders
     }
 
     { unsigned32 bno = 0;
-      superbinders = NULL;
-      for (; bno < bindercount; bno++)
-      /* Caution here avoids splitting an argument binder, since I fear (possibly
-         without justification) that is more difficult. Investigation is needed.
-       */
-        if (bno >= nonargument_index) {
+      for (; bno < bindercount; bno++) {
           SR_Binder *p = sr_binder_(bno);
           SR_Use *use; SR_Def *def, *d;
           for (use = p->uses; use != NULL; use = cdr_(use)) {
@@ -1009,8 +1098,8 @@ static BindList *splitranges_i(BindList *local_binders, BindList *regvar_binders
             /* J_INIT definition).                                          */
             if ( defl != NULL &&
                  cdr_(defl) != NULL &&
-            /* Definitions do partition into more than one set */
-            /* Avoid the case where one set is just a J_INIT with no uses */
+            /* Definitions do partition into more than one set              */
+            /* Avoid the case where one set is just a J_INIT with no uses   */
                  ( cdr_(cdr_(defl)) != NULL  ||
                    ( (cdr_(defl->def) != NULL || defl->def->uses != NULL) &&
                      (cdr_(cdr_(defl)->def) != NULL || cdr_(defl)->def->uses != NULL)) ) ) {
@@ -1032,13 +1121,13 @@ static BindList *splitranges_i(BindList *local_binders, BindList *regvar_binders
                     s1 = ", "; s2 = "}";
                   }
                 }
-                cc_msg("%s", s2);
+                if (debug_sr) cc_msg("%s", s2);
               }
               if (debug_sr) cc_msg("\n");
               bindxx_(p->binder) = GAP;
             }
           }
-        }
+      }
     }
   }
   if ( debugging(DEBUG_CG) &&
@@ -1048,8 +1137,11 @@ static BindList *splitranges_i(BindList *local_binders, BindList *regvar_binders
 }
 
 BindList *splitranges(BindList *local_binders, BindList *regvar_binders) {
-  BindList *newbinders = usrdbg(DBG_LINE+DBG_VAR) ? NULL : splitranges_i(local_binders, regvar_binders);
+  BindList *newbinders = NULL;
   BlockHead *b;
+  superbinders = NULL;
+  if (!usrdbg(DBG_LINE+DBG_VAR))
+    newbinders = splitranges_i(local_binders, regvar_binders);
   for (b = top_block; b != NULL; b = blkdown_(b)) {
     /* Although flowgraf also wants blkusedfrom_() for cross-jumping and
        conditionalising, it wants a version after branch chaining, and the

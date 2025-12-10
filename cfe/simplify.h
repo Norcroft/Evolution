@@ -3,12 +3,13 @@
  * Copyright (C) Codemist Ltd, 1988-1992.
  * Copyright (C) Acorn Computers Ltd., 1988-1990.
  * Copyright (C) Advanced RISC Machines Ltd., 1990-1992.
+ * SPDX-Licence-Identifier: Apache-2.0
  */
 
 /*
- * RCS $Revision: 1.12 $
- * Checkin $Date: 1996/01/10 14:53:56 $
- * Revising $Author: hmeeking $
+ * RCS $Revision$
+ * Checkin $Date$
+ * Revising $Author$
  */
 
 #ifndef _simplify_h

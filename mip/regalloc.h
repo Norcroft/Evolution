@@ -2,12 +2,13 @@
  * mip/regalloc.h
  * Copyright (C) Acorn Computers Ltd., 1988.
  * Copyright (C) Codemist Ltd., 1988.
+ * SPDX-Licence-Identifier: Apache-2.0
  */
 
 /*
- * RCS $Revision: 1.6 $
- * Checkin $Date: 1995/02/09 12:34:00 $
- * Revising $Author: hmeekings $
+ * RCS $Revision$
+ * Checkin $Date$
+ * Revising $Author$
  */
 
 #ifndef _regalloc_h
@@ -40,13 +41,25 @@ extern void globalregistervariable(VRegnum r);
 extern void note_slave(VRegnum slave, VRegnum master);
 extern void forget_slave(VRegnum slave, VRegnum master);
 
+typedef union {
+    char **s;
+    VRegSetP vr;
+    VRegnum r;
+} RealRegSet_MapArg;
+
+typedef void RealRegSet_MapFn(RealRegister r, RealRegSet_MapArg *arg);
+
 extern void augment_RealRegSet(RealRegSet *, unsigned32);
 extern bool member_RealRegSet(RealRegSet const *, unsigned32);
 extern unsigned32 delete_RealRegSet(RealRegSet *, unsigned32);
 extern bool intersect_RealRegSet(RealRegSet *a, RealRegSet const *b, RealRegSet const *c);
 extern void union_RealRegSet(RealRegSet *a, RealRegSet const *b, RealRegSet const *c);
+extern void difference_RealRegSet(RealRegSet *a, const RealRegSet *b, const RealRegSet *c);
+extern void map_RealRegSet(RealRegSet const *a, RealRegSet_MapFn *f, RealRegSet_MapArg *arg);
+extern void print_RealRegSet(RealRegSet const *a);
 
-extern void avoidallocating(VRegnum); /* modifications to ALLOCATION_ORDER */
+RealRegSet const *globalregset(void);
+void avoidallocating(VRegnum); /* modifications to ALLOCATION_ORDER */
 
 extern void regalloc_init(void);
 extern void regalloc_reinit(void);

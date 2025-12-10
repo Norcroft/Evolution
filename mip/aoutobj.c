@@ -2,12 +2,13 @@
  * C compiler file mip/aoutobj.c
  * Copyright (C) Acorn Computers, 1987.
  * Copyright (C) Codemist Ltd., 1988.
+ * SPDX-Licence-Identifier: Apache-2.0
  */
 
 /*
- * RCS $Revision: 1.7 $ Codemist 14x
- * Checkin $Date: 1994/03/17 15:38:05 $
- * Revising $Author: hmeekings $
+ * RCS $Revision$ Codemist 14x
+ * Checkin $Date$
+ * Revising $Author$
  */
 
 /* Memo: AM is converting this file into a generic (target machine/os      */
@@ -76,7 +77,7 @@ void obj_common_start(Symstr *name)
     exported label in the normal data area.
   */
     labeldata(name);
-    obj_symref(name, xr_data+xr_defext, data.size);
+    obj_symref(name, xr_data+xr_defext, data_size());
 }
 
 void obj_common_end(void)
@@ -188,7 +189,7 @@ static int32 get_code(int32 q)
 
 #define FileOffsetOfSym(x) \
    (x->extoffset + ((x->extflags & xr_code) ? 0 :        \
-                    (x->extflags & xr_data) ? datastart : datastart+data.size))
+                    (x->extflags & xr_data) ? datastart : datastart+data_size()))
 
 
 static void buffer_code(int32 *src, int32 nwords)
@@ -414,7 +415,7 @@ static void obj_outsymtab(void)
                   }
 #else
                   type = N_BSS;
-                  n.n_value += datastart+data.size;
+                  n.n_value += datastart+data_size();
 #endif
               }
           } else {
@@ -441,7 +442,7 @@ static void obj_outsymtab(void)
         if ((p->nlist.n_type & N_TYPE) == N_DATA) {
             p->nlist.n_value += datastart;
         } else if ((p->nlist.n_type & N_TYPE) == N_BSS)
-            p->nlist.n_value += datastart+data.size;
+            p->nlist.n_value += datastart+data_size();
         obj_fwrite(&p->nlist, sizeof(p->nlist), 1, objstream);
         p->nlist.n_un.n_name = name;     /* @@@ totally spurious */
     }
@@ -743,7 +744,7 @@ static void obj_writedata(DataInit *p)
                 if (sno == -N_DATA)
                     val += datastart;
                 else if (sno == -N_BSS)
-                    val += datastart+data.size;
+                    val += datastart+data_size();
                 if (xr->extflags & (xr_defloc|xr_defext)) val += xr->extoffset;
                 /* beware: sex dependent... */
                 while (rpt-- != 0) obj_specialfwrite(&val, 4, 1, objstream);
@@ -808,6 +809,13 @@ int32 obj_symref(Symstr *s, int flags, int32 loc)
 #endif
 }
 
+/* Add a symbol even if it already exists */
+int32 obj_symdef(Symstr *s, int flags, int32 loc)
+{
+    symext_(s) = NULL;
+    return obj_symref(s, flags, loc);
+}
+
 void obj_init(void)
 {
     ncoderelocs   = 0;
@@ -864,7 +872,7 @@ static void obj_writeheader()
 
     h.a_magic  = OMAGIC;
     h.a_text   = datastart;    /* actually the next virtual code location... */
-    h.a_data   = data.size;    /* actually the next virtual data location... */
+    h.a_data   = data_size();    /* actually the next virtual data location... */
 #ifdef TARGET_IS_SPARC
     h.a_bss    = 0;             /* SPARC just does not have a working BSS */
 #else
@@ -894,10 +902,10 @@ void obj_trailer()
     if (codesize & 4) datastart += 4;
 #endif
 #ifdef CONST_DATA_IN_CODE
-    if (constdata.size != 0) {
+    if (constdata_size() != 0) {
         constdatabase = datastart;
         obj_symref(bindsym_(constdatasegment), xr_code+xr_defloc, constdatabase);
-        datastart +=  constdata.size;
+        datastart +=  constdata_size();
 #if (alignof_double > 4)      /* TARGET_ALIGNS_DOUBLES */
         if (datastart & 4) datastart += 4;
 #endif
@@ -906,19 +914,19 @@ void obj_trailer()
     obj_writecode();
     constdatabase = codebase;
 #ifdef CONST_DATA_IN_CODE
-    if (constdata.size != 0)
-        obj_writedata(constdata.head);
+    if (constdata_size() != 0)
+        obj_writedata(constdata_head());
 #endif
     if (debugging(DEBUG_OBJ)) cc_msg("writedata at %lx\n", ftell(objstream));
-    obj_writedata(data.head);
+    obj_writedata(data_head());
     if (debugging(DEBUG_OBJ)) cc_msg("codereloc at %lx\n", ftell(objstream));
     obj_coderelocation();
 #ifdef CONST_DATA_IN_CODE
-    if (constdata.size != 0)
-        ncoderelocs += obj_datarelocation(constdata.xrefs, constdatabase);
+    if (constdata_size() != 0)
+        ncoderelocs += obj_datarelocation(constdata_xrefs(), constdatabase);
 #endif
     if (debugging(DEBUG_OBJ)) cc_msg("datareloc at %lx\n", ftell(objstream));
-    ndatarelocs = obj_datarelocation(data.xrefs, 0L);
+    ndatarelocs = obj_datarelocation(data_xrefs(), 0L);
     if (debugging(DEBUG_OBJ)) cc_msg("symtab    at %lx\n", ftell(objstream));
 #ifdef TARGET_HAS_DEBUGGER
     /*

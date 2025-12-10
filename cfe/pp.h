@@ -3,12 +3,13 @@
  * Copyright (C) Acorn Computers Ltd., 1988-1990.
  * Copyright (C) Codemist Ltd., 1988-1992.
  * Copyright (C) Advanced RISC Machines Limited, 1990-1992.
+ * SPDX-Licence-Identifier: Apache-2.0
  */
 
 /*
- * RCS $Revision: 1.7 $
- * Checkin $Date: 1993/10/07 17:47:48 $
- * Revising $Author: irickard $
+ * RCS $Revision$
+ * Checkin $Date$
+ * Revising $Author$
  */
 
 #ifndef _pp_h
@@ -83,22 +84,25 @@ extern void pp_init(FileLine *fl);
  * file named on the compiler's command line.
  */
 
-extern void pp_notesource(char *filename, FILE *stream);
+extern void pp_notesource(char const *filename, FILE *stream, bool preinclude);
 /*
- * Called before processing a pre-included file (stream != stdin) or
- * before each top-level file (stream == stdin).
+ * Called before processing a pre-included file or
+ * before each top-level file.
  */
 
-extern void pp_push_include(char *fname, int lquote);
+extern void pp_push_include(char const *fname, int lquote, FileLine fl);
 /*
  * Support for other languages such as F77. 'fname' is the name of a file
  * to continue reading from; lquote is assumed to be one of <, " or '.
  * The matching rquote is computes as lquote == '<' ? '>' : lquote.
  */
 
+typedef struct pp_uncompression_record pp_uncompression_record;
+
 #ifndef NO_INSTORE_FILES
 
-extern FILE *open_builtin_header(char *name, bool *sf);
+extern FILE *open_builtin_header(const char *name,
+                                 pp_uncompression_record **urp);
 /*
  * Return a stream to a builtin header file and whether the file was opened
  * as a system file or not.
@@ -110,11 +114,11 @@ extern FILE *open_builtin_header(char *name, bool *sf);
  * currently in mip/compiler.c. Thus they are part of pp's interface.
  */
 
-extern FILE *pp_inclopen(char *name,
-    bool is_system, bool *system, char **filename);
+extern FILE *pp_inclopen(char const *name, bool is_system,
+    pp_uncompression_record **urp, char const **filename, FileLine fl);
 /*
  * Open the file called 'name'; is_system is true if the source form is
- * <file> rather than "file". 
+ * <file> rather than "file".
  * Returns: the opened file;
  *          system = is_system && file found on the system search path;
  *          filename = the host name of the opened file.
@@ -125,9 +129,26 @@ extern void pp_inclclose(FileLine fl);
  * Close and adjust the search path.
  */
 
+FILE *new_compressed_header(FILE *f, pp_uncompression_record **urp);
+
 #ifdef FORTRAN
 extern void pp_pop_include(void);
 #endif
+
+typedef struct PragmaSpelling
+{
+    char const *name;
+    short int code;
+#ifdef FORTRAN
+    int32 value;        /* see values below */
+#else
+    short int value;
+#endif
+} PragmaSpelling;
+
+PragmaSpelling const *keyword_pragma(char const *name, bool *negp);
+
+void pp_copy(void);
 
 #endif
 

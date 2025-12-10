@@ -1,13 +1,14 @@
 /*
- * cseguts.h: CSE: internal interfaces
+ * mip/cseguts.h: CSE: internal interfaces
  * Copyright (C) Acorn Computers Ltd., 1988.
- * Copyright (C) Advanced Risc Machines Ltd., 1991
+ * Copyright 1991-1997 Advanced Risc Machines Limited. All rights reserved
+ * SPDX-Licence-Identifier: Apache-2.0
  */
 
 /*
- * RCS $Revision: 1.28 $
- * Checkin $Date: 1996/01/05 16:24:19 $
- * Revising $Author: hmeeking $
+ * RCS $Revision$
+ * Checkin $Date$
+ * Revising $Author$
  */
 
 #ifndef _cseguts_h
@@ -21,47 +22,54 @@
 #define E_UNARY   1  /* unaryop Exprn */
 #define E_BINARYK 2  /* Exprn binaryop const */
 #define E_BINARY  3  /* Exprn binaryop Exprn */
-#define E_LOAD    4  /* load value of vreg/binder/[Exprn, #offset] */
-#define E_MISC    5  /* nasties.  should be none? */
-#define E_LOADR   6
-#define E_CALL    7
+#define E_TERNARY 4  /* Exprn ? Exprn : Exprn */
+#define E_LOAD    5  /* load value of vreg/binder/[Exprn, #offset] */
+#define E_MISC    6  /* nasties.  should be none? */
+#define E_LOADR   7
+#define E_CALL    8
 
 typedef struct ExprnUse ExprnUse;
 struct ExprnUse {
     ExprnUse *cdr;
     BlockHead *block;
-    unsigned32 val_flags_icoden;
+    int32 val_flags_icoden;
     /* was (but can't make that 16-bit int safe)
       struct {
-        int valno: 2,
+        int valbase: 2,
+            valn : 2,
             flags: 5,
-            icoden: 25;
+            icoden: 23;
       } ix;
     */
 };
 
-#define U_NOTDEF2 0x20
+#define U_COMMUTATIVEFN 0x40 /* Just arg to find_exprn: not in an ExprnUse */
+#define U_NOTDEF2 0x20       /*  ...  (U_PEEK, too)                        */
 #define U_NOTREF 0x10
 #define U_NOTDEF 0x08
 #define U_PEEK   0x04
 #define U_STORE  0x02
 #define U_LOCALCSE 0x01
 
-#define flags_(x) ((((x)->val_flags_icoden) >> 2) & 0x1f)
-#define icoden_(x) (((x)->val_flags_icoden) >> 7)
+#define u_block_(x) ((x)->block)
+#define flags_(x) ((((x)->val_flags_icoden) >> 4) & 0x1f)
+#define icoden_(x) ((ptrdiff_t)(((x)->val_flags_icoden) >> 9))
+#define IsRealIcode(x) (icoden_(x) != -1)
 #define valno_(x) (((x)->val_flags_icoden) & 0x3)
-#define vfi_(v, f, i) ((((unsigned32)(i)) << 7) | ((unsigned32)(f) << 2) | (v))
-#define setflag_(x, f) ((x)->val_flags_icoden |= (f) << 2)
+#define nvals_(x) ((((x)->val_flags_icoden)>>2) & 0x3)
+#define vfi_(v, f, i) ((((int32)(i)) << 9) | ((int32)(f) << 4) | (v))
+#define setflag_(x, f) ((x)->val_flags_icoden |= (f) << 4)
 #define setvalno_(x, v) ((x)->val_flags_icoden = ((x)->val_flags_icoden & ~3L) | (v))
+#define setnvals_(x, v) ((x)->val_flags_icoden = ((x)->val_flags_icoden & ~(3L<<2)) | ((v)<<2))
 
-#define useicode_(a) (blkcode_((a)->block)[icoden_(a)])
+#define useicode_(a) (blkcode_(u_block_(a))[icoden_(a)])
 
 typedef struct LocList LocList;
 typedef struct Exprn Exprn;
 typedef struct Location Location;
 struct Exprn {
     Exprn *cdr;                 /* hash bucket chain */
-    int32  op;                  /* a jopcode */
+    J_OPCODE op;
     int32  nodeid;      /* nodeno<<5 | alias | type, see mknodeid_().   */
     ExprnUse *uses;
     VRegSetP leaves;    /* set of Locations on which this Exprn depends */
@@ -85,6 +93,12 @@ struct Exprn {
         struct {
             FloatCon *f;        /* ADCONF/D, MOVF/DK */
         } unarykf;
+        struct {
+            Int64Con *i;        /* ADCONLL */
+        } unaryki64;
+        struct {
+            StringSegList *s;   /* STRING */
+        } unaryks;
         struct {                /* load or store some location */
             Location *loc;
         } loc;
@@ -100,6 +114,12 @@ struct Exprn {
             VRegnum r;
             Location *rloc;
         } loadr;
+        struct {
+            Exprn *e1;
+            Exprn *e2;
+            Exprn *e3;
+            J_OPCODE mask;
+        } ternary;
         struct {
             Binder *primary;
             int32  argres;      /* a jopcode argdesc, with the function result
@@ -119,8 +139,12 @@ struct Exprn {
 #define e1k_(e) ((e)->u.unaryk.m)
 #define e1b_(e) ((e)->u.unarykb.b)
 #define e1f_(e) ((e)->u.unarykf.f)
+#define e1i64_(e) ((e)->u.unaryki64.i)
+#define e1s_(e) ((e)->u.unaryks.s)
 #define e2_(e) ((e)->u.binary.e2)
 #define e2k_(e) ((e)->u.binaryk.m)
+#define e3_(e) ((e)->u.ternary.e3)
+#define exmask_(e) ((e)->u.ternary.mask)
 #define exloc_(e) ((e)->u.loc.loc)
 #define exloadr_(e) ((e)->u.loadr.r)
 #define exloadrloc_(e) ((e)->u.loadr.rloc)
@@ -138,25 +162,33 @@ struct Exprn {
 #define exop_(e) ((e)->op)
 #define exleaves_(e) ((e)->leaves)
 
-#define is_call2(ex) ((exop_(ex) == J_CALLK || exop_(ex) == J_OPSYSK) && \
-                      exnres_(ex) == 2)
+#define is_calln(ex) ((exop_(ex) == J_CALLK || exop_(ex) == J_OPSYSK) && \
+                      exnres_(ex) > 1)
 
 typedef struct ExSet ExSet;
+struct ExSet {
+    ExSet *cdr;
+    Exprn *exprn;
+};
+#define exs_ex_(p) ((p)->exprn)
 
-typedef int32 LocType;
+typedef uint32 LocType;
 
 /* LOC_xxx values can be store references (0..7) or LOC_VAR/LOC_PVAR    */
-#define LOC_(MEM_x) (MEM_x)
-#define LOC_VAR  8
-#define LOC_PVAR 9         /* non-local or address taken */
-#define LOC_anyVAR (8+16)  /* used in masks to detect LOC_VAR/LOC_VAR.       */
-#define LOC_REG 16
-#define LOC_REALBASE 32
+#define LOC_(MEM_x)    (MEM_x)
+#define LOC_VAR        8
+#define LOC_PVAR       9      /* non-local or address taken */
+#define LOC_anyVAR     (8+16) /* used in masks to detect LOC_VAR/LOC_VAR. */
+#define LOC_REG        16
+#define LOC_REALBASE   32
+#define LOC_CONST      64
+#define LOC_LOCAL     128
+#define LOC_PEEK      256
 
 struct Location {
     Location *cdr;
     ExSet *curvalue;  /* the set of current values or Null if unknown */
-    int32  idandtype; /* id<<6 | LOC_xxxx | LOC_REALBASE, see mkidandtype_() */
+    uint32  idandtype; /* id<<8 | LOC_xxxx | LOC_REALBASE, see mkidandtype_() */
     VRegSetP users;   /* the set of Exprns killed if this location is   */
                       /* stored into (those with this as a leaf).       */
     VRegSetP aliasusers; /* union over possible aliases of alias->users */
@@ -180,20 +212,23 @@ struct Location {
     } u;
 };
 
-#define mkidandtype_(id, type) ((id) << 6 | (type))
+#define mkidandtype_(id, type) ((id) << 8 | (type))
 #define locvalue_(p) ((p)->curvalue)
 #define loctype_(p) ((p)->idandtype & 0x1f)
 #define locrealbase_(p) ((p)->idandtype & LOC_REALBASE)
-#define locid_(p)   ((p)->idandtype >> 6)
+#define locconst_(p) ((p)->idandtype & LOC_CONST)
+#define locid_(p)   ((p)->idandtype >> 8)
 #define locreg_(p)  ((p)->u.reg.regno)
 #define locbind_(p) ((p)->u.var.binder)
 #define locvartype_(p) ((p)->u.var.type)
 #define locbase_(p) ((p)->u.mem.base)
 #define locoff_(p)  ((p)->u.mem.offset)
 #define locsynonym_(p) ((p)->synonym)
-#define ispublic(p) (loctype_(p) != LOC_VAR)            /* odd name? */
+#define locload_(p) ((p)->load)
+#define ispublic(p) (loctype_(p) != LOC_VAR && !((p)->idandtype & LOC_LOCAL))
 
 typedef struct CSEDef CSEDef;
+typedef struct CSEUseList CSEUseList;
 typedef struct SavedLocVals SavedLocVals;
 
 struct CSEBlockHead {
@@ -204,25 +239,31 @@ struct CSEBlockHead {
    CSEDef *defs;
    ExSet *cmp;
    SavedLocVals *locvals;
+   VRegnum ternaryr;
+   CSEDef *defs2;
+   CSEUseList *refs;
    char reached, killedinverted, loopempty, scanned;
 };
 
-#define blk_defs_(p) ((p)->cse->defs)
-#define blk_wanted_(p) ((p)->cse->wanted)
-#define blk_wantedlater_(p) ((p)->cse->wantedlater)
-#define blk_wantedonallpaths_(p) ((p)->cse->wantedonallpaths)
-#define blk_available_(p) ((p)->cse->available)
-#define blk_killed_(p) ((p)->cse->killed)
-#define blk_killedexprns_(p) ((p)->cse->killedexprns)
-#define blk_reached_(p) ((p)->cse->reached)
+#define blk_defs_(p) (blkcse_(p)->defs)
+#define blk_wanted_(p) (blkcse_(p)->wanted)
+#define blk_wantedlater_(p) (blkcse_(p)->wantedlater)
+#define blk_wantedonallpaths_(p) (blkcse_(p)->wantedonallpaths)
+#define blk_available_(p) (blkcse_(p)->available)
+#define blk_killed_(p) (blkcse_(p)->killed)
+#define blk_killedexprns_(p) (blkcse_(p)->killedexprns)
+#define blk_reached_(p) (blkcse_(p)->reached)
 #define blk_pred_(p) (blkusedfrom_(p))
-#define blk_killedinverted_(p) ((p)->cse->killedinverted)
-#define blk_scanned_(p) ((p)->cse->scanned)
+#define blk_killedinverted_(p) (blkcse_(p)->killedinverted)
+#define blk_scanned_(p) (blkcse_(p)->scanned)
 #define LOOP_NONEMPTY 1
 #define LOOP_EMPTY 2
-#define blk_loopempty_(p) ((p)->cse->loopempty)
-#define blk_locvals_(p) ((p)->cse->locvals)
-#define blk_cmp_(p) ((p)->cse->cmp)
+#define blk_loopempty_(p) (blkcse_(p)->loopempty)
+#define blk_locvals_(p) (blkcse_(p)->locvals)
+#define blk_cmp_(p) (blkcse_(p)->cmp)
+#define blk_ternaryr_(p) (blkcse_(p)->ternaryr)
+#define blk_defs2_(p) (blkcse_(p)->defs2)
+#define blk_refs_(p) (blkcse_(p)->refs)
 
 #define blockkills(n, b) (!cseset_member(n, blk_killed_(b)) == (blk_killedinverted_(b)))
 
@@ -240,6 +281,9 @@ extern Exprn **exprnindex[EXPRNINDEXSIZE];
 #define CSEList4 syn_list4
 #define CSEList3 syn_list3
 #define CSEList2 syn_list2
+#define CSENew NewSyn
+#define CSENewN NewSynN
+#define CSENewK NewSynK
 
 #define cseset_insert(x, s, oldp) s = vregset_insert(x, s, oldp, &cseallocrec)
 #define cseset_delete(x, s, oldp) s = vregset_delete(x, s, oldp)
@@ -267,35 +311,95 @@ struct SetSPList {
 
 extern SetSPList *setsplist;
 
-extern void cse_print_loc(Location *x);
+void cse_print_loc(Location const *x);
 
-extern void cse_print_node(Exprn *p);
+void cse_print_node(Exprn const *p);
 
-extern void cse_printexits(int32 flags, LabelNumber *exit, LabelNumber *exit1);
+void cse_printexits(int32 flags, LabelNumber *exit, LabelNumber *exit1);
 
-#if 0
-/* In retirement pending removal: see definition */
-extern Icode *trytokillargs(Icode *p, Icode *blockstart, bool nextinblock);
-#endif
+bool cse_KillExprRef(ExSet *s, Icode *p);
 
-extern bool addlocalcse(Exprn *node, int valno, BlockHead *b);
+bool cse_AddLocalCSE(Exprn *node, int valno, int nvals, BlockHead *b);
 /* A use of node has occurred, with a previous evaluation in the same
    basic block (b) still alive.  No decision has been made as to the
    desirability of making it into a CSE.  Return value indicates whether
    a CSE has been made.
  */
-extern bool cse_AddPredecessor(LabelNumber *lab, BlockHead *b);
 
-extern void cse_scanblocks(BlockHead *top);
+bool cse_AddPredecessor(LabelNumber *lab, BlockHead *b);
+void cse_RemovePredecessor(LabelNumber *lab, BlockHead *b);
 
-extern Exprn *adconbase(Exprn *ex, bool allowvaroffsets);
+void cse_scanblocks(BlockHead *top);
+
+Exprn *cse_AdconBase(Exprn *ex, bool allowvaroffsets);
 
 extern ExprnUse *ExprnUse_New(ExprnUse *old, int flags, int valno);
 
-extern bool killedinblock(int32 expid);
+bool cse_KilledInBlock(int32 expid);
 
-extern bool ExSetsOverlap(ExSet *a, ExSet *b);
+bool ExSetsOverlap(ExSet const *a, ExSet const *b);
 
-extern void ExSet_TransferExprnsInSet(VRegSetP *s1, VRegSetP *s2, ExSet *set);
+void ExSet_TransferExprnsInSet(VRegSetP *s1, VRegSetP *s2, ExSet const *set);
+  /* For all Exprns in <set> which are also in the set (of Exprn ids)   */
+  /* <s1>, remove them from <s1> and add to <s2>.                       */
+
+CSEBlockHead *CSEBlockHead_New(void);
+
+#define MOVKinSet(set)  ExSet_OpMember(set, J_MOVK, 0)
+#define MOVFKinSet(set) ExSet_OpMember(set, J_MOVFK, 0)
+#define MOVDKinSet(set) ExSet_OpMember(set, J_MOVDK, 0)
+
+ExSet *ExSet_OpMember(ExSet *set, J_OPCODE op, int32 ignorebits);
+bool ExSet_Member(Exprn const *e, ExSet const *set);
+
+#if defined TARGET_HAS_SCALED_ADDRESSING || defined TARGET_HAS_SCALED_OPS || \
+    defined TARGET_HAS_SCALED_ADD
+#  define OpIsShifted(op) (((op) & J_SHIFTMASK) != 0)
+#  define UnshiftedOp(op) ((op) & ~J_SHIFTMASK)
+#  define OpWithShift(op, op1) ((op) | ((op1) & J_SHIFTMASK))
+#  define NEGINDEX J_NEGINDEX
+int32 ShiftedVal(J_OPCODE op, int32 b);
+#else
+#  define ShiftedVal(op,b) (b)
+#  define OpIsShifted(op) NO
+#  define UnshiftedOp(op) (op)
+#  define OpWithShift(op, op1) (op)
+#  define NEGINDEX 0L
+#endif
+
+FloatCon *CSE_NewDCon(DbleBin const *val);
+FloatCon *CSE_NewFCon(FloatBin const *val);
+Int64Con *CSE_NewLLCon(int64 const *ip);
+
+bool CSE_Compare_F(int *res, FloatBin const *a, FloatBin const *b);
+bool CSE_Compare_D(int *res, FloatCon const *a, FloatCon const *b);
+
+FloatCon *CSE_EvalUnary_F(J_OPCODE op, ExSet *ex);
+FloatCon *CSE_EvalUnary_D(J_OPCODE op, ExSet *ex);
+bool CSE_EvalUnary_I(J_OPCODE op, int32 *resp, ExSet *ex);
+
+FloatCon *CSE_EvalBinary_F(J_OPCODE op, ExSet *as, FloatCon const *b);
+FloatCon *CSE_EvalBinary_D(J_OPCODE op, ExSet *as, FloatCon const *b);
+bool CSE_EvalBinary_I(J_OPCODE op, int32 *resp, Exprn *ax, int32 b);
+
+FloatCon *CSE_CanonicalFPConst(FloatCon *old);
+Int64Con *CSE_CanonicalLLConst(Int64Con *old);
+
+typedef struct {
+  union {
+    DbleBin d;
+    int64 i;
+  } val;
+  bool isdouble;
+} DRes;
+
+bool CSE_EvaluableDoubleValuedCall(
+  Expr const *fn, VRegnum res, int32 argres, ExSet *arg[], DRes *dresp);
+
+bool CSE_EvaluableIntValuedCall(
+  Expr const *fn, VRegnum res, int32 argres, ExSet *arg[], int32 *resp);
+
+extern BlockHead *cse_currentblock;
 
 #endif
+/* end of mip/cseguts.h */

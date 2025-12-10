@@ -1,12 +1,13 @@
-        /*
+/*
  * C compiler file mip/dwarf.c
  * Copyright:   (C) 1995, Advanced RISC Machines Limited. All rights reserved.
+ * SPDX-Licence-Identifier: Apache-2.0
  */
 
 /*
- * RCS $Revision: 1.13 $
- * Checkin $Date: 1995/11/07 17:40:55 $
- * Revising $Author: fwai $
+ * RCS $Revision$
+ * Checkin $Date$
+ * Revising $Author$
  */
 
 /* The debug table formatter for DWARF debug tables, for embedding in ELF
@@ -21,6 +22,10 @@
 #include <stddef.h>
 
 #include "globals.h"
+
+#if defined(TARGET_HAS_DEBUGGER) && defined(TARGET_HAS_DWARF)
+
+#include "syn.h" /* for syn_note_generated_fn */
 
 #ifdef TARGET_HAS_MULTIPLE_DEBUG_FORMATS
 
@@ -40,10 +45,13 @@
 #define dbg_xendproc dwarf_xendproc
 #define dbg_define dwarf_define
 #define dbg_undef dwarf_undef
+#define dbg_include dwarf_include
+#define dbg_notepath dwarf_notepath
 #define dbg_init dwarf_init
 #define dbg_finalise dwarf_finalise
 #define dbg_setformat dwarf_setformat
 #define dbg_final_src_codeaddr dwarf_final_src_codeaddr
+#define dbg_needsframepointer dwarf_needsframepointer
 
 #define obj_notefpdesc dwarf_notefpdesc
 #define dbg_debugareaexists dwarf_debugareaexists
@@ -62,29 +70,20 @@
 #include "regalloc.h"
 #include "util.h"
 #include "sem.h"       /* alignoftype, sizeoftype, structfield */
-#include "builtin.h"   /* te_xxx, xxxsegment */
+#include "builtin.h"   /* te_xxx, xxxsegment, thissym etc */
 #include "bind.h"
 #include "simplify.h"  /* mcrep */
-#include "version.h"
 #include "dwarf.h"
 #include "unmangle.h"  /* unmangle() */
 
-/* Private tag values used to mark DbgList items. They don't make it out */
-/* into the debug tables.                                                */
+#include "dw_int.h"
 
-#define DW_TAG_endproc (DW_TAG_lo_user)
-#define DW_TAG_end_lexical_block (DW_TAG_lo_user+1)
-#define DW_TAG_proctype_formal (DW_TAG_lo_user+2)
-#define DW_TAG_fref (DW_TAG_lo_user+3)
-#define DW_TAG_ignore (DW_TAG_lo_user+4)
+Symstr *dw_debug_sym, *dw_lineinfo_sym;
+Symstr *dw_macro_sym, *dw_abbrev_sym, *dw_location_sym;
 
-#ifdef TARGET_HAS_DEBUGGER
-
-#ifdef TARGET_HAS_DWARF
-
-static Symstr *debug_sym, *lineinfo_sym;
-
-static int dwarf_version;
+static int dw_version;
+static uint32 dw_nameindex_size;
+static Dw_ItemList *dw_section;
 
 #ifndef TARGET_HAS_MULTIPLE_DEBUG_FORMATS
 
@@ -93,201 +92,60 @@ int usrdbgmask;
 
 #endif
 
-#define DEBUGAREANAME (dwarf_version == 2 ? ".debug_info" : ".debug")
-#define LINEINFOAREANAME (dwarf_version == 2 ? ".debug_line" : ".line")
-#define NAMEINDEXAREANAME ".debug_pubnames"
-#define RANGEINDEXAREANAME ".debug_arange"
-
-static void dbg_sub_init(void);
-static bool dbg_init_done, dbg_sub_init_done;
+static void dw_sub_init(void);
+static bool dw_init_done, dw_sub_init_done;
 
 #define DbgAlloc(n) GlobAlloc(SU_Dbg, n)
 #define DbgNew(type) ((type *)DbgAlloc(sizeof(type)))
 
-typedef struct DbgList Dw_TypeRep;
+Dw_ItemList *dw_list, *dw_listproc;
+Dw_ItemList *dw_basetypes;
 
-typedef struct Dbg_Structelt Dbg_Structelt;
-typedef struct Dbg_Enumelt Dbg_Enumelt;
-typedef struct Dbg_Return Dbg_Return;
+Dw_LocList *dw_loclist;
+Dw_MacroList *dw_macrolist;
 
-/* The next macro seems to indicate a lack to do this portably in ANSI-C */
-/* Are discriminated unions second class objects?                        */
-#define DbgListAlloc(variant) \
-    ((DbgList *)DbgAlloc((size_t)(sizeof(dbglist->car.variant)+offsetof(DbgList,car))))
-
-/* The following is the *internal* data structure in which debug info. */
-/* is buffered.                                                        */
-typedef struct DbgList DbgList;
-typedef enum {
-    Stg_Reg,
-    Stg_Auto,
-    Stg_Static,
-    Stg_Extern,
-    Stg_ArgReg,
-    Stg_ArgAuto
-} StgClass;
-
-typedef struct {
-    Symstr *sym;
-    RealRegister r;
-} SymOrReg;
-
-struct DbgList {
-    DbgList *cdr;
-    int debsort;
-    DbgList *sibling;
-    unsigned32 dbgloc;
-    union
-    {  struct { DbgList *children;
-                char *name;
-                Symstr *codeseg;
-                int32 codesize;
-              } DEB_SECTION;
-       struct { DbgList *children;
-                Dw_TypeRep *type;
-                int32 sourcepos;
-                int32 entryaddr, bodyaddr;   /* see dbg_bodyproc */
-                DbgList *endproc;
-                int global;
-                char *fileentry;
-                char *name;
-                Symstr *codeseg;
-                bool variadic;
-                int32 virtuality;
-                int32 vtable_offset;
-                bool inlined;
-                Dw_TypeRep *mem;
-              } DEB_PROC;
-       struct { DbgList *qualtypes;
-                DbgList *children;
-                Dw_TypeRep *type;
-              } DEB_PROCTYPE;
-       struct { DbgList *qualtypes;
-                Dw_TypeRep *container;
-                Dw_TypeRep *type;
-              } DEB_PTRTOMEMTYPE;
-       struct { Symstr *name;
-                Dw_TypeRep *type;
-              } DEB_FORMAL;
-       struct { int32 dummy;
-              } DEB_REST;
-       struct { int32 endaddr;
-/* a (Deb_filecoord *) next line may subsume sourcepos too */
-              } DEB_ENDPROC;
-       struct { Dw_TypeRep *type;
-                int32 sourcepos;
-                StgClass stgclass;
-                int32 location;
-                Symstr *sym;
-                SymOrReg base;
-                Dw_TypeRep *mem;
-              } DEB_VAR;
-       struct { DbgList *qualtypes;
-                char *name;
-                Dw_TypeRep *type;
-                TypeExpr *typex;
-              } DEB_TYPE;
-       struct { DbgList *qualtypes;
-                int typecode;
-              } DEB_BASETYPE;
-       struct { Dw_TypeRep *type;
-                Dw_TypeRep *next;  /* qualified type of the same type */
-                Dw_TypeRep *basetype;
-                int n;
-                char *qualmap;
-              } DEB_QUALTYPE;
-       struct { DbgList *qualtypes;
-                char *name;
-                DbgList *children;
-                Dw_TypeRep *container;
-                char size;
-              } DEB_ENUM;
-       struct { char *name;
-                int32 val;
-              } DEB_ENUMERATOR;
-       struct { DbgList *qualtypes;
-                int32 size;
-                int32 open;
-                Dw_TypeRep *basetype;
-                int32 lowerbound;
-                int32 upperbound;
-              } DEB_ARRAY;
-       struct { DbgList *qualtypes;
-                char *name;
-                DbgList *children;
-                int undefsort;
-                  /* A not-yet-defined (but referenced) struct, class or   */
-                  /* union is given sort TAG_fref, and its real sort is    */
-                  /* stored in undefsort.                                  */
-                int32 size;
-                Friend *friends;
-              } DEB_STRUCT;
-       struct { char *name;                     /* source form */
-                int32 offset;
-                Dw_TypeRep *type;
-                unsigned8 bsize, boffset;
-                bool decl;
-              } DEB_MEMBER;
-       struct { Dw_TypeRep *type;
-                int32 offset;
-                int32 virtuality;
-              } DEB_INHERIT;
-       struct { union { DbgList *next;
-                        int32 codeaddr;
-                      } s;
-                DbgList *children;
-                DbgList *end;
-                Symstr *codeseg;
-              } DEB_STARTSCOPE;
-       struct { union { DbgList *next;
-                        int32 codeaddr;
-                      } s;
-              } DEB_ENDSCOPE;
-       struct { int32 space;
-                char const *name;
-                int32 argcount;
-                char const *body;
-                dbg_ArgList const *arglist;
-                FileLine fl;
-              } DEB_DEFINE;
-       struct { char const *name;
-                FileLine fl;
-              } DEB_UNDEF;
-       struct { DbgList **parent;
-              } DEB_NULL;
-    } car;
-};
-
-static DbgList *dbglist, *dbglistproc;
-static DbgList *basetypes;
-
-typedef struct Dbg_LocList Dbg_LocList;
-struct Dbg_LocList
-{   Dbg_LocList *cdr;
-    Binder *name;
-    int32 pos;
-    Dw_TypeRep *typeref;
-};
-
-static Dbg_LocList *dbg_loclist;
-
-static struct {
-    Symstr *sym;
-    int32 len;
-} baseseg;
+struct Dw_BaseSeg dw_baseseg;
 
 typedef struct Dw_Scope Dw_Scope;
 struct Dw_Scope {
     Dw_Scope *cdr;
-    DbgList *item;
-    DbgList **childlist;
-    DbgList **childp;
+    Dw_ItemList *item;
+    Dw_ItemList **childlist;
+    Dw_ItemList **childp;
 };
 
 static Dw_Scope *freescopes,
                 *scopestack;
 
-static void PushScope(DbgList *item, DbgList **childp) {
+#define Dw_ItemAlloc(variant, tag) \
+  Dw_ItemAlloc_S((size_t)(sizeof(dw_list->car.variant)+offsetof(Dw_ItemList,car)), tag)
+
+static Dw_ItemList *Dw_ItemAlloc_S(size_t size, unsigned tag) {
+  Dw_ItemList *p = (Dw_ItemList *)DbgAlloc(size);
+  debsort_(p) = tag;
+  dbgloc_(p) = 0;
+  return p;
+}
+
+#define dw_additem(sort, tag) \
+  dw_additem_s((size_t)(sizeof(dw_list->car.sort)+offsetof(Dw_ItemList,car)), tag)
+
+static Dw_ItemList *dw_additem_s(size_t size, unsigned tag) {
+  Dw_ItemList *p = (Dw_ItemList *)DbgAlloc(size);
+  debsort_(p) = tag;
+  sibling_(p) = NULL; *scopestack->childp = p; scopestack->childp = &sibling_(p);
+  cdr_(p) = dw_list; dw_list = p;
+  dbgloc_(p) = 0;
+  return p;
+}
+
+static Dw_ItemList *dw_addtoitemlist(Dw_ItemList *p) {
+  sibling_(p) = NULL; *scopestack->childp = p; scopestack->childp = &sibling_(p);
+  cdr_(p) = dw_list; dw_list = p;
+  return p;
+}
+
+static void PushScope(Dw_ItemList *item, Dw_ItemList **childp) {
   Dw_Scope *p = freescopes;
   if (p != NULL)
     freescopes = cdr_(freescopes);
@@ -298,52 +156,36 @@ static void PushScope(DbgList *item, DbgList **childp) {
   scopestack = p;
 }
 
-static void PopScope(void) {
+static void PopScope(bool force) {
   Dw_Scope *p = scopestack;
   scopestack = cdr_(p);
   cdr_(p) = freescopes;
   freescopes = p;
-  if (*p->childlist != NULL) {
-    DbgList *terminator = DbgListAlloc(DEB_NULL);
-    cdr_(terminator) = dbglist; dbglist = terminator;
-    terminator->debsort = TAG_padding;
-    terminator->sibling = NULL;
-    terminator->car.DEB_NULL.parent = p->childlist;
+  if (*p->childlist != NULL || force) {
+  /* Normally, if the current scope has no child debug items, no end scope
+   * item is generated here. This works happily for DWARF1, where the
+   * criterion for an item to have children is that its sibling isn't the
+   * next item. For DWARF2, it works only if there are two sets of abbreviation
+   * entries for the parent item (one declaring there are children, one not).
+   * For items which almost always have children, less output is produced if
+   * there's only the 'has children' one, in which case an end of scope
+   * item must always be produced.
+   */
+    Dw_ItemList *terminator = Dw_ItemAlloc(DEB_NULL, TAG_padding);
+    cdr_(terminator) = dw_list; dw_list = terminator;
+    sibling_(terminator) = NULL;
+    null_parent_(terminator) = p->childlist;
     *p->childp = terminator;
   }
 }
 
-static DataXref *dw_relocate(DataXref *xrefs, int32 where, Symstr *symbol) {
-  return (DataXref*)global_list3(SU_Xref, xrefs, where, symbol);
-}
-
-/* First structs and code for buffering file/line co-ordinates.         */
-/* We have one of these for every file we see.  BUT because a file may  */
-/* validly be included more than once in a C program, we had better do  */
-/* pointer, not string, equality on names, and rely on pp.c behaviour.  */
-
-typedef struct Deb_filecoord Deb_filecoord;
-typedef struct Deb_filelist Deb_filelist;
-
-struct Deb_filelist
-{   Deb_filelist *nextfile;
-    char *filename;
-    unsigned lastline;
-    Deb_filecoord *linelist;
-};
-
-struct Deb_filecoord
-{   Deb_filecoord *cdr;
-    Deb_filelist *file; Deb_filecoord *nextinfile;
-    unsigned16 line, col;
-    int32 codeaddr;
-    Symstr *codeseg;
-};
-
-static Deb_filelist *dbg_filelist;
+Dw_PathList *dw_pathlist;
+static Uint dw_pathindex;
+Dw_FileList *dw_filelist;
+static Uint dw_fileindex;
 /* The next two vars are (code order) list & tail pointer */
-static Deb_filecoord *dbg_coord_p, **dbg_coord_q;
-static Deb_filecoord dbg_coord_sentinel =
+Dw_FileCoord *dw_coord_p, **dw_coord_q;
+Dw_FileCoord dw_coord_sentinel =
   {   0,                   /* cdr                                      */
       0, 0,                /* file, nextinfile                         */
       0, 0xffff, 0         /* line, col, codeaddr(set by dbg_fileinfo).*/
@@ -355,38 +197,44 @@ int32 dbg_tableindex(int32 dt_number)
   return 0;
 }
 
+static Dw_FileList *Dw_FindFile(char const *name) {
+  Dw_FileList *p = dw_filelist;
+  for (; p != NULL; p = cdr_(p))
+    if (p->filename == name) return p;
+
+  p = DbgNew(Dw_FileList);
+  cdr_(p) = dw_filelist; p->filename = name; p->linelist = 0;
+  p->index = (name != NULL && StrEq(name, "<command line>")) ? 0 : ++dw_fileindex;
+  p->dir = NULL; p->timestamp = 0; p->filelength = 0;
+  dw_filelist = p;
+  return p;
+}
+
 void *dbg_notefileline(FileLine fl) {
-  Deb_filelist *x;
-  if (!dbg_sub_init_done) dbg_sub_init();
-  x = dbg_filelist;
-  while (x != NULL && x->filename != fl.f) x = x->nextfile;
-  if (x == NULL) {
-    x = DbgNew(Deb_filelist);
-    x->nextfile = dbg_filelist, x->filename = fl.f,
-    x->linelist = 0;
-    dbg_filelist = x;
-  }
+  Dw_FileList *x;
+  if (!dw_sub_init_done) dw_sub_init();
+  x = Dw_FindFile(fl.f);
   if (usrdbg(DBG_LINE)) {
-    Deb_filecoord *l = x->linelist;
+    Dw_FileCoord *l = x->linelist;
     /* There used to be a syserr here if (l != NULL && l->line > fl.l),
        but it can be triggered by #line (though not #line n file, which
        won't give equality of filename): the CVS has an example. Also, it
        fails if functions are taken out of file order, as in the
        out-of-line expansion of inline functions.
      */
-    l = DbgNew(Deb_filecoord);
+    l = DbgNew(Dw_FileCoord);
       cdr_(l) = NULL,
       l->nextinfile = x->linelist, x->linelist = l,
       l->file = x, l->line = fl.l, l->col = fl.column,
       l->codeaddr = -1;
-      l->codeseg = dbg_init_done ? bindsym_(codesegment) : 0;
+      l->codeseg = dw_init_done ? bindsym_(codesegment) : 0;
     x->lastline = fl.l;
     return (void *)l;
   }
   return DUFF_ADDR;
 }
 
-static DbgList *dbglistscope;
+static Dw_ItemList *dw_listscope;
 
 /* The 'dbgaddr' arg has type 'void *' to keep the debugger types local to */
 /* this file.  This does not make it any less of a (ANSI approved) hack.   */
@@ -396,194 +244,320 @@ void dbg_addcodep(void *dbgaddr, int32 codeaddr) {
      * dbg_scope, to mark the relevant code address.
      */
     if (debugging(DEBUG_Q)) cc_msg("-- scope at 0x%lx\n", codeaddr);
-    { DbgList *p = dbglistscope, *next;
+    { Dw_ItemList *p = dw_listscope, *next;
       for (; p != NULL; p = next) {
-        next = p->car.DEB_STARTSCOPE.s.next;
-        p->car.DEB_STARTSCOPE.s.codeaddr = codeaddr;
+        next = startscope_next_(p);
+        startscope_codeaddr_(p) = codeaddr;
       }
-      dbglistscope = NULL;
+      dw_listscope = NULL;
     }
   } else if (usrdbg(DBG_LINE)) {
-    Deb_filecoord *p = (Deb_filecoord *)dbgaddr;
+    Dw_FileCoord *p = (Dw_FileCoord *)dbgaddr;
     if (debugging(DEBUG_Q))
-      cc_msg("%p ('%s' line %u/%u) @ %.6lx\n", (VoidStar )p,
+      cc_msg("%p ('%s' line %u/%u) @ %.6lx\n", p,
              p->file->filename, p->line, p->col, (long)codeaddr);
     /* The following test avoids setting nextincode/codeaddr twice */
     /* This is currently needed in case FileLine's are duplicated. */
     if (p->codeaddr == -1) {
       p->codeaddr = codeaddr;
-      *dbg_coord_q = p;
-      dbg_coord_q = &cdr_(p);
+      *dw_coord_q = p;
+      dw_coord_q = &cdr_(p);
     }
   }
 }
 
-static DataXref *xrefs;
+DataXref *dw_xrefs;
 
-typedef union {
-  unsigned32 u;
-  char const *s;
-  struct {
-    unsigned32 n;
-    Symstr *sym;
-  } ref;
-  unsigned32 d[2];
-} AttribArg;
+DataXref *Dw_Relocate(DataXref *xrefs, int32 where, Symstr const *symbol) {
+  return (DataXref*)global_list3(SU_Xref, xrefs, where, symbol);
+}
 
-static unsigned32 dw_inlinestring(char const *s, unsigned32 offset) {
-  size_t n = strlen(s);
+uint32 Dw_WriteInlineString(char const *s, uint32 offset) {
+  uint32 n = strlen(s);
   obj_writedebug(s, n+1);
   return offset + n + 1;
 }
 
-static unsigned32 dw_write_b(unsigned u, unsigned32 offset) {
+uint32 Dw_WriteB(unsigned u, uint32 offset) {
   char b[1];
   b[0] = u; obj_writedebug(b, 1);
   return offset + 1;
 }
 
-static unsigned32 dw_write_h(unsigned32 u, unsigned32 offset) {
-  unsigned16 h[1];
-  h[0] = (unsigned16)u; obj_writedebug(h, 1+DBG_SHORTFLAG);
+uint32 Dw_WriteBN(uint8 const *p, int32 n, uint32 offset) {
+  obj_writedebug(p, n);
+  return offset + n;
+}
+
+uint32 Dw_WriteH(uint32 u, uint32 offset) {
+  uint16 h[1];
+  h[0] = (uint16)u; obj_writedebug(h, 1+DBG_SHORTFLAG);
   return offset + 2;
 }
 
-static unsigned32 dw_write_w(unsigned32 u, unsigned32 offset) {
+uint32 Dw_WriteW(uint32 u, uint32 offset) {
   obj_writedebug(&u, 1+DBG_INTFLAG);
   return offset + 4;
+}
+
+uint32 Dw_WriteL(uint32 const *d, uint32 offset) {
+  obj_writedebug(d, 2+DBG_INTFLAG);
+  return offset + 8;
+}
+
+uint32 Dw_WriteW_Relocated(uint32 w, Symstr const *sym, uint32 offset) {
+  dw_xrefs = Dw_Relocate(dw_xrefs, offset, sym);
+  return Dw_WriteW(w, offset);
 }
 
 /* End of file/line co-ordinate code */
 
 static Dw_TypeRep *Dw_PrimType(int typecode) {
-  Dw_TypeRep *p = basetypes;
-  for (; p != NULL; p = cdr_(p))
-    if (p->car.DEB_BASETYPE.typecode == typecode)
+  Dw_TypeRep *p = dw_basetypes;
+  for (; p != NULL; p = basetype_next_(p))
+    if (basetype_typecode_(p) == typecode)
       return p;
-  p = DbgListAlloc(DEB_BASETYPE);
-  cdr_(p) = basetypes; basetypes = p;
-  p->debsort = DW_TAG_base_type;
-  p->car.DEB_BASETYPE.typecode = typecode;
-  p->car.DEB_BASETYPE.qualtypes = NULL;
-  return p;
-}
-
-#define dw_additem(sort, tag) \
-  dw_additem_s((size_t)(sizeof(dbglist->car.sort)+offsetof(DbgList,car)), tag)
-
-static DbgList *dw_additem_s(size_t size, unsigned tag) {
-  DbgList *p = (DbgList *)DbgAlloc(size);
-  p->debsort = tag;
-  p->sibling = NULL; *scopestack->childp = p; scopestack->childp = &p->sibling;
-  cdr_(p) = dbglist; dbglist = p;
+  p = dw_additem(DEB_BASETYPE, DW_TAG_base_type);
+  basetype_next_(p) = dw_basetypes; dw_basetypes = p;
+  basetype_typecode_(p) = typecode;
+  basetype_qual_(p) = NULL;
   return p;
 }
 
 static void dw_typerep(TypeExpr *, Dw_TypeRep **typep);
 
+typedef struct Dw_fmlList  Dw_fmlList;
+struct Dw_fmlList {
+  Dw_fmlList *cdr;
+  Binder *fb;
+  Dw_ItemList *p;
+};
+
+static Dw_fmlList *dw_fmllist;
+static FileLine dbg_invented_fl = {0, 0, 0};
+
+static void dw_generate_default_fn(Expr *e, Dw_ItemList *fml) {
+  Symstr *fname = sym_insert_id(symname_(gensymval(YES)));
+  TypeExprFnAux s;
+  Cmd *p = (Cmd *)GlobAlloc(SU_Other, (int32)offsetof(Cmd, cmd2));
+  TypeExpr *ftype = g_mkTypeExprfn(t_fnap, typeofexpr(e), 0, 0,
+                                   packTypeExprFnAux(s, 0, 0, 0, 0, 0));
+  DeclRhsList *d = mkDeclRhsList(fname, ftype, bitofstg_(s_static)|b_fnconst);
+  Binder *fbind = instate_declaration(d, TOPLEVEL);
+  binduses_(fbind) |= u_referenced;
+  p->fileline = dbg_invented_fl;
+  h0_(p) = s_return;
+  cmd1e_(p) = optimise0(mk_expr1(s_return, typeofexpr(e), e));
+  syn_note_generated_fn(mkTopDeclFnDef(s_fndef, fbind, NULL,
+        mk_cmd_block(dbg_invented_fl, 0, mkCmdList(0, p)), 0));
+  { Dw_fmlList *l = DbgNew(Dw_fmlList);
+    cdr_(l) = dw_fmllist, l->fb = fbind, l->p = fml, dw_fmllist = l;
+  }
+}
+
+static void dw_formalparameterlistrep(TypeExpr *x) {
+  FormTypeList *ft = typefnargs_(x);
+  for (; ft != NULL; ft = ft->ftcdr) {
+    Dw_ItemList *p = Dw_ItemAlloc(DEB_FORMAL, DW_TAG_proctype_formal);
+    formal_invented_(p) = NO;
+    formal_name_(p) = ft->ftname;
+    if (LanguageIsCPlusPlus && ft->ftname != NULL && ft->ftname == thissym)
+      formal_invented_(p) = YES;
+
+    dw_typerep(ft->fttype, &formal_type_(p));
+    dw_addtoitemlist(p);
+    { Expr *e = ft->ftdefault;
+      if (e != NULL)
+        switch (h0_(e)) {
+        default:
+          dw_generate_default_fn(e, p);
+          /* drop through */
+        case s_integer:
+        case s_floatcon:
+        case s_string:
+          formal_defltexpr_(p) = e;
+          break;
+        }
+      else
+        formal_defltexpr_(p) = NULL;
+    }
+  }
+  if (fntypeisvariadic(x))
+    dw_additem(DEB_REST, DW_TAG_unspecified_parameters);
+}
+
+/*
+static bool dw_hasdefaultvalues(FormTypeList *ft) {
+  for (; ft != NULL; ft = ft->ftcdr)
+    if (ft->ftdefault != NULL)
+      return YES;
+  return NO;
+}
+*/
+
 static Dw_TypeRep *dw_arrayrep(TypeExpr *t, Expr *e)
 { /* e is the array size. Since C arrays start at 0, the upper bound is */
   /* one less                                                           */
-  DbgList *p = DbgListAlloc(DEB_ARRAY);
-  p->debsort = DW_TAG_array_type;
-  p->car.DEB_ARRAY.open = e == NULL;
-  dw_typerep(t, &p->car.DEB_ARRAY.basetype);
-  p->car.DEB_ARRAY.lowerbound = 0;
-  p->car.DEB_ARRAY.upperbound = e ? evaluate(e)-1:0;
-  p->car.DEB_ARRAY.size = sizeoftype(t);
-  p->car.DEB_ARRAY.qualtypes = NULL;
-  p->sibling = NULL; *scopestack->childp = p; scopestack->childp = &p->sibling;
-  p->cdr = dbglist;              /* do this last (typerep above) */
-  dbglist = p;
+  Dw_ItemList *p = Dw_ItemAlloc(DEB_ARRAY, DW_TAG_array_type);
+  if (e && h0_(e) == s_binder) e = NULL;
+  array_open_(p) = e == NULL;
+  dw_typerep(t, &array_basetype_(p));
+  array_lowerbound_(p) = 0;
+  array_upperbound_(p) = e ? evaluate(e)-1:0;
+  array_size_(p) = sizeoftype(t);
+  array_qual_(p) = NULL;
+  dw_addtoitemlist(p);            /* do this last (typerep above) */
+  PushScope(p, &array_children_(p));
+  { Dw_ItemList *bound = dw_additem(DEB_ARRAYBOUND, DW_TAG_array_bound);
+    arraybound_open_(bound) = array_open_(p);
+    arraybound_upperbound_(bound) = array_upperbound_(p);
+  }
+  PopScope(NO);
   return p;
 }
 
-static void move_children(DbgList *p, DbgList *prevlist) {
-  /* Move the child entries of p, currently at the head of dbglist (up to   */
+static void move_children(Dw_ItemList *p, Dw_ItemList *prevlist) {
+  /* Move the child entries of p, currently at the head of dw_list (up to   */
   /* but not including prevlist) to immediately before p (after it when the */
   /* list is reversed)                                                      */
-  DbgList *end = dbglist,
-          *before;
+  Dw_ItemList *end = dw_list,
+              *before;
   for (; cdr_(end) != prevlist; end = cdr_(end)) continue;
   for (before = prevlist; cdr_(before) != p; before = cdr_(before)) continue;
-  cdr_(before) = dbglist; cdr_(end) = p;
-  dbglist = prevlist;
+  cdr_(before) = dw_list; cdr_(end) = p;
+  dw_list = prevlist;
 }
 
-static void dbg_proc_i(Symstr *name, TypeExpr *t, bool ext, FileLine fl, bool virt, int32 voffset, bool inlined);
-void dbg_xendproc(FileLine fl);
-FileLine dbg_invented_fl = {0, 0, 0};
+/* bit like dw_additem(); makes move_children() redundant
+   for structs. maybe enum too, but that's less important.
+ */
+static void move_to_top(Dw_ItemList *p)
+{   Dw_ItemList *before = cdr_(p);
+    for (; before && sibling_(before) != p; before = cdr_(before));
+    if (before) sibling_(before) = sibling_(p);
+    if (!LanguageIsCPlusPlus)
+    {   /* how could this be possible??? */
+        for (before = cdr_(p); before; before = cdr_(before))
+            if ((debsort_(before) == DW_TAG_structure_type ||
+                 debsort_(before) == DW_TAG_union_type ||
+                 debsort_(before) == DW_TAG_class_type) &&
+                struct_children_(before) == p)
+            {   struct_children_(before) = sibling_(p);
+                break;
+            }
+    }
+    if (sect_children_(dw_section) == p)
+        sect_children_(dw_section) = sibling_(p);
+    cdr_(sibling_(p)) = cdr_(p);
+    sibling_(p) = NULL;
+    cdr_(p) = dw_list; dw_list = p;
+    *scopestack->childp = p; scopestack->childp = &sibling_(p);
+}
+
+static void dw_typeinternal(Symstr *name, Dw_TypeRep *t, TypeExpr *type);
+
+static Dw_ItemList *Dw_ProcDeclRep(Symstr *name, Binder *b, Dw_ItemList *parent, int ext) {
+  Dw_ItemList *d = Dw_ItemAlloc(DEB_PROCDECL, DW_TAG_procdecl);
+  TypeExpr *t = princtype(bindtype_(b));
+  dw_typerep(typearg_(t), &procdecl_type_(d));
+  procdecl_name_(d) = symname_(name);
+  procdecl_variadic_(d) = fntypeisvariadic(t);
+  procdecl_global_(d) = ext;
+  procdecl_stg_(d) = bindstg_(b);
+  procdecl_parent_(d) = parent;
+  procdecl_voffset_(d) = (bindstg_(b) & bitofstg_(s_virtual)) ? bindxx_(b) : -1;
+  dw_addtoitemlist(d); /* do this last (typerep above) */
+  PushScope(d, &procdecl_children_(d));
+  dw_formalparameterlistrep(t);
+  PopScope(dw_version == 2);
+  binddbg_(b) = (IPtr)d;
+  return d;
+}
 
 static Dw_TypeRep *dw_structentry(Dw_TypeRep *p, TagBinder *b, TypeExpr *x) {
   SET_BITMAP sort = tagbindbits_(b) & CLASSBITS;
   int itemsort = sort == bitoftype_(s_struct) ? DW_TAG_structure_type :
                  sort == bitoftype_(s_union)  ? DW_TAG_union_type :
                                                 DW_TAG_class_type;
-  DbgList *prev_dbglist = NULL;
+#if 0
+  Dw_ItemList *prev_dw_list = NULL;
+#endif
   if (p == NULL) {
     p = dw_additem(DEB_STRUCT, itemsort);
-    p->car.DEB_STRUCT.size = 0;    /* filled in later */
-    p->car.DEB_STRUCT.name = isgensym(tagbindsym_(b)) ? NULL : symname_(tagbindsym_(b));
-    p->car.DEB_STRUCT.children = NULL;
-    p->car.DEB_STRUCT.qualtypes = NULL;
-    p->car.DEB_STRUCT.friends = NULL;
-    if (b != NULL) b->tagbinddbg = (IPtr)p;
+    struct_size_(p) = 0;    /* filled in later */
+    struct_name_(p) = isgensym(tagbindsym_(b)) ? NULL : symname_(tagbindsym_(b));
+    struct_children_(p) = NULL;
+    struct_qual_(p) = NULL;
+    struct_friends_(p) = NULL;
+    if (b != NULL) tagbinddbg_(b) = (IPtr)p;
     if (!(tagbindbits_(b) & TB_DEFD)) {
-      p->debsort = DW_TAG_fref;
-      p->car.DEB_STRUCT.undefsort = itemsort;
-      p->car.DEB_STRUCT.size = 0;
+      debsort_(p) = DW_TAG_fref;
+      struct_undefsort_(p) = itemsort;
+      struct_size_(p) = 0;
       return p;
     }
   } else {
-    p->debsort = itemsort;
-    if (LanguageIsCPlusPlus) p->car.DEB_STRUCT.friends = b->friends;
-    if (p != dbglist) prev_dbglist = dbglist;
+    debsort_(p) = itemsort;
+    if (LanguageIsCPlusPlus) struct_friends_(p) = b->friends;
+#if 0
+    if (p != dw_list) prev_dw_list = dw_list;
+#else
+    if (p != dw_list) move_to_top(p);
+#endif
   }
-  p->car.DEB_STRUCT.size = sizeoftype(x);
+  struct_size_(p) = sizeoftype(x);
 
   { StructPos sp;
-    DbgList **pp = &p->car.DEB_STRUCT.children;
+    Dw_ItemList **pp = &struct_children_(p);
     ClassMember *l;
     PushScope(p, pp);
     structpos_init(&sp, b);
     for (l = tagbindmems_(b); l != 0; l = memcdr_(l))
-      if (memsv_(l) != NULL && 
+      if (memsv_(l) != NULL &&
             (structfield(l, sort, &sp) || LanguageIsCPlusPlus)) {
+
         if (LanguageIsCPlusPlus && attributes_(l) & (CB_BASE|CB_VBASE)) {
-            DbgList *base = dw_additem(DEB_INHERIT, DW_TAG_inheritance);
-            TagBinder *tb_base = typespectagbind_(princtype(memtype_(l)));
-            base->car.DEB_INHERIT.type = (Dw_TypeRep *)tb_base->tagbinddbg;
-            base->car.DEB_INHERIT.offset = sp.woffset;
-            base->car.DEB_INHERIT.virtuality = attributes_(l) & CB_VBASE;
-        } else if (h0_(memtype_(l)) != t_ovld) 
-            if (isfntype(memtype_(l)))
-            {   dbg_proc_i(memsv_(l), princtype(memtype_(l)), NO, dbg_invented_fl,
-                        bindstg_(l) & bitofstg_(s_virtual), bindxx_(l),
-                        bindstg_(l) & bitofstg_(s_inline));
-                dbg_xendproc(dbg_invented_fl);
-                PushScope(cdr_(dbglist), &(cdr_(dbglist))->car.DEB_PROC.children);
-                dw_typerep(memtype_(l), &(cdr_(dbglist))->car.DEB_PROC.type);
-                PopScope();
-            } else {
-              /* note that memsv is 0 for padding bit fields */
-              DbgList *mem = dw_additem(DEB_MEMBER, DW_TAG_member);
-              mem->car.DEB_MEMBER.offset = sp.woffset;
-              mem->car.DEB_MEMBER.name = symname_(memsv_(l));
-              mem->car.DEB_MEMBER.boffset = (unsigned8)sp.boffset;
-              mem->car.DEB_MEMBER.bsize = (unsigned8)sp.bsize;
-              mem->car.DEB_MEMBER.decl = bindstg_(l) & bitofstg_(s_extern); 
-              if (sp.bsize == 0) {
-                dw_typerep(memtype_(l), &mem->car.DEB_MEMBER.type);
-              } else {
-                TypeExpr te; te = *memtype_(l);
-                typespecmap_(&te) &= ~BITFIELD;
-                dw_typerep(&te, &mem->car.DEB_MEMBER.type);
-              }
-            }
+          Dw_ItemList *base = dw_additem(DEB_INHERIT, DW_TAG_inheritance);
+          TagBinder *tb_base = typespectagbind_(princtype(memtype_(l)));
+          inherit_type_(base) = (Dw_TypeRep *)tagbinddbg_(tb_base);
+          inherit_offset_(base) = sp.woffset;
+          inherit_virt_(base) = (attributes_(l) & CB_VBASE) != 0;
+        } else if (h0_(memtype_(l)) == t_ovld || attributes_(l) & CB_ANON ||
+                   h0_(l) == s_tagbind) {
+          /* nothing */
+
+        } else if (isfntype(memtype_(l))) {
+          Dw_ItemList *d = Dw_ProcDeclRep(memsv_(l), realbinder_(l), p, 0);
+          IGNORE(d);
+
+        } else if (bindstg_(l) & bitofstg_(s_typedef)) {
+          dw_typeinternal(bindsym_(l), 0, bindtype_(l));
+
+        } else if (h0_(l) == s_member || bindstg_(l) & b_pseudonym) {
+          Dw_ItemList *mem;
+          Dw_TypeRep *type;
+          if (sp.bsize == 0) {
+            dw_typerep(memtype_(l), &type);
+          } else {
+            TypeExpr te; te = *memtype_(l);
+            typespecmap_(&te) &= ~BITFIELD;
+            dw_typerep(&te, &type);
+          }
+          /* note that memsv is 0 for padding bit fields */
+          mem = dw_additem(DEB_MEMBER, DW_TAG_member);
+          member_offset_(mem) = (bindstg_(l) & b_pseudonym) ? -1 : sp.woffset;
+          member_name_(mem) = symname_(memsv_(l));
+          member_boffset_(mem) = (uint8)sp.boffset;
+          member_bsize_(mem) = (uint8)sp.bsize;
+          member_type_(mem) = type;
+        }
       }
-    PopScope();
+    PopScope(NO);
   }
-  if (prev_dbglist != NULL) move_children(p, prev_dbglist);
+#if 0
+  if (prev_dw_list != NULL && prev_dw_list != dw_list)
+    move_children(p, prev_dw_list);
+#endif
   return p;
 }
 
@@ -593,45 +567,45 @@ static Dw_TypeRep *dw_enumentry(Dw_TypeRep *p, TagBinder *b) {
       FT_unsigned_char, FT_unsigned_short, FT_unsigned_integer, FT_unsigned_integer
   };
   static char const s[] = { 1, 2, 4, 4, 1, 2, 4, 4};
-  DbgList *prev_dbglist = NULL;
+  Dw_ItemList *prev_dw_list = NULL;
   if (p == NULL) {
     p = dw_additem(DEB_ENUM, DW_TAG_enumeration_type);
-    p->car.DEB_ENUM.children = NULL;
-    p->car.DEB_ENUM.name = isgensym(tagbindsym_(b)) ? NULL : symname_(tagbindsym_(b));
-    p->car.DEB_ENUM.qualtypes = NULL;
-    if (b != NULL) b->tagbinddbg = (IPtr)p;
+    enum_children_(p) = NULL;
+    enum_name_(p) = isgensym(tagbindsym_(b)) ? NULL : symname_(tagbindsym_(b));
+    enum_qual_(p) = NULL;
+    if (b != NULL) tagbinddbg_(b) = (IPtr)p;
     if (!(tagbindbits_(b) & TB_DEFD)) {
-      p->debsort = DW_TAG_fref;
+      debsort_(p) = DW_TAG_fref;
       return p;
     }
   } else {
-    p->debsort = DW_TAG_enumeration_type;
-    prev_dbglist = dbglist;
+    debsort_(p) = DW_TAG_enumeration_type;
+    prev_dw_list = dw_list;
   }
 
   { int32 container = (tagbindbits_(b) & TB_CONTAINER) >> TB_CONTAINER_SHIFT;
-    p->car.DEB_ENUM.container = Dw_PrimType(c[container]);
-    p->car.DEB_ENUM.size = s[container];
+    enum_container_(p) = Dw_PrimType(c[container]);
+    enum_size_(p) = s[container];
   }
-  PushScope(p, &p->car.DEB_ENUM.children);
+  PushScope(p, &enum_children_(p));
   { BindList *members = tagbindenums_(b);
     for (; members != 0; members = members->bindlistcdr) {
-      DbgList *mem = dw_additem(DEB_ENUMERATOR, DW_TAG_enumerator);
+      Dw_ItemList *mem = dw_additem(DEB_ENUMERATOR, DW_TAG_enumerator);
       Binder *elt = members->bindlistcar;
-      mem->car.DEB_ENUMERATOR.name = symname_(bindsym_(elt));
-      mem->car.DEB_ENUMERATOR.val = bindenumval_(elt);
+      enumerator_name_(mem) = symname_(bindsym_(elt));
+      enumerator_val_(mem) = bindenumval_(elt);
     }
   }
-  PopScope();
-  if (prev_dbglist != NULL) move_children(p, prev_dbglist);
+  PopScope(NO);
+  if (prev_dw_list != NULL) move_children(p, prev_dw_list);
   return p;
 }
 
 static Dw_TypeRep *struct_typerep(TypeExpr *x) {
   TagBinder *b = typespectagbind_(x);
-  Dw_TypeRep *t = (Dw_TypeRep *)b->tagbinddbg;
+  Dw_TypeRep *t = (Dw_TypeRep *)tagbinddbg_(b);
   if (t == NULL ||                 /* not yet seen */
-      (t->debsort == DW_TAG_fref && (tagbindbits_(b) & TB_DEFD))
+      (debsort_(t) == DW_TAG_fref && (tagbindbits_(b) & TB_DEFD))
                            /* previously seen, (undefined), now defined */
       ) {
     if (tagbindbits_(b) & bitoftype_(s_enum))
@@ -645,8 +619,8 @@ static Dw_TypeRep *struct_typerep(TypeExpr *x) {
 static int typename_match(char *mangled, char *generic)
 { int l = strlen(generic);
   if (mangled == generic) return 1;
-  if (strncmp(mangled, generic, l) == 0 &&
-      strncmp(mangled+l, "__", 2) == 0) return 1;
+  if (StrnEq(mangled, generic, l) &&
+      StrnEq(mangled+l, "__", 2)) return 1;
   return 0;
 }
 
@@ -663,28 +637,45 @@ static Dw_QualType *CVQualType(SET_BITMAP m, Dw_QualType *p) {
   return p;
 }
 
+typedef struct Dw_ftList Dw_ftList;
+struct Dw_ftList {
+  Dw_ftList *cdr;
+  TypeExpr *t;
+  Dw_ItemList *p;
+};
+
+static Dw_ftList *dw_ftlist;
+
+static Dw_ItemList *find_ftlist(TypeExpr *te)
+{ Dw_ftList *ft = dw_ftlist;
+  for (; ft != NULL; ft = cdr_(ft))
+    if (ft->t == te) return ft->p;
+  return NULL;
+}
+
 static Dw_TypeRep *dw_fnrep(TypeExpr *x) {
-  DbgList *t = dw_additem(DEB_PROCTYPE, DW_TAG_subroutine_type);
-  dw_typerep(typearg_(x), &t->car.DEB_PROCTYPE.type);
-  t->car.DEB_PROCTYPE.qualtypes = NULL;
-  PushScope(t, &t->car.DEB_PROCTYPE.children);
-  { FormTypeList *ft = typefnargs_(x);
-    for (; ft != NULL; ft = ft->ftcdr) {
-      DbgList *p = dw_additem(DEB_FORMAL, DW_TAG_proctype_formal);
-      p->car.DEB_FORMAL.name = ft->ftname == NULL ? NULL : ft->ftname;
-      dw_typerep(ft->fttype, &p->car.DEB_FORMAL.type);
-    }
+  Dw_ItemList *t = find_ftlist(x);
+  if (t != NULL) return t;
+  t = Dw_ItemAlloc(DEB_PROCTYPE, DW_TAG_subroutine_type);
+  dw_typerep(typearg_(x), &proctype_type_(t));
+  proctype_qual_(t) = NULL;
+  dw_addtoitemlist(t);
+  PushScope(t, &proctype_children_(t));
+  dw_formalparameterlistrep(x);
+  PopScope(dw_version == 2);
+  { Dw_ftList *p = DbgNew(Dw_ftList);
+    cdr_(p) = dw_ftlist;
+    p->t = x; p->p = t; dw_ftlist = p;
   }
-  if (fntypeisvariadic(x)) dw_additem(DEB_REST, DW_TAG_unspecified_parameters);
-  PopScope();
   return t;
 }
 
 static Dw_TypeRep *dw_ptrtomemrep(TypeExpr *x)
-{   DbgList *t = dw_additem(DEB_PTRTOMEMTYPE, DW_TAG_ptr_to_member_type);
-    t->car.DEB_PTRTOMEMTYPE.container = (Dw_TypeRep *)typespectagbind_(x)->tagbinddbg;
-    dw_typerep(typearg_(x), &t->car.DEB_PTRTOMEMTYPE.type);
-    t->car.DEB_PTRTOMEMTYPE.qualtypes = NULL;
+{   Dw_ItemList *t = Dw_ItemAlloc(DEB_ARRAY, DW_TAG_ptr_to_member_type);
+    ptrtomem_container_(t) = (Dw_TypeRep *)tagbinddbg_(typespectagbind_(x));
+    dw_typerep(typearg_(x), &ptrtomem_type_(t));
+    ptrtomem_qual_(t) = NULL;
+    dw_addtoitemlist(t);
     return t;
 }
 
@@ -716,7 +707,7 @@ static void dw_typerep(TypeExpr *x, Dw_TypeRep **typep)
     case s_typespec:
       { SET_BITMAP m = typespecmap_(x);
         quals = CVQualType(m, quals);
-        switch (m & -m) {   /* LSB - unsigned32/long etc. are higher */
+        switch (m & -m) {   /* LSB - unsigned/long etc. are higher */
         case bitoftype_(s_enum):
           restype = struct_typerep(x);
           break;
@@ -728,11 +719,11 @@ static void dw_typerep(TypeExpr *x, Dw_TypeRep **typep)
         case bitoftype_(s_typedefname):
           { Binder *b = typespecbind_(x);
             /* is there already a table entry for it ? */
-            { DbgList *l;
-              for ( l = dbglist ; l != NULL ; l = cdr_(l))
-                if ( l->debsort==DW_TAG_typedef &&
-                     l->car.DEB_TYPE.typex==bindtype_(b) &&
-                     typename_match(l->car.DEB_TYPE.name, symname_(bindsym_(b)))) {
+            { Dw_ItemList *l;
+              for ( l = dw_list ; l != NULL ; l = cdr_(l))
+                if ( debsort_(l)==DW_TAG_typedef &&
+                     type_typex_(l)==bindtype_(b) &&
+                     typename_match(type_name_(l), symname_(bindsym_(b)))) {
                   restype = l;
                   break;
                 }
@@ -749,9 +740,16 @@ static void dw_typerep(TypeExpr *x, Dw_TypeRep **typep)
         case bitoftype_(s_int):
           if (m & BITFIELD) syserr(syserr_dbg_bitfield);
           { int32 mcr = mcrepoftype(x);
-            int tc = (mcr & MCR_SORT_MASK) == MCR_SORT_SIGNED ?
-                       (((mcr & MCR_SIZE_MASK) == 2) ? FT_signed_short : FT_signed_integer) :
-                       (((mcr & MCR_SIZE_MASK) == 2) ? FT_unsigned_short : FT_unsigned_integer);
+            int32 size = mcr & MCR_SIZE_MASK;
+            int tc;
+            if ((mcr & MCR_SORT_MASK) == MCR_SORT_SIGNED)
+              tc = size == 2 ? FT_signed_short :
+                   size == 8 ? FT_signed_long_long :
+                               FT_signed_integer;
+            else
+              tc = size == 2 ? FT_unsigned_short :
+                   size == 8 ? FT_unsigned_long_long :
+                               FT_unsigned_integer;
             restype = Dw_PrimType(tc);
             break;
           }
@@ -783,35 +781,26 @@ static void dw_typerep(TypeExpr *x, Dw_TypeRep **typep)
     Dw_TypeRep *basetype = restype;
     Dw_TypeRep *q, **qp;
     int n = 1;
-    int maxn = length((List *)quals);
-    char *qualmap = (char *)SynAlloc(maxn);
-    char *qualp = &qualmap[maxn];
+    int maxn = (int)length((List *)quals);
+    uint8 *qualmap = (uint8 *)SynAlloc(maxn);
+    uint8 *qualp = &qualmap[maxn];
 
-    switch (restype->debsort) {
-    case DW_TAG_ptr_to_member_type:
-        qp = &restype->car.DEB_PTRTOMEMTYPE.qualtypes;
-        break;
-    case DW_TAG_array_type:
-        qp = &restype->car.DEB_ARRAY.qualtypes;
-        break;
-    case DW_TAG_subroutine_type:
-        qp = &restype->car.DEB_PROCTYPE.qualtypes;
-        break;
-    case DW_TAG_enumeration_type:
-        qp = &restype->car.DEB_ENUM.qualtypes;
-        break;
+    switch (debsort_(restype)) {
+    case DW_TAG_ptr_to_member_type: qp = &ptrtomem_qual_(restype); break;
+    case DW_TAG_array_type:         qp = &array_qual_(restype); break;
+    case DW_TAG_subroutine_type:    qp = &proctype_qual_(restype); break;
+    case DW_TAG_enumeration_type:   qp = &enum_qual_(restype); break;
+
+    case DW_TAG_fref:
     case DW_TAG_class_type:
     case DW_TAG_union_type:
-    case DW_TAG_structure_type:
-        qp = &restype->car.DEB_STRUCT.qualtypes;
-        break;
+    case DW_TAG_structure_type:     qp = &struct_qual_(restype); break;
+
     case DW_TAG_typedef:
-    case DW_TAG_base_type:
-        qp = &restype->car.DEB_TYPE.qualtypes;
-        break;
-    default:
-        syserr("dw_typerep: %d", restype->debsort);
-        qp = NULL;
+    case DW_TAG_base_type:          qp = &type_qual_(restype); break;
+
+    default:                        syserr("dw_typerep: %d", debsort_(restype));
+                                    qp = NULL;
     }
 
     for (; quals != NULL; quals = cdr_(quals), n++) {
@@ -819,73 +808,41 @@ static void dw_typerep(TypeExpr *x, Dw_TypeRep **typep)
                quals->qual == DW_TAG_reference_type ? MOD_reference_to :
                    quals->qual == DW_TAG_const_type ? MOD_const :
                                                       MOD_volatile;
-      for (; (q = *qp) != NULL; qp = &q->car.DEB_QUALTYPE.next)
-        if (q->car.DEB_QUALTYPE.n > n) {
+      for (; (q = *qp) != NULL; qp = &qualtype_next_(q))
+        if (qualtype_n_(q) > n) {
           q = NULL;
           break;
-        } else if (q->car.DEB_QUALTYPE.n == n &&
-                   memcmp(q->car.DEB_QUALTYPE.qualmap, qualp, n) == 0) {
-          restype = q;
+        } else if (qualtype_n_(q) == n
+                   && memcmp(qualtype_map_(q), qualp, n) == 0) {
           break;
         }
       if (q == NULL) {
-        DbgList *newt = dw_additem(DEB_QUALTYPE, quals->qual);
-        newt->car.DEB_QUALTYPE.type = restype;
-        newt->car.DEB_QUALTYPE.n = n;
-        newt->car.DEB_QUALTYPE.qualmap = (char *)DbgAlloc(n);
-        memcpy(newt->car.DEB_QUALTYPE.qualmap, qualp, n);
-        newt->car.DEB_QUALTYPE.next = *qp; *qp = newt;
-        newt->car.DEB_QUALTYPE.basetype = basetype;
-        restype = newt;
+        q = dw_additem(DEB_QUALTYPE, quals->qual);
+        qualtype_type_(q) = restype;
+        qualtype_n_(q) = n;
+        qualtype_map_(q) = (uint8 *)DbgAlloc(n);
+        memcpy(qualtype_map_(q), qualp, n);
+        qualtype_next_(q) = *qp; *qp = q;
+        qualtype_basetype_(q) = basetype;
+        qualtype_qualifiedtype_(q) = restype;
       }
+      restype = q;
     }
   }
   if (typep != NULL) *typep = restype;
 }
 
-#if 0
-
-static bool typename_fuzzy_match(char *mangled, char *generic)
-{   int l = strlen(mangled);
-    while ((*mangled == *generic) && l) mangled++, generic++, l--;
-    if (l && isdigit(*mangled)) {
-        int len = atoi(mangled);
-        while (isdigit(*mangled)) mangled++;
-        mangled += len;
-    }
-    while ((*mangled == *generic) && l) mangled++, generic++, l--;
-    return (l == 0);
-}
-
-static void dw_spec(Binder *b, Dw_TypeRep **spec)
-{   TagBinder *parent = bindparent_(b);
-    DbgList *p = ((DbgList *)parent->tagbinddbg)->car.DEB_STRUCT.children;
-    for (; p->debsort != TAG_padding; p = p->sibling)
-    {   if (p->debsort == DW_TAG_member && 
-                typename_match(symname_(bindsym_(b)), p->car.DEB_MEMBER.name) ||
-            p->debsort == DW_TAG_subprogram &&
-                typename_fuzzy_match(symname_(bindsym_(b)), p->car.DEB_PROC.name))
-        {   *spec = p;
-            return;
-        }
-    }
-    syserr("dw_spec: member not found");
-}
-#endif
-
-static void dw_addvar(Symstr *name, Dw_TypeRep *t, int32 sourcepos,
+static void dw_addvar(Symstr *name, Dw_TypeRep *t,
                       StgClass stgclass, SymOrReg base, int32 addr, TypeExpr *type)
 { unsigned tag = stgclass >= Stg_ArgReg ? DW_TAG_formal_parameter: DW_TAG_variable;
-  DbgList *p = dw_additem(DEB_VAR, tag);
-  Binder *b = bind_global_(name);
-  p->car.DEB_VAR.type = t;
-  p->car.DEB_VAR.sourcepos = sourcepos;
-  p->car.DEB_VAR.stgclass = stgclass;
-  p->car.DEB_VAR.location = addr;
-  p->car.DEB_VAR.sym = name;
-  p->car.DEB_VAR.base = base;
-  if (type != NULL) dw_typerep(type, &p->car.DEB_VAR.type);
-  p->car.DEB_VAR.mem = (b && bindparent_(b)) ? (Dw_TypeRep *)bindparent_(b)->tagbinddbg : NULL;
+  Dw_ItemList *p = Dw_ItemAlloc(DEB_VAR, tag);
+  var_type_(p) = t;
+  var_stgclass_(p) = stgclass;
+  var_loc_(p) = addr;
+  var_sym_(p) = name;
+  var_base_(p) = base;
+  if (type != NULL) dw_typerep(type, &var_type_(p));
+  dw_addtoitemlist(p);
 }
 
 void dbg_topvar(Symstr *name, int32 addr, TypeExpr *t, int stgclass,
@@ -896,11 +853,12 @@ void dbg_topvar(Symstr *name, int32 addr, TypeExpr *t, int stgclass,
   { /* nb bss => external here.  The effect is only to cause the table item
        to be 0+symbol, rather than addr+data seg
      */
-    DbgList *p;
+    Dw_ItemList *p;
     SymOrReg base;
     StgClass stg = (stgclass & DS_REG) ? Stg_Reg :
                    (stgclass & DS_EXT) ? Stg_Extern :
                                          Stg_Static;
+    IGNORE(fl);
     base.sym = NULL;
     if (stgclass & (DS_EXT|DS_BSS))
       base.sym = name, addr = 0;
@@ -914,18 +872,17 @@ void dbg_topvar(Symstr *name, int32 addr, TypeExpr *t, int stgclass,
     if (debugging(DEBUG_Q))
       cc_msg("top var $r @ %.6lx\n", name, (long)addr);
     if (stgclass != 0 && stg != Stg_Reg)
-      for ( p = dbglist ; p!=NULL ; p = p->cdr )
-        if ( p->debsort == DW_TAG_variable &&
-             (p->car.DEB_VAR.stgclass == Stg_Extern ||
-              p->car.DEB_VAR.stgclass == Stg_Static) &&
-             p->car.DEB_VAR.location==0 &&
-             p->car.DEB_VAR.sym == name) {
-          p->car.DEB_VAR.sourcepos = fl.l;
-          p->car.DEB_VAR.location = addr;
-          p->car.DEB_VAR.base = base;
+      for ( p = dw_list ; p != NULL ; p = cdr_(p))
+        if ( debsort_(p) == DW_TAG_variable &&
+             (var_stgclass_(p) == Stg_Extern ||
+              var_stgclass_(p) == Stg_Static) &&
+             var_loc_(p) == 0 &&
+             var_sym_(p) == name) {
+          var_loc_(p) = addr;
+          var_base_(p) = base;
           return;
         }
-    dw_addvar(name, 0, fl.l, stg, base, addr, t);
+    dw_addvar(name, 0, stg, base, addr, t);
   }
 }
 
@@ -938,14 +895,18 @@ static void dw_typeinternal(Symstr *name, Dw_TypeRep *t, TypeExpr *type)
 { if (isgensym(name))
     dw_typerep(type, NULL);
   else {
-    DbgList *p = dw_additem(DEB_TYPE, DW_TAG_typedef);
+    Dw_ItemList *p = Dw_ItemAlloc(DEB_TYPE, DW_TAG_typedef);
     if (debugging(DEBUG_Q))
         cc_msg("type $r\n", name);
-    p->car.DEB_TYPE.type = t;
-    p->car.DEB_TYPE.typex = type;
-    p->car.DEB_TYPE.name = symname_(name);
-    p->car.DEB_TYPE.qualtypes = NULL;
-    if (type != NULL) dw_typerep(type, &p->car.DEB_TYPE.type);
+    /* If there isn't already an internal representation ... */
+    if (t == NULL && type != NULL)
+        dw_typerep(type, &type_type_(p));
+    else
+        type_type_(p) = t;
+    type_typex_(p) = type;
+    type_name_(p) = symname_(name);
+    type_qual_(p) = NULL;
+    dw_addtoitemlist(p);
   }
 }
 
@@ -957,57 +918,54 @@ void dbg_type(Symstr *name, TypeExpr *t, FileLine fl)
   dw_typeinternal(name, 0, t);
 }
 
-static Deb_filecoord *cur_proc_coord;
+static Dw_FileCoord *cur_proc_coord;
 
-static void dbg_proc_i(Symstr *name, TypeExpr *t, bool ext, FileLine fl, bool virt, int32 voffset, bool inlined)
+void dbg_proc(Binder *b, TagBinder *parent, bool ext, FileLine fl)
 { if (usrdbg(DBG_PROC))
-  { DbgList *p = DbgListAlloc(DEB_PROC);
-    char *s = symname_(name);
-    Binder *b = bind_global_(name);
+  { Symstr *name = bindsym_(b);
+    TypeExpr *t = princtype(bindtype_(b));
+    Dw_ItemList *p = Dw_ItemAlloc(DEB_PROC, DW_TAG_subprogram);
     if (debugging(DEBUG_Q)) cc_msg("startproc $r\n", name);
-    t = princtype(t);
-    p->debsort = DW_TAG_subprogram;
     if (h0_(t) != t_fnap) syserr(syserr_dbg_proc);
-    dw_typerep(typearg_(t), &p->car.DEB_PROC.type);
-    p->car.DEB_PROC.sourcepos = fl.l;
-    p->car.DEB_PROC.entryaddr = 0;       /* fill in at dbg_enterproc */
-    p->car.DEB_PROC.bodyaddr = 0;        /* fill in at dbg_bodyproc */
-    p->car.DEB_PROC.endproc = 0;         /* fill in at dbg_xendproc   */
-    p->car.DEB_PROC.fileentry = fl.f;
-    p->car.DEB_PROC.name = s;
-    p->car.DEB_PROC.codeseg = bindsym_(codesegment);
-    p->car.DEB_PROC.global = ext;
-    p->car.DEB_PROC.variadic = fntypeisvariadic(t);
-    p->car.DEB_PROC.virtuality = virt;
-    p->car.DEB_PROC.vtable_offset = voffset;
-    p->car.DEB_PROC.inlined = inlined;
-    p->car.DEB_PROC.mem = (b && bindparent_(b)) ? 
-                (Dw_TypeRep *)bindparent_(b)->tagbinddbg : NULL;
-    p->sibling = NULL; *scopestack->childp = p; scopestack->childp = &p->sibling;
-    p->cdr = dbglist;              /* do this last (typerep above) */
-    dbglistproc = dbglist = p;       /* so can be filled in */
-    PushScope(p, &p->car.DEB_PROC.children);
+    /*
+    if ((Dw_ItemList *)binddbg_(b) == NULL
+        && dw_hasdefaultvalues(typefnargs_(t)))
+      Dw_ProcDeclRep(name, b, NULL, ext);
+      */
+
+    dw_typerep(typearg_(t), &proc_type_(p));
+    proc_entry_(p) = 0;           /* fill in at dbg_enterproc */
+    proc_body_(p) = 0;            /* fill in at dbg_bodyproc  */
+    proc_endproc_(p) = 0;         /* fill in at dbg_xendproc  */
+    proc_name_(p) = symname_(name);
+    proc_codeseg_(p) = bindsym_(codesegment);
+    proc_global_(p) = ext;
+    proc_variadic_(p) = fntypeisvariadic(t);
+    proc_parent_(p) = NULL;
+    if (parent != NULL)
+      dw_typerep(tagbindtype_(parent), &proc_parent_(p));
+    proc_decl_(p) = (Dw_ItemList *)binddbg_(b);
+    dw_listproc = dw_addtoitemlist(p); /* do this last (typerep above) */
+    PushScope(p, &proc_children_(p));
+    if (dw_fmllist != NULL && dw_fmllist->fb == bind_global_(name)) {
+      formal_defltfn_(dw_fmllist->p) = p;
+      dw_fmllist = cdr_(dw_fmllist);
+    }
   }
   if (usrdbg(DBG_LINE))
-    cur_proc_coord = (Deb_filecoord *)fl.p;
-  dbg_loclist = 0;
-}
-
-void dbg_proc(Symstr *name, TypeExpr *t, bool ext, FileLine fl)
-{   dbg_proc_i(name, t, ext, fl, NO, 0, 
-        bind_global_(name) ? bindstg_(bind_global_(name)) & bitofstg_(s_inline) : NO);
+    cur_proc_coord = (Dw_FileCoord *)fl.p;
+  dw_loclist = 0;
 }
 
 void dbg_enterproc(void)
 { if (usrdbg(DBG_PROC))
-  { DbgList *p = dbglistproc;
+  { Dw_ItemList *p = dw_listproc;
 
-    if (p == 0 || p->debsort != DW_TAG_subprogram || p->car.DEB_PROC.entryaddr != 0)
+    if (p == 0 || debsort_(p) != DW_TAG_subprogram || proc_entry_(p) != 0)
       syserr(syserr_dbg_proc1);
     if (debugging(DEBUG_Q))
-      cc_msg("enter '%s' @ %.6lx\n",
-             p->car.DEB_PROC.name, (long)codebase);
-    p->car.DEB_PROC.entryaddr = codebase;
+      cc_msg("enter '%s' @ %.6lx\n", proc_name_(p), (long)codebase);
+    proc_entry_(p) = codebase;
   }
   if (usrdbg(DBG_LINE))
     dbg_addcodep(cur_proc_coord, codebase);
@@ -1016,13 +974,12 @@ void dbg_enterproc(void)
 /* The following routine records the post-entry codeaddr of a proc */
 void dbg_bodyproc(void)
 { if (usrdbg(DBG_PROC))
-  { DbgList *p = dbglistproc;
-    if (p == 0 || p->debsort != DW_TAG_subprogram || p->car.DEB_PROC.bodyaddr != 0)
+  { Dw_ItemList *p = dw_listproc;
+    if (p == 0 || debsort_(p) != DW_TAG_subprogram || proc_body_(p) != 0)
       syserr(syserr_dbg_proc1);
     if (debugging(DEBUG_Q))
-      cc_msg("body '%s' @ %.6lx\n",
-             p->car.DEB_PROC.name, (long)(codebase+codep));
-    p->car.DEB_PROC.bodyaddr = codebase+codep;
+      cc_msg("body '%s' @ %.6lx\n", proc_name_(p), (long)(codebase+codep));
+    proc_body_(p) = codebase+codep;
   }
 }
 
@@ -1036,21 +993,26 @@ void dbg_return(int32 addr)
 
 void dbg_xendproc(FileLine fl)
 { IGNORE(fl);
-  if (bindsym_(codesegment) == baseseg.sym) baseseg.len = codebase+codep;
+  if (bindsym_(codesegment) == dw_baseseg.sym) dw_baseseg.len = codebase+codep;
   if (usrdbg(DBG_PROC))
-  { DbgList *q = dbglistproc;
-    DbgList *p = DbgListAlloc(DEB_ENDPROC);
-    if (q == 0 || q->debsort != DW_TAG_subprogram || q->car.DEB_PROC.endproc != 0)
+  { Dw_ItemList *q = dw_listproc;
+    Dw_ItemList *p = Dw_ItemAlloc(DEB_ENDPROC, DW_TAG_endproc);
+    if (q == 0 || debsort_(q) != DW_TAG_subprogram || proc_endproc_(q) != 0)
       syserr(syserr_dbg_proc1);
+    /* ... for nested fns */
+    for (dw_listproc = cdr_(dw_list); dw_listproc != NULL; dw_listproc = cdr_(dw_listproc))
+      if (debsort_(dw_listproc) == DW_TAG_subprogram
+          && proc_endproc_(dw_listproc) == 0
+          && proc_body_(dw_listproc) == 0
+          && proc_entry_(dw_listproc) == 0)
+         break;
     if (debugging(DEBUG_Q))
-      cc_msg("endproc '%s' @ %.6lx\n",
-             q->car.DEB_PROC.name, (long)(codebase+codep));
-    q->car.DEB_PROC.endproc = p;
-    p->debsort = DW_TAG_endproc;
-    p->car.DEB_ENDPROC.endaddr = codebase+codep;
-    cdr_(p) = dbglist; dbglist = p;
-    dbg_loclist = 0;
-    PopScope();
+      cc_msg("endproc '%s' @ %.6lx\n", proc_name_(q), (long)(codebase+codep));
+    proc_endproc_(q) = p;
+    endproc_endaddr_(p) = codebase+codep;
+    cdr_(p) = dw_list; dw_list = p;
+    dw_loclist = 0;
+    PopScope(dw_version == 2);
   }
 }
 
@@ -1062,24 +1024,26 @@ void dbg_xendproc(FileLine fl)
  * Also remember that dead code elimination may remove some decls.
  */
 void dbg_locvar(Binder *name, FileLine fl)
-{ if (usrdbg(DBG_VAR) && !isgensym(bindsym_(name))) {
+{ if (usrdbg(DBG_VAR) /* && !isgensym(bindsym_(name))*/) {
     /* local to a proc */
-    Dbg_LocList *p = (Dbg_LocList*) BindAlloc(sizeof(Dbg_LocList));
+    Dw_LocList *p = (Dw_LocList*) BindAlloc(sizeof(Dw_LocList));
     if (debugging(DEBUG_Q))
       cc_msg("note loc var $b\n", name);
-    cdr_(p) = dbg_loclist;
+    cdr_(p) = dw_loclist;
     p->name = name;
     p->pos = fl.l;
+    p->size = sizeoftypelegal(bindtype_(name)) ? sizeoftype(bindtype_(name)) :
+                                                sizeof_int;
     dw_typerep(bindtype_(name), &p->typeref);
-    dbg_loclist = p;
+    dw_loclist = p;
     if (bindstg_(name) & bitofstg_(s_typedef))
-      dw_typeinternal(bindsym_(name), p->typeref, NULL);
+      dw_typeinternal(bindsym_(name), p->typeref, bindtype_(name));
   }
 }
 
-static Dbg_LocList *dbg_findloclist(Binder *b)
-{ Dbg_LocList *p;
-  for (p = dbg_loclist; p != NULL; p = p->cdr)
+static Dw_LocList *dbg_findloclist(Binder *b)
+{ Dw_LocList *p;
+  for (p = dw_loclist; p != NULL; p = cdr_(p))
     if (p->name == b) return p;
   return NULL;
 }
@@ -1087,7 +1051,7 @@ static Dbg_LocList *dbg_findloclist(Binder *b)
 void dbg_locvar1(Binder *b) {
   Symstr *name = bindsym_(b);
   SymOrReg base;
-  Dbg_LocList *p = dbg_findloclist(b);
+  Dw_LocList *p = dbg_findloclist(b);
   StgClass stgclass;
   int stgclassname;
   int32 addr = bindaddr_(b);
@@ -1109,7 +1073,11 @@ void dbg_locvar1(Binder *b) {
     return;                   /* local externs do not allocate store */
   case bitofstg_(s_static):
     stgclass = Stg_Static, stgclassname = 'S';
-    base.sym =
+    if (bindstg_(b) & b_fnconst) {
+      base.sym = bindsym_(b);
+      addr = 0;
+    } else
+      base.sym =
 #ifdef TARGET_HAS_BSS
            (bindstg_(b) & u_bss) ? bindsym_(bsssegment) :
 #endif
@@ -1125,10 +1093,12 @@ void dbg_locvar1(Binder *b) {
     } else switch (addr & BINDADDR_MASK) {
     case BINDADDR_ARG:
       stgclass = Stg_ArgAuto, stgclassname = 'A', addr = local_fpaddress(b);
+      if (p->size < 4 && !target_lsbytefirst) addr += 4 - p->size;
       base.r = local_fpbase(b);
       break;
     case BINDADDR_LOC:
       stgclass = Stg_Auto, stgclassname = 'P', addr = local_fpaddress(b);
+      if (p->size < 4 && !target_lsbytefirst) addr += 4 - p->size;
       base.r = local_fpbase(b);
       break;
     case 0:
@@ -1143,46 +1113,39 @@ void dbg_locvar1(Binder *b) {
     }
     break;
   }
-  if (debugging(DEBUG_Q)) cc_msg(" %c %lx", stgclassname, (long)addr);
-  dw_addvar(name, p->typeref, p->pos, stgclass, base, addr, NULL);
+  if (debugging(DEBUG_Q)) cc_msg(" %c %#lx", stgclassname, (long)addr);
+  dw_addvar(name, p->typeref, stgclass, base, addr, NULL);
 }
 
-bool dbg_scope(BindListList *newbll, BindListList *oldbll)
-{ int32 entering = length((List *)newbll) - length((List *)oldbll);
-  if (entering == 0) return NO;
-  if (entering < 0)
-  { BindListList *t = newbll;
-    newbll = oldbll, oldbll = t;
-  }
-  if (length((List *)oldbll) > 0) {
+static void dwarf_scope_2(int entering, BindListList *newbll, BindListList *oldbll)
+{ if (oldbll != NULL) {
     BindListList *bll = newbll;
-    DbgList *last = NULL;
+    Dw_ItemList *last = NULL;
     for (bll = newbll; bll != oldbll; bll = bll->bllcdr) {
-      if (bll == 0) syserr(syserr_dbg_scope);
-      if (bll->bllcar != 0) {
-        DbgList *p;
+      if (bll == NULL) syserr(syserr_dbg_scope);
+      if (bll->bllcar != NULL) {
+        Dw_ItemList *p;
         if (entering > 0) {
           p = dw_additem(DEB_STARTSCOPE, DW_TAG_lexical_block);
-          p->car.DEB_STARTSCOPE.s.next = last; /* filled in soon by INFOSCOPE */
-          p->car.DEB_STARTSCOPE.codeseg = bindsym_(codesegment);
-          PushScope(p, &p->car.DEB_STARTSCOPE.children);
+          startscope_next_(p) = last; /* filled in soon by INFOSCOPE */
+          startscope_codeseg_(p) = bindsym_(codesegment);
+          PushScope(p, &startscope_children_(p));
         } else {
-          p = DbgListAlloc(DEB_ENDSCOPE);
-          p->debsort = DW_TAG_end_lexical_block;
-          p->car.DEB_STARTSCOPE.s.next = last; /* filled in soon by INFOSCOPE */
-          scopestack->item->car.DEB_STARTSCOPE.end = p;
-          PopScope();
-          cdr_(p) = dbglist; dbglist = p;
+          p = Dw_ItemAlloc(DEB_ENDSCOPE, DW_TAG_end_lexical_block);
+          startscope_next_(p) = last; /* filled in soon by INFOSCOPE */
+          startscope_end_(scopestack->item) = p;
+          PopScope(NO);
+          cdr_(p) = dw_list; dw_list = p;
         }
         last = p;
-        dbglistscope = p;
+        dw_listscope = p;
       }
     }
   }
   if (debugging(DEBUG_Q)) cc_msg("scope %ld\n", entering);
   for (; newbll != oldbll; newbll = newbll->bllcdr)
   { SynBindList *bl;
-    if (newbll == 0) syserr(syserr_dbg_scope);
+    if (newbll == NULL) syserr(syserr_dbg_scope);
     for (bl = newbll->bllcar; bl; bl = bl->bindlistcdr)
     { Binder *b = bl->bindlistcar;
       if (bindstg_(b) & b_dbgbit) continue; /* for this and next line */
@@ -1197,9 +1160,75 @@ bool dbg_scope(BindListList *newbll, BindListList *oldbll)
         cc_msg("\n");
     }
   }
-  return YES;
+}
+
+static bool dwarf_scope_1(BindListList *newbll, BindListList *oldbll) {
+  int32 entering = length((List *)newbll) - length((List *)oldbll);
+  if (entering == 0) return NO;
+  /* A bodge here to ensure that there's no START/ENDSCOPE pair around  */
+  /* the variable items for the outermost BindList (arguments)          */
+  /* XRAY for one is unhappy if there is.                               */
+  /* (dwarf_scope_i copes with the case where there's just one BindList */
+  /* being added or removed : code is needed here for the case there's  */
+  /* more than one because of removal of an empty block with a          */
+  /* different debenv from its predecessor                              */
+  if (entering > 0) {
+    if (oldbll == NULL && entering > 1) {
+      BindListList *p = newbll;
+      do
+        p = p->bllcdr;
+      while (p->bllcdr != NULL);
+      dwarf_scope_2(1, p, oldbll);
+      oldbll = p; --entering;
+    }
+    dwarf_scope_2(entering, newbll, oldbll);
+  } else {
+    if (newbll == NULL && entering < -1) {
+      BindListList *p = oldbll;
+      do
+        p = p->bllcdr;
+      while (p->bllcdr != NULL);
+      dwarf_scope_2(1, p, newbll);
+      newbll = p; ++entering;
+    }
+    dwarf_scope_2(entering, oldbll, newbll);
+  }
   /* Ask for INFOSCOPE item to get called back more or less immediately */
   /* from the local cg (INFOSCOPE item) to fill in the codeaddr         */
+  return YES;
+}
+
+bool dbg_scope(BindListList *newbll, BindListList *oldbll) {
+  int32 entering = length((List *)newbll) - length((List *)oldbll);
+  if (oldbll == newbll)
+    return NO;
+  if (newbll == NULL || oldbll == NULL)
+    return dwarf_scope_1(newbll, oldbll);
+
+  if (entering > 0) {
+    BindListList *bll;
+    for (bll = newbll; bll != 0; bll = bll->bllcdr)
+      if (bll == oldbll)
+        return dwarf_scope_1(newbll, oldbll);
+  } else if (entering < 0) {
+    BindListList *bll;
+    for (bll = oldbll; bll != 0; bll = bll->bllcdr)
+      if (bll == newbll)
+        return dwarf_scope_1(newbll, oldbll);
+  }
+  /* Neither list is a subset of the other (can happen thanks to dead   */
+  /* block elimination). Find the common tail.                          */
+  { BindListList *bll_n, *bll_o;
+    for (bll_n = newbll->bllcdr; bll_n != NULL; bll_n = bll_n->bllcdr)
+      for (bll_o = oldbll->bllcdr; bll_o != NULL; bll_o = bll_o->bllcdr)
+        if (bll_o == bll_n) {
+          dwarf_scope_1(bll_o, oldbll);
+          return dwarf_scope_1(newbll, bll_o);
+        }
+  }
+  /* There is no common tail to oldbll and newbll                       */
+  syserr(syserr_dbg_scope);
+  return NO;
 }
 
 /* Dummy procedure not yet properly implemented, included here to keep in */
@@ -1208,785 +1237,167 @@ void dbg_commblock(Binder *b, SynBindList *members, FileLine fl) {
   IGNORE(b); IGNORE(members); IGNORE(fl);
 }
 
+static Dw_MacroList *Dw_NewMacroList(FileLine const *fl, int sort) {
+  Dw_MacroList *p = DbgNew(Dw_MacroList);
+  Dw_FileList *fp = Dw_FindFile(fl->f);
+  p->fl.index = fp->index; p->fl.l = fl->l; p->fl.column = fl->column;
+  p->sort = sort;
+  cdr_(p) = dw_macrolist;
+  dw_macrolist = p;
+  return p;
+}
+
 void dbg_define(char const *name, bool objectmacro, char const *body,
                 dbg_ArgList const *args, FileLine fl) {
-    /* Only representable in DWARF version 2 */
-  IGNORE(name); IGNORE(objectmacro); IGNORE(body); IGNORE(args); IGNORE(fl);
-  return;
+  if (dw_version == 2) {
+    Dw_MacroList *p = Dw_NewMacroList(&fl, DW_MACINFO_define);
+    size_t namelen = strlen(name);
+    size_t len = namelen;
+    if (!objectmacro) {
+      dbg_ArgList const *p;
+      for (p = args; p != NULL; p = p->next)
+        len += strlen(p->name) + 1;
+      len += args == NULL ? 2 : 1;
+    }
+    len += strlen(body) + 2;
+    { char *value = (char *)DbgAlloc(len);
+      p->data.s = value;
+      memcpy(value, name, namelen); value += namelen;
+      if (!objectmacro) {
+        dbg_ArgList const *p;
+        *value++ = '(';
+        for (p = args; p != NULL; p = p->next) {
+          namelen = strlen(p->name);
+          if (p != args) *value++ = ',';
+          memcpy(value, p->name, namelen);
+          value += namelen;
+        }
+        *value++ = ')';
+      }
+      *value++ = ' ';
+      strcpy(value, body);
+    }
+    if (debugging(DEBUG_Q))
+      cc_msg("%s:%d #define %s\n", fl.f, fl.l, p->data.s);
+  }
 }
 
 void dbg_undef(char const *name, FileLine fl) {
-    /* Only representable in DWARF version 2 */
-  IGNORE(name); IGNORE(fl);
-  return;
+  if (dw_version == 2) {
+    Dw_MacroList *p = Dw_NewMacroList(&fl, DW_MACINFO_undef);
+    p->data.s = name;
+    if (debugging(DEBUG_Q))
+      cc_msg("%s:%d #undef %s\n", fl.f, fl.l, name);
+  }
 }
 
-static int32 dw_1_lineinfo_size(void) {
-  return dbg_coord_p == NULL ? 0 :
-                               (length((List *)dbg_coord_p)+1) * 10 + 8;
+static Dw_PathList *FindPath(char const *pathname) {
+  size_t len = strlen(pathname);
+  Dw_PathList *p = dw_pathlist;
+  for (; p != NULL; p = cdr_(p))
+    if (len == p->len && memcmp(p->name, pathname, len) == 0)
+      return p;
+
+  p = (Dw_PathList *)DbgAlloc(sizeof(Dw_PathList)+len);
+  cdr_(p) = dw_pathlist; dw_pathlist = p;
+  p->index = ++dw_pathindex;
+  p->len = len;
+  memcpy(p->name, pathname, len+1);
+  return p;
 }
 
-static int32 src_mapped_codebase, src_mapped_codep;
+void dbg_include(char const *filename, char const *path, FileLine fl) {
+  if (dw_version == 2) {
+    if (filename == NULL) {
+      Dw_MacroList *p = Dw_NewMacroList(&fl, DW_MACINFO_end_file);
+      p->data.i = 0;
+      if (debugging(DEBUG_Q))
+        cc_msg("%s:%d #end include\n", fl.f, fl.l);
+    } else {
+      Dw_MacroList *p = Dw_NewMacroList(&fl, DW_MACINFO_start_file);
+      Dw_FileList *fp = Dw_FindFile(filename);
+      p->data.i = fp->index;
+      fp->dir = path == NULL || path[0] == 0 ? NULL : FindPath(path);
+      if (debugging(DEBUG_Q)) {
+        cc_msg("%s:%d #include %s", fl.f, fl.l, filename);
+        if (path != NULL) cc_msg(" %s", path);
+        cc_msg("\n");
+      }
+    }
+  }
+}
+
+void dbg_notepath(char const *pathname) {
+  if (dw_version == 2) {
+    if (!dw_sub_init_done) dw_sub_init();
+    { Uint ix = dw_pathindex;
+      if (FindPath(pathname)->index > ix &&
+          debugging(DEBUG_Q))
+        cc_msg("note path %s\n", pathname);
+    }
+  }
+}
+
+int32 dw_mapped_codebase, dw_mapped_codep;
 
 void dbg_final_src_codeaddr(int32 code_base, int32 code_p)
-{   src_mapped_codebase = code_base,
-    src_mapped_codep = code_p;
+{   dw_mapped_codebase = code_base,
+    dw_mapped_codep = code_p;
 }
 
-static void dw_1_write_lineinfo(void) {
-  Deb_filecoord *p = dbg_coord_p;
-  DataXref *xrefs = NULL;
-  int32 size = dw_1_lineinfo_size();
-  int32 roundup = (size & 2) ? 2 : 0;
-  dbg_coord_sentinel.codeseg = bindsym_(codesegment);
-  *dbg_coord_q = &dbg_coord_sentinel;
-  dbg_coord_sentinel.codeaddr = 
-        (LanguageIsCPlusPlus) ? src_mapped_codebase+src_mapped_codep : codebase+codep;
-  obj_startdebugarea(LINEINFOAREANAME);
-  dw_write_w(size + roundup, 0);
-  dw_write_w(p->codeaddr, 0);
-  xrefs = dw_relocate(xrefs, 4, p->codeseg);
-  for (; p != NULL; p = cdr_(p)) {
-  /* Include the sentinel (to mark the end of info, and to hold
-     the address of end of code-segment)
-     Note that, despite the DWARF spec talking about deltas for
-     the code addresses, it appears to mean from the section start,
-     not from the previous statement.
-   */
-    dw_write_w(p->line, 0);
-    dw_write_h(p->col, 0);
-    dw_write_w(p->codeaddr, 0);
-  }
-  /* round up to 4-byte multiple */
-  if (roundup) dw_write_h(0, 0);
-  obj_enddebugarea(LINEINFOAREANAME, xrefs);
-}
-
-/* armobj.c calls writedebug to generate the debugging tables.   */
-/* It must format them and then call obj_writedebug()            */
-static unsigned32 dw_1_writeattribute(int attr, unsigned32 offset, AttribArg arg) {
-  offset = dw_write_h(attr, offset);
-  switch (attr & 15) {
-  case FORM_ADDR:
-  case FORM_REF:
-    xrefs = dw_relocate(xrefs, offset, arg.ref.sym);
-    return dw_write_w(arg.ref.n, offset);
-
-  case FORM_BLOCK2:
-  case FORM_DATA2:
-    return dw_write_h(arg.ref.n, offset);
-
-  case FORM_DATA4:
-    if (arg.ref.sym != NULL) xrefs = dw_relocate(xrefs, offset, arg.ref.sym);
-    return dw_write_w(arg.ref.n, offset);
-
-  case FORM_BLOCK4:
-    return dw_write_w(arg.ref.n, offset);
-
-  case FORM_DATA8:
-    { unsigned32 w[2];
-      w[0] = arg.d[0]; w[1] = arg.d[1]; obj_writedebug(w, 2+DBG_INTFLAG);
-      return offset + 8;
-    }
-  case FORM_STRING:
-    return dw_inlinestring(arg.s, offset);
-
-  default:
-    syserr("dw_1_writeattribute(%x)", attr);
-    return offset;
-  }
-}
-
-static unsigned32 dw_1_writeattrib_u(int attr, unsigned32 offset, unsigned32 u) {
-  AttribArg arg;
-  arg.ref.n = u;
-  arg.ref.sym = ((attr & 15) == FORM_REF) ? debug_sym : NULL;
-  return dw_1_writeattribute(attr, offset, arg);
-}
-
-static unsigned32 dw_1_writeattrib_str(int attr, unsigned32 offset, char const *s) {
-  AttribArg arg;
-  arg.s = s;
-  return dw_1_writeattribute(attr, offset, arg);
-}
-
-static unsigned32 dw_1_writeattrib_ref(int attr, unsigned32 offset, unsigned32 n, Symstr *sym) {
-  AttribArg arg;
-  arg.ref.n = n; arg.ref.sym = sym;
-  return dw_1_writeattribute(attr, offset, arg);
-}
-
-static unsigned32 dw_1_attrib_size(int attr) {
-  switch (attr & 15) {
-  case FORM_ADDR:
-  case FORM_REF:
-  case FORM_DATA4:
-  case FORM_BLOCK4: return 6;
-
-  case FORM_BLOCK2:
-  case FORM_DATA2:  return 4;
-
-  case FORM_DATA8:  return 10;
-
-  default:          syserr("dw_1_attrib_size(%x)", attr);
-                    return 0;
-  }
-}
-
-static unsigned32 dw_1_attrib_str_size(char const *s) {
-  return (unsigned32)strlen(s) + 2 + 1;
-}
-
-static unsigned32 dw_1_hdr_size(void) {
-  return 6 + dw_1_attrib_size(AT_sibling);
-}
-
-static unsigned32 dw_1_attrib_friend_size(Friend *amigos)
-{ int32 n = 0;
-  for (; amigos != NULL; amigos = amigos->friendcdr)
-    if (h0_(amigos->u.friendfn) == s_binder)
-      n += (bindstg_(amigos->u.friendfn) & b_undef) ? 0 : 1;
-    else
-      n++;
-  return 4 * n + dw_1_attrib_size(AT_friends);
-}
-
-static unsigned32 dw_1_typeref_size(DbgList *typep) {
-/* For DWARF version 1, qualified types do not have information items, nor do
-   base types (the qualifiers and distinction between base and user types are
-   encoded in the reference). It's uncertain whether pointer and reference
-   types should be separate types or not: there are items for them, but also
-   there are modifier values. For now, we make them items.
-  */
-  switch (typep->debsort) {
-  case DW_TAG_base_type:
-      return dw_1_attrib_size(AT_fund_type);
-
-  case DW_TAG_fref:
-  case DW_TAG_structure_type:
-  case DW_TAG_union_type:
-  case DW_TAG_class_type:
-  case DW_TAG_enumeration_type:
-  case DW_TAG_subroutine_type:
-  case DW_TAG_array_type:
-  case DW_TAG_typedef:
-    return dw_1_attrib_size(AT_user_def_type);
-
-  case DW_TAG_reference_type:
-  case DW_TAG_pointer_type:
-  case DW_TAG_const_type:
-  case DW_TAG_volatile_type:
-    { unsigned32 n = typep->car.DEB_QUALTYPE.n;
-      DbgList *basetype = typep->car.DEB_QUALTYPE.basetype;
-      if (basetype->debsort == DW_TAG_base_type) {
-        if (basetype->car.DEB_BASETYPE.typecode == FT_void && n == 1 &&
-            typep->car.DEB_QUALTYPE.qualmap[0] == MOD_pointer_to)
-          /* special representation for void * */
-          return dw_1_attrib_size(AT_fund_type);
-        else
-          return dw_1_attrib_size(AT_mod_fund_type) + n + 2; /* fundamental type code */
-      } else
-        return dw_1_attrib_size(AT_mod_u_d_type) + n + 4;  /* type ref */
-    }
-
-  default:
-    syserr("dw_1_typeref_size %d", typep->debsort);
-    return 0;
-  }
-}
-
+char const *Dw_Unmangle(char const *s)
+{
 static char unmangle_buf[256];
-
-static char *dbg_unmangle(char *s)
-{ if (strstr(s, "ct__F") == NULL &&
-      strstr(s, "dt__F") == NULL &&
-      strstr(s, "as__F") == NULL &&
-      strstr(s, "__C") == NULL)
-  { unmangle(s, unmangle_buf, 256);
-    if (strcmp(s, unmangle_buf) != NULL)
+static char const sstring[] = "static";
+  size_t len = strlen(s), slen = strlen(sstring);
+  if (!StrnEq(s, "__ct__F", 7) &&
+      !StrnEq(s, "__dt__F", 7) &&
+      !StrnEq(s, "__as__F", 7) &&
+      (len < 4 || !StrEq(s+len-3, "__C")))
+  { const char *name = unmangle2(s, unmangle_buf, sizeof unmangle_buf);
+    if (name != s)
     { char *t = strchr(unmangle_buf, '(');
-      if (t != NULL && t < &unmangle_buf[256]) *t = '\0';
-      return unmangle_buf;
+      if (t != NULL && t < &unmangle_buf[sizeof unmangle_buf])
+          *t = '\0';
+      return (StrnEq(unmangle_buf, sstring, slen)) ? &unmangle_buf[slen+1] :
+          unmangle_buf;
     }
   }
   return s;
 }
 
-#define low_pc_(p)      (p->car.DEB_PROC.bodyaddr)
-#define high_pc_(p)     (p->car.DEB_PROC.endproc->car.DEB_ENDPROC.endaddr)
-static unsigned32 dw_1_itemsize(DbgList *p) {
-/* must be kept in step with dw_1_write_info */
-  unsigned32 n;
-  switch (p->debsort) {
-  case DW_TAG_compile_unit:
-    n = dw_1_hdr_size() +
-        dw_1_attrib_size(AT_language) +
-        dw_1_attrib_str_size(p->car.DEB_SECTION.name);
-    if (baseseg.len > 0) {
-      n += dw_1_attrib_size(AT_low_pc) +
-           dw_1_attrib_size(AT_high_pc);
-    }
-    if (dw_1_lineinfo_size() != 0) {
-      n += dw_1_attrib_size(AT_stmt_list);
-    }
-    return n + dw_1_attrib_str_size(version_banner());
-
-  case DW_TAG_subprogram:
-    n = dw_1_hdr_size() +
-        dw_1_attrib_str_size(dbg_unmangle(p->car.DEB_PROC.name));
-    { DbgList *restype = p->car.DEB_PROC.type;
-      if (restype->debsort != DW_TAG_base_type ||
-          restype->car.DEB_BASETYPE.typecode != FT_void)
-        n += dw_1_typeref_size(restype);
-    }
-    if (p->car.DEB_PROC.mem != NULL)
-    { n += dw_1_typeref_size(p->car.DEB_PROC.mem);
-      if (p->car.DEB_PROC.virtuality) n += dw_1_attrib_str_size("");
-        /* /* and vtable offset?? */
-    }
-    if (p->car.DEB_PROC.inlined)
-      n += dw_1_attrib_str_size("");
-    return n + ((low_pc_(p) != 0 && high_pc_(p) != 0) ? dw_1_attrib_size(AT_low_pc) +
-               dw_1_attrib_size(AT_high_pc) : 0);
-
-  case DW_TAG_endproc:
-    return 0;
-
-  case DW_TAG_proctype_formal:
-    n = dw_1_hdr_size() +
-        dw_1_typeref_size(p->car.DEB_FORMAL.type);
-    if (p->car.DEB_FORMAL.name!= NULL)
-      n += dw_1_attrib_str_size(symname_(p->car.DEB_FORMAL.name));
-    return n;
-
-  case DW_TAG_subroutine_type:
-    n = dw_1_hdr_size();
-    { DbgList *restype = p->car.DEB_PROCTYPE.type;
-      if (restype->debsort != DW_TAG_base_type ||
-          restype->car.DEB_BASETYPE.typecode != FT_void)
-        n += dw_1_typeref_size(restype);
-    }
-    return n;
-
-  case DW_TAG_variable:
-  case DW_TAG_formal_parameter:
-    n = dw_1_hdr_size() +
-        dw_1_attrib_str_size(dbg_unmangle(symname_(p->car.DEB_VAR.sym))) +
-        dw_1_typeref_size(p->car.DEB_VAR.type) +
-        dw_1_attrib_size(AT_location);
-    if (p->car.DEB_VAR.mem != NULL)
-        n += dw_1_typeref_size(p->car.DEB_VAR.mem);
-    switch (p->car.DEB_VAR.stgclass) {
-    case Stg_Extern:
-    case Stg_Static:  return n + 5;
-    case Stg_Reg:
-    case Stg_ArgReg:  return n + 5;
-    case Stg_Auto:
-    case Stg_ArgAuto: return n + 11;
-    default:          syserr("dw_1_itemsize: stg %p = %d", p, p->car.DEB_VAR.stgclass);
-    }
-
-  case DW_TAG_unspecified_parameters:
-    return dw_1_hdr_size();
-
-  case DW_TAG_typedef:
-    return dw_1_hdr_size() +
-           dw_1_attrib_str_size(p->car.DEB_TYPE.name) +
-           dw_1_typeref_size(p->car.DEB_TYPE.type);
-
-  case DW_TAG_fref:
-    p->debsort = p->car.DEB_STRUCT.undefsort;
-  case DW_TAG_class_type:
-  case DW_TAG_union_type:
-  case DW_TAG_structure_type:
-    n = dw_1_hdr_size();
-    if (p->car.DEB_STRUCT.name != NULL) 
-        n += dw_1_attrib_str_size(p->car.DEB_STRUCT.name);
-    if (p->car.DEB_STRUCT.size != 0)  n += dw_1_attrib_size(AT_byte_size);
-    if (p->car.DEB_STRUCT.friends != NULL)
-        n += dw_1_attrib_friend_size(p->car.DEB_STRUCT.friends);
-    return n;
-
-  case DW_TAG_volatile_type:
-  case DW_TAG_const_type:
-  case DW_TAG_pointer_type:
-  case DW_TAG_reference_type:
-    return 0;
-
-  case DW_TAG_ptr_to_member_type:
-    n = dw_1_hdr_size() +
-        dw_1_typeref_size(p->car.DEB_PTRTOMEMTYPE.container) +
-        dw_1_typeref_size(p->car.DEB_PTRTOMEMTYPE.type);
-    return n;
-
-  case DW_TAG_member:
-    n = dw_1_hdr_size() +
-        dw_1_attrib_str_size(p->car.DEB_MEMBER.name) +
-        dw_1_typeref_size(p->car.DEB_MEMBER.type);
-
-    if (!p->car.DEB_MEMBER.decl)                /* static member, no AT_location */
-      n += dw_1_attrib_size(AT_location) +
-        6  /* op_const(n) op_add */;
-    if (p->car.DEB_MEMBER.bsize != 0) {
-      n += dw_1_attrib_size(AT_bit_size) +
-           dw_1_attrib_size(AT_bit_offset);
-    }
-    return n;
-
-  case DW_TAG_inheritance:
-    n = dw_1_hdr_size() +
-        dw_1_typeref_size(p->car.DEB_INHERIT.type) +
-        dw_1_attrib_size(AT_location) +
-        6;
-    if (p->car.DEB_INHERIT.virtuality)
-      n += dw_1_attrib_str_size("");
-    return n;
-
-  case DW_TAG_enumeration_type:
-    n = dw_1_hdr_size();
-    if (p->car.DEB_ENUM.name != NULL)
-      n += dw_1_attrib_str_size(p->car.DEB_ENUM.name);
-    n += dw_1_attrib_size(AT_byte_size);
-    { DbgList *elts = p->car.DEB_ENUM.children;
-      n += dw_1_attrib_size(AT_element_list);
-      for (; elts != NULL; elts = elts->sibling)
-        if (elts->debsort == DW_TAG_enumerator) {
-          n += 4 + strlen(elts->car.DEB_ENUMERATOR.name) + 1;
-        }
-    }
-    return n;
-
-  case DW_TAG_enumerator:
-    return 0;   /* DWARF version 2 only */
-
-  case TAG_padding: /* null entry to terminate sibling chains */
-    { DbgList *l = *p->car.DEB_NULL.parent;
-      for (; l != p; l = l->sibling)
-        if (l->dbgloc != 0) return 4;
-      p->debsort = DW_TAG_ignore;
-      return 0;
-    }
-
-  case DW_TAG_array_type:
-    n = dw_1_hdr_size() +
-        dw_1_attrib_size(AT_subscr_data);
-    n += p->car.DEB_ARRAY.open ? 10 : 12;
-    return n + dw_1_typeref_size(p->car.DEB_ARRAY.basetype);
-
-  case DW_TAG_lexical_block:
-    return dw_1_hdr_size() +
-           dw_1_attrib_size(AT_low_pc) +
-           dw_1_attrib_size(AT_high_pc);
-
-  case DW_TAG_ignore:
-  case DW_TAG_end_lexical_block:
-    return 0;
-
-  default:
-    syserr("dw_1_itemsize %d", p->debsort);
-    return 0;
-  }
-}
-
-static unsigned32 dw_this_itemsize;
-
-static unsigned32 dw_1_hdr(DbgList *p, int itemsort, unsigned32 offset) {
-  dw_this_itemsize = dw_1_itemsize(p);
-  offset = dw_write_w(dw_this_itemsize, offset);
-  offset = dw_write_h(itemsort, offset);
-  { DbgList *sib = p->sibling;
-    for (; sib->sibling != 0; sib = sib->sibling)
-      if (sib->dbgloc != 0) break;
-    return dw_1_writeattrib_u(AT_sibling, offset, sib->dbgloc);
-  }
-}
-
-static unsigned32 dw_1_writetyperef(DbgList *typep, unsigned32 offset) {
-/* For DWARF version 1, qualified types do not have information items, nor do
-   base types (the qualifiers and distinction between base and user types are
-   encoded in the reference). It's uncertain whether pointer and reference
-   types should be separate types or not: there are items for them, but also
-   there are modifier values. For now, we use modifiers.
-  */
-  switch (typep->debsort) {
-  case DW_TAG_base_type:
-    return dw_1_writeattrib_u(AT_fund_type, offset, typep->car.DEB_BASETYPE.typecode);
-
-  case DW_TAG_structure_type:
-  case DW_TAG_union_type:
-  case DW_TAG_class_type:
-  case DW_TAG_enumeration_type:
-  case DW_TAG_subroutine_type:
-  case DW_TAG_array_type:
-  case DW_TAG_typedef:
-    return dw_1_writeattrib_u(AT_user_def_type, offset, typep->dbgloc);
-
-  case DW_TAG_reference_type:
-  case DW_TAG_pointer_type:
-  case DW_TAG_const_type:
-  case DW_TAG_volatile_type:
-    { int n = typep->car.DEB_QUALTYPE.n;
-      Dw_TypeRep *basetype = typep->car.DEB_QUALTYPE.basetype;
-      if (basetype->debsort == DW_TAG_base_type) {
-        if (basetype->car.DEB_BASETYPE.typecode == FT_void && n == 1 &&
-            typep->car.DEB_QUALTYPE.qualmap[0] == MOD_pointer_to)
-          /* special representation for void * */
-          return dw_1_writeattrib_u(AT_fund_type, offset, FT_pointer);
-        else {
-          offset = dw_1_writeattrib_u(AT_mod_fund_type, offset, n+2);
-          obj_writedebug(typep->car.DEB_QUALTYPE.qualmap, n);
-          return dw_write_h(basetype->car.DEB_BASETYPE.typecode, offset+n);
-        }
-      } else {
-        offset = dw_1_writeattrib_u(AT_mod_u_d_type, offset, n+4);
-        obj_writedebug(typep->car.DEB_QUALTYPE.qualmap, n);
-        offset += n;
-        xrefs = dw_relocate(xrefs, offset, debug_sym);
-        return dw_write_w(basetype->dbgloc, offset);
-      }
-    }
-
-  default:
-    syserr("dw_1_writetype %d", typep->debsort);
-    return 0;
-  }
-}
-
-static unsigned32 dw_1_write_friends(unsigned32 offset, Friend *amigos)
-{ DbgList *p = dbglist;
-  offset = dw_write_h(AT_friends, offset);
-  offset = dw_write_h(dw_1_attrib_friend_size(amigos)-dw_1_attrib_size(AT_friends), offset);
-  for (; amigos != NULL ; amigos = amigos->friendcdr)
-  { xrefs = dw_relocate(xrefs, offset, debug_sym);
-    if (h0_(amigos->u.friendclass) == s_tagbind)
-      offset = dw_write_w(((Dw_TypeRep *)((TagBinder *)amigos->u.friendclass)->tagbinddbg)->dbgloc, offset);
-    else
-      for (; p != NULL; p = cdr_(p))
-        if (!(bindstg_(amigos->u.friendfn) & b_undef) &&
-            p->debsort == DW_TAG_subprogram &&
-            p->car.DEB_PROC.name == symname_(bindsym_(amigos->u.friendfn)))
-          { offset = dw_write_w(p->dbgloc, offset); break;}
-  }
-  return offset;
-}
-
-static void dw_1_write_info(void)
-{ DbgList *p;
-  unsigned32 infosize, offset, roundup;
-  xrefs = NULL;
-  /* produce structure descriptors for forward referenced structures for
-   * which there hasn't been a real declaration
-   */
-  obj_startdebugarea(DEBUGAREANAME);
-  PopScope();
-  dbglist = (DbgList *)dreverse((List *)dbglist);
-
-  for (p = dbglist; p != NULL; p = cdr_(p))
-    if (p->debsort == DW_TAG_subprogram && p->car.DEB_PROC.variadic) {
-      DbgList *q,
-              **prevp = &cdr_(p),
-              **prevsibling = &p->car.DEB_PROC.children;
-      for (q = p->car.DEB_PROC.children; q != NULL; q = q->sibling)
-        if (q->debsort == DW_TAG_formal_parameter) {
-          prevsibling = &q->sibling;
-          prevp = &cdr_(q);
-        }
-
-      q = (DbgList *)DbgAlloc(sizeof(dbglist->car.DEB_REST)+offsetof(DbgList,car));
-      q->debsort = DW_TAG_unspecified_parameters;
-      q->sibling = *prevsibling; cdr_(q) = *prevp;
-      *prevsibling = q; *prevp = q;
-    }
-
-  for (infosize = 0, p = dbglist; p != NULL; p = cdr_(p)) {
-    unsigned32 n = dw_1_itemsize(p);
-    p->dbgloc = n == 0 ? 0 : infosize;
-    infosize += n;
-  }
-
-  if (infosize & 3)
-    roundup = 8 - (infosize & 3);
-  else
-    roundup = 0;
-
-  for (offset = 0, p = dbglist; p != NULL; p = cdr_(p)) {
-    int sort = p->debsort;
-    unsigned32 start = offset;
-    switch (sort) {
-    default:
-      syserr(syserr_dbg_write, (long)sort);
-      break;
-
-    case DW_TAG_compile_unit:
-      { DbgList dummy;
-        dummy.dbgloc = infosize + roundup;
-        p->sibling = &dummy;
-        offset = dw_1_hdr(p, TAG_compile_unit, offset);
-      }
-      offset = dw_1_writeattrib_u(AT_language, offset, 
-                (LanguageIsCPlusPlus) ? LANG_C_PLUS_PLUS : LANG_C89);
-      offset = dw_1_writeattrib_str(AT_name, offset, p->car.DEB_SECTION.name);
-      if (baseseg.len > 0) {
-        offset = dw_1_writeattrib_ref(AT_low_pc, offset, 0, p->car.DEB_SECTION.codeseg);
-        offset = dw_1_writeattrib_ref(AT_high_pc, offset, baseseg.len, p->car.DEB_SECTION.codeseg);
-      }
-      if (dw_1_lineinfo_size() != 0) {
-        offset = dw_1_writeattrib_ref(AT_stmt_list, offset, 0, lineinfo_sym);
-      }
-      offset = dw_1_writeattrib_str(AT_producer, offset, version_banner());
-      break;
-
+static uint32 Dw_1or2_NameindexSize(void) {
+  Dw_ItemList const *p = sect_children_(dw_section);
+  uint32 n = 0;
+  for (; p != NULL; p = sibling_(p))
+    switch (debsort_(p)) {
     case DW_TAG_subprogram:
-      offset = dw_1_hdr(p, p->car.DEB_PROC.global ? TAG_global_subroutine : TAG_subroutine, offset);
-      offset = dw_1_writeattrib_str(AT_name, offset, dbg_unmangle(p->car.DEB_PROC.name));
-      { DbgList *restype = p->car.DEB_PROC.type;
-        if (restype->debsort != DW_TAG_base_type ||
-            restype->car.DEB_BASETYPE.typecode != FT_void)
-          offset = dw_1_writetyperef(restype, offset);
-      }
-      if (low_pc_(p) != 0 && high_pc_(p) != 0)
-      {
-      offset = dw_1_writeattrib_ref(AT_low_pc, offset, p->car.DEB_PROC.bodyaddr, 
-                        p->car.DEB_PROC.codeseg);
-      offset = dw_1_writeattrib_ref(AT_high_pc, offset, 
-                p->car.DEB_PROC.endproc->car.DEB_ENDPROC.endaddr, p->car.DEB_PROC.codeseg);
-      }
-      if (p->car.DEB_PROC.mem != NULL)
-      { offset = dw_1_writeattrib_ref(AT_member, offset, p->car.DEB_PROC.mem->dbgloc, 
-                        debug_sym);
-        if (p->car.DEB_PROC.virtuality)
-          offset = dw_1_writeattrib_str(AT_virtual, offset, "");
-      }
-      if (p->car.DEB_PROC.inlined)
-        offset = dw_1_writeattrib_str(AT_inline, offset, "");
-      break;
-
-    case DW_TAG_endproc:
-      break;
-
-    case DW_TAG_unspecified_parameters:
-      offset = dw_1_hdr(p, TAG_unspecified_parameters, offset);
-      break;
-
-    case DW_TAG_proctype_formal:
-      offset = dw_1_hdr(p, TAG_formal_parameter, offset);
-      if (p->car.DEB_FORMAL.name != NULL)
-        offset = dw_1_writeattrib_str(AT_name, offset, symname_(p->car.DEB_FORMAL.name));
-      offset = dw_1_writetyperef(p->car.DEB_FORMAL.type, offset);
-      break;
-
-    case DW_TAG_subroutine_type:
-      offset = dw_1_hdr(p, TAG_subroutine_type, offset);
-      { DbgList *restype = p->car.DEB_PROCTYPE.type;
-        if (restype->debsort != DW_TAG_base_type ||
-            restype->car.DEB_BASETYPE.typecode != FT_void)
-          offset = dw_1_writetyperef(restype, offset);
-      }
-      break;
-
-    case DW_TAG_ptr_to_member_type:
-      offset = dw_1_hdr(p, TAG_ptr_to_member_type, offset);
-      offset = dw_1_writetyperef(p->car.DEB_PTRTOMEMTYPE.container, offset);
-      offset = dw_1_writetyperef(p->car.DEB_PTRTOMEMTYPE.type, offset);
+      n += (uint32)strlen(Dw_Unmangle(proc_name_(p))) + 5;
       break;
 
     case DW_TAG_variable:
-      sort = p->car.DEB_VAR.stgclass == Stg_Extern ? TAG_global_variable : TAG_local_variable;
-    case DW_TAG_formal_parameter:
-      offset = dw_1_hdr(p, sort, offset);
-      offset = dw_1_writeattrib_str(AT_name, offset, dbg_unmangle(symname_(p->car.DEB_VAR.sym)));
-      offset = dw_1_writetyperef(p->car.DEB_VAR.type, offset);
-      if (p->car.DEB_VAR.mem != NULL)
-        offset = dw_1_writeattrib_ref(AT_member, offset, p->car.DEB_VAR.mem->dbgloc, debug_sym);
-      offset = dw_write_h(AT_location, offset);
-      switch (p->car.DEB_VAR.stgclass) {
-      case Stg_Extern:
-      case Stg_Static:
-        offset = dw_write_h(5, offset);
-        offset = dw_write_b(OP_ADDR, offset);
-        { Symstr *s = p->car.DEB_VAR.base.sym;
-          obj_symref(s, symext_(s) == NULL ? xr_data|xr_weak : xr_data, 0);
-          xrefs = dw_relocate(xrefs, offset, s);
-        }
-        offset = dw_write_w(p->car.DEB_VAR.location, offset);
-        break;
-
-      case Stg_Reg:
-      case Stg_ArgReg:
-        offset = dw_write_h(5, offset);
-        offset = dw_write_b(OP_REG, offset);
-        offset = dw_write_w(p->car.DEB_VAR.location, offset);
-        break;
-
-      case Stg_Auto:
-      case Stg_ArgAuto:
-        offset = dw_write_h(11, offset);
-        offset = dw_write_b(OP_BASEREG, offset);
-        offset = dw_write_w(p->car.DEB_VAR.base.r, offset);
-        offset = dw_write_b(OP_CONST, offset);
-        offset = dw_write_w(p->car.DEB_VAR.location, offset);
-        offset = dw_write_b(OP_ADD, offset);
-        break;
-      }
+      n += (uint32)strlen(Dw_Unmangle(symname_(var_sym_(p)))) + 5;
       break;
 
     case DW_TAG_typedef:
-      offset = dw_1_hdr(p, TAG_typedef, offset);
-      offset = dw_1_writeattrib_str(AT_name, offset, p->car.DEB_TYPE.name);
-      offset = dw_1_writetyperef(p->car.DEB_TYPE.type, offset);
-      break;
-
-    case DW_TAG_class_type:
-    case DW_TAG_union_type:
-    case DW_TAG_structure_type:
-      offset = dw_1_hdr(p, p->debsort, offset);
-      if (p->car.DEB_STRUCT.name != NULL)
-        offset = dw_1_writeattrib_str(AT_name, offset, p->car.DEB_STRUCT.name);
-      if (p->car.DEB_STRUCT.size != 0)
-        offset = dw_1_writeattrib_u(AT_byte_size, offset, p->car.DEB_STRUCT.size);
-      if (p->car.DEB_STRUCT.friends != NULL)
-        offset = dw_1_write_friends(offset, p->car.DEB_STRUCT.friends);
-      break;
-
-    case DW_TAG_volatile_type:
-    case DW_TAG_const_type:
-    case DW_TAG_pointer_type:
-    case DW_TAG_reference_type:
-      break;
-
-    case DW_TAG_member:
-      offset = dw_1_hdr(p, TAG_member, offset);
-      offset = dw_1_writeattrib_str(AT_name, offset, p->car.DEB_MEMBER.name);
-      offset = dw_1_writetyperef(p->car.DEB_MEMBER.type, offset);
-      if (p->car.DEB_MEMBER.bsize != 0) {
-        offset = dw_1_writeattrib_u(AT_bit_size, offset, p->car.DEB_MEMBER.bsize);
-        offset = dw_1_writeattrib_u(AT_bit_offset, offset, p->car.DEB_MEMBER.boffset);
-      }
-      if (!p->car.DEB_MEMBER.decl)
-      { offset = dw_1_writeattrib_u(AT_location, offset, 6);
-        offset = dw_write_b(OP_CONST, offset);
-        offset = dw_write_w(p->car.DEB_MEMBER.offset, offset);
-        offset = dw_write_b(OP_ADD, offset);
-      }
-      break;
-
-    case DW_TAG_inheritance:
-      offset = dw_1_hdr(p, TAG_inheritance, offset);
-      offset = dw_1_writetyperef(p->car.DEB_INHERIT.type, offset);
-      offset = dw_1_writeattrib_u(AT_location, offset, 6);
-      offset = dw_write_b(OP_CONST, offset);
-      offset = dw_write_w(p->car.DEB_INHERIT.offset, offset);
-      offset = dw_write_b(OP_ADD, offset);
-      if (p->car.DEB_INHERIT.virtuality)
-        offset = dw_1_writeattrib_str(AT_virtual, offset, "");
-      break;
-
-    case DW_TAG_enumeration_type:
-      offset = dw_1_hdr(p, TAG_enumeration_type, offset);
-      if (p->car.DEB_ENUM.name != NULL)
-        offset = dw_1_writeattrib_str(AT_name, offset, p->car.DEB_ENUM.name);
-      offset = dw_1_writeattrib_u(AT_byte_size, offset, p->car.DEB_ENUM.size);
-      { DbgList *elts = p->car.DEB_ENUM.children;
-        DbgList *prev = NULL, *next;
-        /* DWARF version 1 requires the enumeration members in reverse order.
-           Pre-reverse them. (And reverse back on writing)
-         */
-        for (; elts != NULL; prev = elts, elts = next) {
-          next = elts->sibling;
-          elts->sibling = prev;
-        }
-        elts = prev;
-        offset = dw_1_writeattrib_u(AT_element_list, offset,
-                                    dw_this_itemsize - (offset + 6 - start));
-        prev = NULL;
-        for (; elts != NULL; prev = elts, elts = next) {
-          if (elts->debsort == DW_TAG_enumerator) {
-          /* This just ignores the sibling list terminator */
-            offset = dw_write_w(elts->car.DEB_ENUMERATOR.val, offset);
-            offset = dw_inlinestring(elts->car.DEB_ENUMERATOR.name, offset);
-          }
-          next = elts->sibling;
-          elts->sibling = prev;
-        }
-      }
-      break;
-
-    case DW_TAG_enumerator:
-      break;   /* DWARF version 2 only */
-
-    case TAG_padding: /* null entry to terminate sibling chains */
-      offset = dw_write_w(4, offset);
-      break;
-
-    case DW_TAG_array_type:
-      offset = dw_1_hdr(p, TAG_array_type, offset);
-      offset = dw_1_writeattrib_u(AT_subscr_data, offset,
-                                  dw_1_typeref_size(p->car.DEB_ARRAY.basetype) + (p->car.DEB_ARRAY.open ? 10 : 12));
-      offset = dw_write_b(p->car.DEB_ARRAY.open ? FMT_FT_C_X : FMT_FT_C_C, offset);
-      offset = dw_write_h(FT_signed_integer, offset);
-      offset = dw_write_w(p->car.DEB_ARRAY.lowerbound, offset);
-      if (p->car.DEB_ARRAY.open)
-        offset = dw_write_h(0, offset);
-      else
-        offset = dw_write_w(p->car.DEB_ARRAY.upperbound, offset);
-      offset = dw_write_b(FMT_ET, offset);
-      offset = dw_1_writetyperef(p->car.DEB_ARRAY.basetype, offset);
-      break;
-
-    case DW_TAG_lexical_block:
-      offset = dw_1_hdr(p, TAG_lexical_block, offset);
-      offset = dw_1_writeattrib_ref(AT_low_pc, offset, p->car.DEB_STARTSCOPE.s.codeaddr, p->car.DEB_STARTSCOPE.codeseg);
-      offset = dw_1_writeattrib_ref(AT_high_pc, offset, p->car.DEB_STARTSCOPE.end->car.DEB_ENDSCOPE.s.codeaddr, p->car.DEB_STARTSCOPE.codeseg);
-      break;
-
-    case DW_TAG_ignore:
-    case DW_TAG_end_lexical_block:
-      break;
-    }
-  }
-  if (roundup != 0) {
-    unsigned32 w = 0;
-    dw_write_w(roundup, offset);
-    obj_writedebug(&w, roundup - 4);
-  }
-  obj_enddebugarea(DEBUGAREANAME, xrefs);
-}
-
-static unsigned32 dw_nameindex_size;
-static DbgList *dw_section;
-
-static unsigned32 dw_1or2_nameindex_size(void) {
-  DbgList const *p = dw_section->car.DEB_SECTION.children;
-  unsigned32 n = 0;
-  for (; p != NULL; p = p->sibling)
-    switch (p->debsort) {
-    case DW_TAG_subprogram:
-      n += strlen(dbg_unmangle(p->car.DEB_PROC.name)) + 5;
-      break;
-
-    case DW_TAG_variable:
-      n += strlen(dbg_unmangle(symname_(p->car.DEB_VAR.sym))) + 5;
-      break;
-
-    case DW_TAG_typedef:
-      n += strlen(p->car.DEB_TYPE.name) + 5;
+      n += (uint32)strlen(type_name_(p)) + 5;
       break;
 
     case DW_TAG_fref:
     case DW_TAG_class_type:
     case DW_TAG_union_type:
     case DW_TAG_structure_type:
-      if (p->car.DEB_STRUCT.name != NULL)
-        n += strlen(p->car.DEB_STRUCT.name) + 5;
+      if (struct_name_(p) != NULL)
+        n += (uint32)strlen(struct_name_(p)) + 5;
       break;
 
     case DW_TAG_enumeration_type:
-      if (p->car.DEB_ENUM.name != NULL)
-        n += strlen(p->car.DEB_ENUM.name) + 5;
-      { DbgList *elts = p->car.DEB_ENUM.children;
-        for (; elts != NULL; elts = elts->sibling)
-          if (elts->debsort == DW_TAG_enumerator)
-            n += strlen(elts->car.DEB_ENUMERATOR.name) + 5;
+      if (enum_name_(p) != NULL)
+        n += (uint32)strlen(enum_name_(p)) + 5;
+      { Dw_ItemList *elts = enum_children_(p);
+        for (; elts != NULL; elts = sibling_(elts))
+          if (debsort_(elts) == DW_TAG_enumerator)
+            n += (uint32)strlen(enumerator_name_(elts)) + 5;
       }
       break;
 
@@ -1996,63 +1407,64 @@ static unsigned32 dw_1or2_nameindex_size(void) {
   return n;
 }
 
-static void dw_1or2_write_nameindex_entry(DbgList const *p, char const *s) {
-  dw_write_w(p->dbgloc, 0);
-  dw_inlinestring(s, 0);
+static void Dw_1or2_WriteNameindexEntry(Dw_ItemList const *p, char const *s) {
+  Dw_WriteW(dbgloc_(p), 0);
+  Dw_WriteInlineString(s, 0);
 }
 
-static void dw_1_write_nameindex(void) {
-  DbgList const *p = dw_section->car.DEB_SECTION.children;
+static void Dw_1or2_WriteNameindex(void) {
+  Dw_ItemList const *p = sect_children_(dw_section);
   DataXref *xrefs = NULL;
-  unsigned32 size = dw_nameindex_size + 9 + /* header (excluding length word) */
-                                        4;  /* terminator */
-  unsigned32 roundup = (size & 3) ? 4 - (size & 3) : 0;
-  obj_startdebugarea(NAMEINDEXAREANAME);
-  dw_write_w(size + roundup, 0);
-  dw_write_b(1, 0);
-  dw_write_w(0, 0);
-  dw_write_w(baseseg.len, 0);
-  xrefs = dw_relocate(xrefs, 5, debug_sym);
-  for (; p != NULL; p = p->sibling)
-    switch (p->debsort) {
+  uint32 size = dw_nameindex_size + 9 + /* header (excluding length word) */
+                                    4;  /* terminator */
+  uint32 roundup = (size & 3) ? 4 - (size & 3) : 0;
+  obj_startdebugarea(NameIndexAreaName);
+  Dw_WriteW(size + roundup, 0);
+  Dw_WriteB(1, 0);
+  Dw_WriteW(0, 0);
+  Dw_WriteW(dw_baseseg.len, 0);
+  xrefs = Dw_Relocate(xrefs, 5, dw_debug_sym);
+  for (; p != NULL; p = sibling_(p))
+    switch (debsort_(p)) {
     case DW_TAG_subprogram:
-      dw_1or2_write_nameindex_entry(p, dbg_unmangle(p->car.DEB_PROC.name));
+      Dw_1or2_WriteNameindexEntry(p, Dw_Unmangle(proc_name_(p)));
       break;
 
     case DW_TAG_variable:
-      dw_1or2_write_nameindex_entry(p, dbg_unmangle(symname_(p->car.DEB_VAR.sym)));
+      Dw_1or2_WriteNameindexEntry(p, Dw_Unmangle(symname_(var_sym_(p))));
       break;
 
     case DW_TAG_typedef:
-      dw_1or2_write_nameindex_entry(p, p->car.DEB_TYPE.name);
+      Dw_1or2_WriteNameindexEntry(p, type_name_(p));
       break;
 
+    case DW_TAG_fref:
     case DW_TAG_class_type:
     case DW_TAG_union_type:
     case DW_TAG_structure_type:
-      if (p->car.DEB_STRUCT.name != NULL)
-        dw_1or2_write_nameindex_entry(p, p->car.DEB_STRUCT.name);
+      if (struct_name_(p) != NULL)
+        Dw_1or2_WriteNameindexEntry(p, struct_name_(p));
       break;
 
     case DW_TAG_enumeration_type:
-      if (p->car.DEB_ENUM.name != NULL)
-        dw_1or2_write_nameindex_entry(p, p->car.DEB_ENUM.name);
-      { DbgList *elts = p->car.DEB_ENUM.children;
-        for (; elts != NULL; elts = elts->sibling)
-          if (elts->debsort == DW_TAG_enumerator)
-            dw_1or2_write_nameindex_entry(p, elts->car.DEB_ENUMERATOR.name);
+      if (enum_name_(p) != NULL)
+        Dw_1or2_WriteNameindexEntry(p, enum_name_(p));
+      { Dw_ItemList *elts = enum_children_(p);
+        for (; elts != NULL; elts = sibling_(elts))
+          if (debsort_(elts) == DW_TAG_enumerator)
+            Dw_1or2_WriteNameindexEntry(p, enumerator_name_(elts));
       }
       break;
 
     default:
       break;
     }
-  dw_write_w(0, 0);
+  Dw_WriteW(0, 0);
   if (roundup) {
-    unsigned32 w = 0;
+    uint32 w = 0;
     obj_writedebug(&w, roundup);
   }
-  obj_enddebugarea(NAMEINDEXAREANAME, xrefs);
+  obj_enddebugarea(NameIndexAreaName, xrefs);
 }
 
 #ifdef TARGET_HAS_FP_OFFSET_TABLES
@@ -2066,77 +1478,135 @@ void obj_notefpdesc(ProcFPDesc const *fpd) {
 #endif
 
 void dbg_finalise(void) {
-  dbg_init_done = dbg_sub_init_done = NO;
+  dw_init_done = dw_sub_init_done = NO;
 }
 
 bool dbg_debugareaexists(char const *name) {
-  if (strcmp(name, DEBUGAREANAME) == 0)
-    return dbglist != NULL;
-  else if (strcmp(name, LINEINFOAREANAME) == 0)
-    return dw_1_lineinfo_size() != 0;
-  else if (strcmp(name, NAMEINDEXAREANAME) == 0)
-    return (dw_nameindex_size = dw_1or2_nameindex_size()) != 0;
-  else if (strcmp(name, RANGEINDEXAREANAME) == 0)
+  if (StrEq(name, DebugAreaName))
+    return dw_list != NULL;
+  else if (StrEq(name, LineInfoAreaName))
+    return dw_coord_p != NULL;
+  else if (StrEq(name, NameIndexAreaName))
+    return (dw_nameindex_size = Dw_1or2_NameindexSize()) != 0;
+  else if (StrEq(name, RangeIndexAreaName))
+    return NO;
+  else if (StrEq(name, MacroAreaName))
+    return dw_macrolist != NULL;
+  else if (StrEq(name, AbbrevAreaName))
+    return dw_list != NULL;
+  else if (StrEq(name, LocationAreaName))
     return NO;
   return NO;
 }
 
 void dbg_writedebug(void) {
-  if (dbglist != NULL) dw_1_write_info();
-  if (dw_1_lineinfo_size() != 0) dw_1_write_lineinfo();
-  if (dw_nameindex_size != 0) dw_1_write_nameindex();
+  Dw_ItemList *p;
+  if (dw_list != NULL) {
+    PopScope(NO);
+    dw_list = (Dw_ItemList *)dreverse((List *)dw_list);
+  }
+  dw_macrolist = (Dw_MacroList *)dreverse((List *)dw_macrolist);
+
+  for (p = dw_list; p != NULL; p = cdr_(p))
+    if (debsort_(p) == DW_TAG_subprogram && proc_variadic_(p)) {
+      Dw_ItemList *q,
+              **prevp = &cdr_(p),
+              **prevsibling = &proc_children_(p);
+      for (q = proc_children_(p); q != NULL; q = sibling_(q))
+        if (debsort_(q) == DW_TAG_formal_parameter) {
+          prevsibling = &sibling_(q);
+          prevp = &cdr_(q);
+        }
+
+      q = (Dw_ItemList *)DbgAlloc(sizeof(dw_list->car.DEB_REST)+offsetof(Dw_ItemList,car));
+      debsort_(q) = DW_TAG_unspecified_parameters;
+      sibling_(q) = *prevsibling; cdr_(q) = *prevp;
+      *prevsibling = q; *prevp = q;
+    }
+
+  if (dw_version == 1) {
+    if (dw_list != NULL) Dw_1_WriteInfo();
+    if (dw_coord_p != NULL) Dw_1_WriteLineinfo();
+    if (dw_nameindex_size != 0) Dw_1or2_WriteNameindex();
+  } else {
+    if (dw_list != NULL) Dw_2_WriteInfo();
+    if (dw_coord_p != NULL) Dw_2_WriteLineinfo();
+    if (dw_nameindex_size != 0) Dw_1or2_WriteNameindex();
+    if (dw_macrolist != NULL) Dw_2_WriteMacros();
+    if (dw_list != NULL) Dw_2_WriteAbbrevs();
+  }
+  if (usrdbg(DBG_PROC) && dw_fmllist != NULL) syserr("dw_fmllist non empty!");
 }
 
-static void dbg_sub_init(void) {
-  dbglist = NULL; basetypes = NULL;
-  baseseg.len = 0;
-  dbglistproc = 0;
-  dbglistscope = 0;
-  dbg_filelist = 0, dbg_coord_p = 0; dbg_coord_q = &dbg_coord_p;
-  dbg_loclist = 0;
-  dbg_sub_init_done = YES;
+static void dw_sub_init(void) {
+  dw_list = NULL; dw_basetypes = NULL;
+  dw_baseseg.len = 0;
+  dw_listproc = NULL;
+  dw_listscope = NULL;
+  dw_filelist = NULL; dw_fileindex = 0;
+  dw_pathlist = NULL; dw_pathindex = 0;
+  dw_coord_p = NULL; dw_coord_q = &dw_coord_p;
+  dw_loclist = NULL;
+  dw_sub_init_done = YES;
   dw_nameindex_size =0;
+  dw_ftlist = NULL;
+  dw_fmllist = NULL;
+  dw_macrolist = NULL;
 }
 
-void dbg_setformat(int format) {
-  if (format == 0) format = 1;  /* -dwarf on its own defaults to dwarf version 1 */
-  dwarf_version = format;
+bool dbg_needsframepointer(void) {
+    return dw_version == 1;
+}
+
+void dbg_setformat(char const *format) {
+  int form = format[0];
+  if (form == 0)
+    form = 1;  /* -dwarf on its own defaults to dwarf version 1 */
+  else
+    form = form - '0';
+  dw_version = form;
 }
 
 void dbg_init(void) {
-  if (!dbg_sub_init_done) dbg_sub_init();
-  baseseg.sym = bindsym_(codesegment);
+  if (!dw_sub_init_done) dw_sub_init();
+  dw_baseseg.sym = bindsym_(codesegment);
   if (usrdbg(DBG_ANY))
-  { DbgList *p = DbgListAlloc(DEB_SECTION);
+  { Dw_ItemList *p = Dw_ItemAlloc(DEB_SECTION, DW_TAG_compile_unit);
     dw_section = p;
-    debug_sym = obj_notedebugarea(DEBUGAREANAME);
-    lineinfo_sym = obj_notedebugarea(LINEINFOAREANAME);
-    obj_notedebugarea(NAMEINDEXAREANAME);
-    obj_notedebugarea(RANGEINDEXAREANAME);
-    p->debsort = DW_TAG_compile_unit;
-    p->car.DEB_SECTION.name = sourcefile;
-    p->car.DEB_SECTION.codeseg = bindsym_(codesegment);
-    p->cdr = NULL;
+    dw_debug_sym = obj_notedebugarea(DebugAreaName);
+    dw_lineinfo_sym = obj_notedebugarea(LineInfoAreaName);
+    obj_notedebugarea(NameIndexAreaName);
+    obj_notedebugarea(RangeIndexAreaName);
+    if (dw_version == 2) {
+      dw_macro_sym = obj_notedebugarea(MacroAreaName);
+      dw_abbrev_sym = obj_notedebugarea(AbbrevAreaName);
+      dw_location_sym = obj_notedebugarea(LocationAreaName);
+    }
+    sect_name_(p) = sourcefile;
+    sect_codeseg_(p) = bindsym_(codesegment);
+    cdr_(p) = NULL;
     freescopes = NULL;
-    scopestack = NULL; PushScope(p, &p->car.DEB_SECTION.children);
-    { DbgList *q, **pp = &dbglist;
-      for (; (q = *pp) != NULL; pp = &q->cdr) continue;
+    scopestack = NULL; PushScope(p, &sect_children_(p));
+    { Dw_ItemList *q, **pp = &dw_list;
+      for (; (q = *pp) != NULL; pp = &cdr_(q)) continue;
       *pp = p;
     }
     if (usrdbg(DBG_LINE))
-    { Deb_filelist *x = dbg_filelist;
-      for (; x != NULL; x = x->nextfile) {
-        Deb_filecoord *l = x->linelist;
+    { Dw_FileList *x = dw_filelist;
+      for (; x != NULL; x = cdr_(x)) {
+        Dw_FileCoord *l = x->linelist;
         for (; l != NULL; l = l->nextinfile)
           l->codeseg = bindsym_(codesegment);
       }
     }
   }
-  dbg_init_done = YES;
+  dw_init_done = YES;
 }
 
-#endif /* TARGET_HAS_DWARF */
+#else
 
-#endif /* TARGET_HAS_DEBUGGER */
+typedef int dummy; /* prevent translation unit from being empty */
+
+#endif /* defined(TARGET_HAS_DWARF) && defined(TARGET_HAS_DEBUGGER) */
 
 /* End of mip/dwarf.c */

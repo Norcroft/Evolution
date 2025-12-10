@@ -2,16 +2,52 @@
  * C compiler file compiler.h
  * Copyright (C) Acorn Computers Ltd., 1988-1990.
  * Copyright (C) Advanced RISC Machines Limited, 1991-92.
+ * SPDX-Licence-Identifier: Apache-2.0
  */
 
 /*
- * RCS $Revision: 1.6 $
- * Checkin $Date: 1995/05/10 16:03:48 $
- * Revising $Author: lsmith $
+ * RCS $Revision$
+ * Checkin $Date$
+ * Revising $Author$
  */
 
 #ifndef __compiler_h
 #define __compiler_h
+
+#include "host.h"
+#include "backchat.h"
+#define TOOLNAME armcc
+#include "toolbox.h"
+#include "tooledit.h"
+
+typedef struct {
+  backchat_Messenger *send;
+  void *handle;
+} BackChatHandler;
+
+extern BackChatHandler backchat;
+extern ToolEnv *cc_default_env;
+
+int Tool_EditEnv(ToolEnv *t, HWND wh);
+
+int Tool_OrderedEnvEnumerate(
+    ToolEnv *t, char const *prefix, ToolEdit_EnumFn *f, void *arg);
+
+bool Tool_Configurable(ToolEnv *t, char const *name);
+
+Uint TE_Integer(ToolEnv *t, char const *name, Uint def);
+
+bool TE_HasValue(ToolEnv *t, char const *name, char const *val);
+
+Uint TE_Count(ToolEnv *t, char const *prefix);
+
+void cc_announce_error(char *s, int severity, char const *file, int32 line);
+
+void UpdateProgress(void);
+
+void TE_DecodeArgumentLine(ToolEnv *t, char const *s, bool ignoreerrors);
+
+void TE_NormaliseEtc(ToolEnv *t);
 
 /* The filename suffixes subject to inversion under RISC OS/MVS etc.  */
 #ifdef FORTRAN
@@ -48,14 +84,18 @@
 
 extern time_t tmuse_front, tmuse_back;
 
-extern int ccom(int argc, char *argv[]);  /* must match spec for main */
+int ccom(ToolEnv *t, char const *in_file, char const *out_file, char const *list_file, char const *md_file);
 
 extern void driver_abort(char *message);
 
-extern bool cistreq(const char *s1, const char *s2);
+extern void compiler_exit(int status);
+
+extern bool cistreq(const char *s1, const char *s2); /* s2 must be lower case */
+extern bool cistrneq(const char *s1, const char *s2, size_t n);
 
 #ifdef FOR_ACORN
 extern bool cplusplus_preprocessing(void);
 #endif
 
+extern bool inputfromtty;
 #endif

@@ -3,12 +3,13 @@
  * Copyright (C) Acorn Computers Ltd., 1988-1990.
  * Copyright (C) Codemist Ltd., 1988-1992.
  * Copyright (C) Advanced RISC Machines Limited, 1990-1992.
+ * SPDX-Licence-Identifier: Apache-2.0
  */
 
 /*
- * RCS $Revision: 1.63 $  Codemist 186
- * Checkin $Date: 1995/12/13 12:46:02 $
- * Revising $Author: hmeeking $
+ * RCS $Revision$  Codemist 186
+ * Checkin $Date$
+ * Revising $Author$
  */
 
 /* AM memo: we should look at a getenv() variable to find alternative    */
@@ -48,25 +49,36 @@
 #  include <strings.h>
 extern void exit();
 extern char *getenv();
-extern char *malloc();
-extern char *realloc();
 extern int  system();
 #endif
 #include <ctype.h>
 #include <stdio.h>
+#define uint HIDE_HPs_uint
 #include <signal.h>
+#undef uint
+#include <setjmp.h>
 
 #include "globals.h"
 #include "errors.h"
 #include "compiler.h"
+#include "store.h"
 #include "fname.h"
 #include "version.h"
 #include "drivhelp.h"
 #include "mcdep.h"
 #include "prgname.h"
+#include "pp.h"
 #ifdef FOR_ACORN
 #include "dde.h"
 #endif
+#include "toolenv2.h"
+#include "tooledit.h"
+#include "toolbox.h"
+#include "toolver.h"
+#include "trackfil.h"
+
+BackChatHandler backchat;
+static jmp_buf exitbuf;
 
     /*************************************************************/
     /*                                                           */
@@ -85,14 +97,14 @@ extern int  system();
 
 /* #define BSD_CC              "/usr/ucb/cc" */
 
-#define KEY_ANSI            0x0000001L
+#define KEY_NEXT                    1L
 #define KEY_HOST_LIB        0x0000002L
 #define KEY_HELP            0x0000004L
 #define KEY_LINK            0x0000008L
 #define KEY_LISTING         0x0000010L
 #define KEY_PCC             0x0000020L
+#define KEY_CONFIG          0x0000040L
 
-#define KEY_STRICT          0x0000040L
 #define KEY_COMMENT         0x0000080L
 #define KEY_ASM_OUT         0x0000100L
 #define KEY_XPROFILE        0x0000200L
@@ -100,7 +112,6 @@ extern int  system();
 #define KEY_PREPROCESS      0x0000800L
 #define KEY_PROFILE         0x0001000L
 #define KEY_RENAME          0x0002000L
-#define KEY_UNIX            0x0004000L
 #define KEY_MD              0x0008000L
 #define KEY_READONLY        0x0010000L
 #define KEY_STDIN           0x0020000L
@@ -111,18 +122,12 @@ extern int  system();
 #else
 #  define KEY_NOSYSINCLUDES 0x0080000L
 #endif
-#ifdef TARGET_ENDIANNESS_CONFIGURABLE
-#  define KEY_LITTLEEND    0x00100000L
-#  define KEY_BIGEND       0x00200000L
-#endif
 #define KEY_ERRORSTREAM    0x00400000L
 #define KEY_VIAFILE        0x00800000L
 #define KEY_VERIFY         0x01000000L
+
 #  define KEY_CFRONT       0x02000000L
-#ifdef PASCAL
-#  define KEY_ISO          0x02000000L
-#endif
-#define KEY_CPP            0x04000000L
+#define KEY_DEBUG          0x08000000L
 
 #ifndef FORTRAN
 /* IDJ 25-Mar-94: re-use FORTRAN flags for DDE purposes */
@@ -218,7 +223,7 @@ static struct EnvTable
                           *fort_profile_lib,
                           *pas_lib;
 }
-      setupenv =
+     const initSetupenv =
 #ifdef DRIVER_ENV
     DRIVER_ENV
 #else
@@ -240,7 +245,7 @@ static struct EnvTable
       0, (KEY_LINK), 0,
 /* /* Perhaps $.clib, $.plib etc should be called $.lib */
       "$.clib", "$.clib", "$.plib", ".", "$.clib", "$.plib", "l",
-      "ObjAsm -quit -stamp",
+      "ObjAsm",
       "CHAIN:link", NULL, "",
       "", "", "",
       "o.ansilib", "o.hostlib", "o.ansilib", "o.fortlib", "o.fortlib", "o.plib"
@@ -248,25 +253,11 @@ static struct EnvTable
 #     endif
 #  endif
 #  ifdef COMPILING_ON_UNIX
-#   ifdef TARGET_IS_HELIOS         /* software rust awaiting paint. */
     {
 #    ifdef FORTRAN
-      0, (KEY_UNIX | KEY_LINK), RISCIX_FORTRAN_PRAGMAX,
+      0, (KEY_LINK), RISCIX_FORTRAN_PRAGMAX,
 #    else
-      0, (KEY_UNIX | KEY_LINK), 0,
-#    endif
-      "/helios/include", "/helios/include", "/", "/", "", "", "lst",
-      "as",
-      "armlink", "a.out", "",
-      "/helios/lib/cstart.o", "/helios/lib/cstart.o", "/helios/lib/cstart.o",
-      "", "", "", "", ""
-    }
-#   else /* TARGET_IS_HELIOS */
-    {
-#    ifdef FORTRAN
-      0, (KEY_UNIX | KEY_LINK), RISCIX_FORTRAN_PRAGMAX,
-#    else
-      0, (KEY_UNIX | KEY_PCC | KEY_LINK), 0,
+      0, (KEY_PCC | KEY_LINK), 0,
 #    endif
 #    ifdef RISCiX113
       "/usr/include/ansi",
@@ -289,14 +280,13 @@ static struct EnvTable
 #    endif
      "-lpc"
     }
-#   endif  /* TARGET_IS_HELIOS */
 #  endif /* COMPILING_ON_UNIX */
 # else /* COMPILING_ON_ARM */
-#  ifdef COMPILING_ON_MSDOS /* Zortech on MSDOS */
+#  ifdef COMPILING_ON_MSDOS /* Zortech / WatCom / VC++  on MSDOS */
     {
        0, (KEY_LINK), 0,
        "\\arm\\lib", "\\arm\\lib", "", "\\", "\\arm\\lib", "", "lst",
-       "armasm -quit -stamp",
+       "armasm",
        "armlink", NULL, "",
        "", "", "",
        "armlib.o", "hostlib.o", "armlib.o", "", "", ""
@@ -312,7 +302,7 @@ static struct EnvTable
        0, 0, 0,
 #endif
        "", "", "", ":", "", "", "lst",
-       "armasm -quit -stamp",
+       "armasm",
        "armlink", NULL, "",
        "", "", "",
        "armlib.o", "hostlib.o", "armlib.o", "", "", ""
@@ -322,7 +312,7 @@ static struct EnvTable
 /* arm_targetted cross_compilation : fortran & pascal not supported */
        { 0, KEY_LINK, 0,
          "/usr/local/lib/arm", "/usr/local/lib/arm", "", "/", "/usr/local/lib/arm", "", "lst",
-         "armasm -quit -stamp",
+         "armasm",
          "armlink", NULL, "",
          "", "", "",
          "armlib.o", "hostlib.o", "armlib.o", "", "", ""
@@ -336,32 +326,40 @@ static struct EnvTable
 #endif /* DRIVER_ENV */
 ;
 
-static char  *(*cc_argv)[], *(*cc_filv)[];
-static const char *(*ld_argv)[], *(*ld_filv)[];
-static int   cc_argc, cc_filc, ld_argc, ld_filc;
+static struct EnvTable setupenv;
+
+char const Tool_Name[] = TOOLFILENAME;
+
+#ifdef COMPLING_ON_UNIX
+#  define Compiling_On_Unix 1
+#else
+#  define Compiling_On_Unix 0
+#endif
+
+#if defined(PASCAL)
+#  define LanguageIsPascal 1
+#  define LanguageIsFortran 0
+#elif defined(FORTRAN)
+#  define LanguageIsPascal 0
+#  define LanguageIsFortran 1
+#else
+#  define LanguageIsPascal 0
+#  define LanguageIsFortran 0
+#endif
+
+typedef struct { char const **v; Uint sz; Uint n; } ArgV;
+static ArgV cc_arg, cc_fil;
+static ArgV ld_arg, ld_fil;
+
 static int   cmd_error_count, main_error_count;
 static int32 driver_flags;
 #ifdef FORTRAN
 static int32 pragmax_flags;
 #endif
-#ifdef FOR_ACORN
-static char *dependfile;
-        /* IDJ: 06-Jun-94: used to point to filename after -depend */
-#endif
-
-
-#ifdef TARGET_IS_KCM            /* shouldn't be here */
-#  define OBJ_EXTN "kcm"
-#  define ASM_EXTN "mas"
-#endif
-#ifdef TARGET_IS_XAP            /* ditto */
-#  define ASM_EXTN "xap"
-#endif
 
 #ifdef HOST_OBJECT_INCLUDES_SOURCE_EXTN
 #  define OBJ_EXTN LANG_EXTN_STRING ".o"
 #  define ASM_EXTN LANG_EXTN_STRING ".s"
-#  define DEFAULT_STDIN_OBJECT OBJ_EXTN
 #else
 #ifndef OBJ_EXTN
 #  define OBJ_EXTN "o"
@@ -371,6 +369,22 @@ static char *dependfile;
 #endif
 #endif
 
+static int compiler_exit_status;
+
+void compiler_exit(int status)
+{  compiler_exit_status = status;
+#ifdef NLS
+   msg_close(NULL);
+#endif
+   trackfile_finalise();
+   alloc_finalise();
+#ifdef COMPILING_ON_MSDOS
+   (void) signal(SIGTERM, SIG_DFL);
+#endif
+   if (errors != NULL) fclose(errors);
+   longjmp(exitbuf, 1);
+}
+
 /*
  * Join two path names and return the result.
  */
@@ -379,32 +393,45 @@ static const char *join_path(const char *root, const char *dir,
                              const char *name)
 {
   if (root[0] != '\0' && name[0] != '\0')
-  {
-      char *new_name = (char *)malloc(strlen(root)+strlen(dir)+strlen(name)+1);
-      strcpy(new_name, root);
-      strcat(new_name, dir);
-      strcat(new_name, name);
+  {   size_t rootlen = strlen(root),
+             dirlen =  strlen(dir),
+             namelen = strlen(name);
+      char *new_name = (char *)PermAlloc((int32)rootlen+(int32)dirlen+(int32)namelen+1);
+      memcpy(new_name, root, rootlen);
+      memcpy(new_name+rootlen, dir, dirlen);
+      memcpy(new_name+rootlen+dirlen, name, namelen+1);
       return new_name;
   }
   return name;
 }
 
+#define modifiablecopy(s) join_strs(s, "")
+#define PermString(s) modifiablecopy(s)
+
 static char *join_strs(const char *s1, const char *s2)
 {
-  char *s = strcpy((char *)malloc(strlen(s1) + strlen(s2) + 1), s1);
-  strcat(s, s2);
+  size_t s1len = strlen(s1),
+         s2len = strlen(s2);
+  char *s = (char *)PermAlloc((int32)s1len + (int32)s2len + 1);
+  memcpy(s, s1, s1len);
+  memcpy(s+s1len, s2, s2len+1);
   return s;
 }
 
-static void new_cc_arg(char *flag)
+static void AddArg(ArgV *p, char const *arg)
 {
-  (*cc_argv)[cc_argc++] = flag;
+  if (p->n >= p->sz) {
+    void *newv = PermAlloc(sizeof(char **) * 2 * p->sz);
+    memcpy(newv, p->v, p->sz * sizeof(char **));
+    p->v = (char const **)newv;
+    p->sz *= 2;
+  }
+  p->v[p->n++] = arg;
 }
 
-static char *copy_unparse(const char *key,
-                          UnparsedName *unparse,  const char *extn)
+static char *copy_unparse(UnparsedName *unparse,  const char *extn)
 {   char *new_name;
-    size_t k = strlen(key), n;
+    size_t n;
     UnparsedName u;
 /* A NULL extn means use the UnparsedName as-is. A non-NULL extn means */
 /* use the extn given and kill any leading path segment. In this case  */
@@ -425,10 +452,9 @@ static char *copy_unparse(const char *key,
     }
 /* Allocate space for the returned copy of the name. Allow some spare   */
 /* for ^ -> .. (several times) + up to 2 extra path separators + a NUL. */
-    n = k + unparse->vlen + unparse->plen + unparse->rlen + unparse->elen + 10;
-    new_name = (char *)malloc(n);
-    strcpy(new_name, key);
-    if (fname_unparse(unparse, FNAME_AS_NAME, new_name+k, n-k) < 0)
+    n = unparse->vlen + unparse->plen + unparse->rlen + unparse->elen + 10;
+    new_name = (char *)PermAlloc(n);
+    if (fname_unparse(unparse, FNAME_AS_NAME, new_name, n) < 0)
         driver_abort("internal fault in \"copy_unparse\""); /* @@@ syserr? */
     return new_name;
 }
@@ -443,12 +469,11 @@ static char *pathfromenv(char *var, char *ifnull)
   if (def == NULL)
       return ifnull;
   else {
-      def = join_strs(def, "");
-#ifdef COMPILING_ON_UNIX
+      def = modifiablecopy(def);
+      if (Compiling_On_Unix)
       {   char *s = def;
           for (; *s != 0; s++) if (*s == ':') *s = ',';
       }
-#endif
       return def;
   }
 }
@@ -477,16 +502,16 @@ static char *pathfromenv(char *var, char *ifnull)
 static void get_external_environment(void)
 {
   char *root = pathfromenv(C_INC_VAR, "");
+  setupenv = initSetupenv;
   if (root[0] != 0)
       setupenv.include_ansi_path = setupenv.include_pcc_path = root;
   root = pathfromenv(C_LIB_VAR, setupenv.lib_root);
   if (root[0] != 0)
   {
-/* Hmm, KEY_UNIX is same as 'COMPILING_ON_UNIX'.                        */
 /* Moreover the 'isalpha' is essential a file-is-rooted test.           */
 /* similarly 'lib_dir' is just the (host) directory-separator.          */
 #define lib_fixupname(path) \
-    if (!(setupenv.initial_flags & KEY_UNIX) || isalpha(path[0])) \
+    if (!Compiling_On_Unix || isalpha(path[0])) \
         path = join_path(root, setupenv.lib_dir, path)
     lib_fixupname(setupenv.default_lib);
     lib_fixupname(setupenv.host_lib);
@@ -508,15 +533,94 @@ static void get_external_environment(void)
 #endif
 }
 
-static void set_default_options(void)
-{
-  char **argp, *arg;
-  /* set up driver options excepting things like -D<letter>id.          */
-  for (argp = driver_options, arg = *argp;  arg != NULL;  arg = *(++argp))
-  {   if (arg[1] == 'D' && arg[2] != '_' &&
-          (driver_flags & (KEY_PCC|KEY_STRICT)) == KEY_STRICT) continue;
-      new_cc_arg(arg);
+typedef struct {
+  char const *name;
+  char const *val;
+} NameVal;
+
+typedef struct {
+  ToolEnv *t;
+  ToolEdit_EnumFn *f;
+  void *arg;
+  char const *prefix;
+  size_t prefix_len;
+  Uint n;
+  NameVal *matches;
+} TE_EnumRec;
+
+typedef struct {
+  char const *prefix;
+  size_t prefix_len;
+  Uint n;
+} TE_CountRec;
+
+static int TECount_F(void *arg, char const *name, char const *val) {
+  TE_CountRec *tp = (TE_CountRec *)arg;
+  IGNORE(val);
+  if (tp->prefix_len == 0 || StrnEq(name, tp->prefix, tp->prefix_len))
+    tp->n++;
+  return 0;
+}
+
+Uint TE_Count(ToolEnv *t, char const *prefix) {
+  TE_CountRec tr;
+  tr.prefix = prefix; tr.prefix_len = strlen(prefix);
+  tr.n = 0;
+  toolenv_enumerate(t, TECount_F, &tr);
+  return tr.n;
+}
+
+static int TE_EnumEnter(void *arg, char const *name, char const *val) {
+  TE_EnumRec *tp = (TE_EnumRec *)arg;
+  if (tp->prefix_len == 0 || StrnEq(name, tp->prefix, tp->prefix_len)) {
+    tp->matches[tp->n].name = name;
+    tp->matches[tp->n].val = val;
+    tp->n++;
   }
+  return 0;
+}
+
+static int CFNameVal(void const *a, void const *b) {
+  NameVal const *ap = (NameVal const *)a;
+  NameVal const *bp = (NameVal const *)b;
+  uint32 an = strtoul(&ap->name[3], NULL, 16),
+         bn = strtoul(&bp->name[3], NULL, 16);
+  return an < bn  ? -1 :
+         an == bn ? 0 :
+                    1;
+}
+
+int Tool_OrderedEnvEnumerate(
+    ToolEnv *t, char const *prefix, ToolEdit_EnumFn *f, void *arg) {
+  Uint n = TE_Count(t, prefix);
+  TE_EnumRec tr;
+  int rc = 0;
+  tr.t = t; tr.f = f; tr.arg = arg;
+  tr.prefix = prefix; tr.prefix_len = strlen(prefix);
+  if (n != 0) {
+    Uint i;
+    tr.matches = (NameVal *)malloc(n * sizeof(NameVal));
+    tr.n = 0;
+    toolenv_enumerate(t, TE_EnumEnter, &tr);
+    qsort(tr.matches, tr.n, sizeof(NameVal), CFNameVal);
+    for (i = 0; i < tr.n; i++) {
+      rc = f(arg, tr.matches[i].name, tr.matches[i].val, FALSE);
+      if (rc != 0) break;
+    }
+    free(tr.matches);
+  }
+  return rc;
+}
+
+Uint TE_Integer(ToolEnv *t, char const *name, Uint def) {
+    char const *tval = toolenv_lookup(t, name);
+    if (tval == NULL || tval[0] != '=') return def;
+    return (Uint)strtoul(&tval[1], NULL, 10);
+}
+
+bool TE_HasValue(ToolEnv *t, char const *name, char const *val) {
+    char const *tval = toolenv_lookup(t, name);
+    return tval != NULL && StrEq(val, tval);
 }
 
 /*************************************************************/
@@ -525,250 +629,25 @@ static void set_default_options(void)
 /*                                                           */
 /*************************************************************/
 
+/* full case-insensitive */
 bool cistreq(const char *s1, const char *s2) {
     for ( ; ; ) {
         int ch1 = *s1++, ch2 = *s2++;
-        if (safe_tolower(ch1) != ch2) return NO;
+        if (safe_tolower(ch1) != safe_tolower(ch2)) return NO;
         if (ch1 == 0) return YES;
     }
 }
 
-static int32 keyword(const char *string)
-{
-  int count;
-  static struct { char *word; int32 key; } const keytab[] = {
-      "-help",          KEY_HELP,
-      "-h",             KEY_HELP,
-      "-verify",        KEY_VERIFY,
-      "-link",          KEY_LINK,
-      "-list",          KEY_LISTING,
-      "-errors",        KEY_ERRORSTREAM,
-      "-via",           KEY_VIAFILE,
-#ifdef TARGET_ENDIANNESS_CONFIGURABLE
-      "-littleend",     KEY_LITTLEEND,
-      "-li",            KEY_LITTLEEND,
-      "-bigend",        KEY_BIGEND,
-      "-bi",            KEY_BIGEND,
-#endif
-#ifdef PASCAL /*ECN*/
-      "-iso",           KEY_ISO,
-      "-arthur",        KEY_HOST_LIB,
-      "-super",         KEY_HOST_LIB,
-      "-counts",        KEY_COUNTS,
-#else
-#ifndef FORTRAN /* i.e. C, C++, etc */
-      "-ansi",          KEY_ANSI,
-      "-ansic",         KEY_ANSI,
-      "-arthur",        KEY_HOST_LIB,
-      "-pcc",           KEY_PCC,
-      "-super",         KEY_HOST_LIB,
-      "-fussy",         KEY_STRICT,
-      "-strict",        KEY_STRICT,
-      "-pedantic",      KEY_STRICT,
-      "-counts",        KEY_COUNTS,
-      "-cfront",        KEY_CFRONT,
-      "-cpp",           KEY_CPP,
-#ifdef FOR_ACORN
-      "-throwback",     KEY_THROWBACK,
-      "-desktop",       KEY_DESKTOP,
-      "-depend",        KEY_DEPEND,
-      "-c++",           KEY_CFRONTPREPROCESS,
-#endif
-#  ifdef RISCiX113
-      "-riscix1.2",     KEY_RIX120,
-#  endif
-#else /* FORTRAN */
-#  ifndef TARGET_IS_UNIX
-      "-bsd",           KEY_PCC,
-#  endif
-      "-onetrip",       KEY_ONETRIP,
-      "-fussy",         KEY_STRICT,
-      "-f66",           KEY_F66,
-      "-strict",        KEY_STRICT,
-      "-extend",        KEY_LONGLINES,
-#endif /* FORTRAN */
-#endif /* PASCAL */
-    };
-
-  for (count = 0;  count < sizeof(keytab)/sizeof(keytab[0]);  ++count)
-      if (cistreq(string, keytab[count].word))
-          return keytab[count].key;
-
-  return 0L;
-}
-
-static void incompatible_option(msg_t opt)
-{
-  cc_msg_lookup(driver_incompat_options,msg_lookup(opt));
-  exit(EXIT_error);
-}
-
-/*************************************************************/
-/*                                                           */
-/*      Validate the command line keywords                   */
-/*                                                           */
-/*************************************************************/
-
-static void validate_flags(void)
-{
-  int32 flags = driver_flags;
-
-#ifdef WANT_WHINGY_MSGS_EVEN_WHEN_WRONG
-  if (ld_argc != 0 && !(flags & KEY_LINK))
-      /* Beware: the next line catches most curios, but not -lxxx   */
-      cc_msg_lookup(driver_ignored_linkerflags);
-#endif
-
-  if (flags & KEY_ANSI) flags &= ~KEY_PCC;
-
-  if (flags & KEY_ANSI)
-    if (flags & KEY_CFRONT || flags & KEY_CPP)
-      incompatible_option(driver_incompat_cfrontcpp_ansi);
-
-  if (flags & KEY_PCC)
-    if (flags & KEY_CFRONT || flags & KEY_CPP)
-      incompatible_option(driver_incompat_cfrontcpp_pcc);
-
-  if (flags & KEY_CFRONT)
-    if (flags & KEY_PCC || flags & KEY_ANSI)
-      incompatible_option(driver_incompat_pccansi_cfront);
-
-  if (flags & KEY_CPP)
-    if (flags & KEY_PCC || flags & KEY_ANSI)
-      incompatible_option(driver_incompat_pccansi_cpp);
-
-  if (flags & KEY_HOST_LIB)
-  {   if (flags & KEY_UNIX)
-      {   cc_msg_lookup(driver_ignored_arthur_unix);
-          flags &= ~KEY_HOST_LIB;
-      }
-  }
-
-  if (flags & KEY_COMMENT && !(flags & KEY_PREPROCESS)) flags &= ~KEY_COMMENT;
-
-  if ((flags & (KEY_MAKEFILE+KEY_PREPROCESS+KEY_MD)) ==
-               (KEY_MAKEFILE+KEY_PREPROCESS))
-  {
-      cc_msg_lookup(driver_conflict_EM);
-      flags &= ~KEY_MAKEFILE;
-  }
-
-  if (flags & KEY_COUNTS) flags |= KEY_LISTING;
-
-  if (flags & KEY_PROFILE && flags & KEY_XPROFILE) flags &= ~KEY_PROFILE;
-
-#ifdef FORTRAN
-  if (flags & KEY_STRICT)
-  {   if (flags & KEY_ONETRIP)
-      {   cc_msg_lookup(driver_conflict_strict_onetrip);
-          flags &= ~KEY_ONETRIP;
-      }
-      if (flags & KEY_F66)
-      {   cc_msg_lookup(driver_conflict_strict_f66);
-          flags &= ~KEY_F66;
-      }
-      if (flags & KEY_LONGLINES)
-      {   cc_msg_lookup(driver_conflict_strict_extend);
-          flags &= ~KEY_LONGLINES;
-      }
-  }
-  if ((flags & KEY_F66) && (flags & KEY_ONETRIP))
-  {   cc_msg_lookup(driver_implies_f66_onetrip);
-      flags &= ~KEY_ONETRIP;
-  }
-#endif
-
-  driver_flags = flags;
-}
-
-static void give_help(const char *command_name)
-{
-#ifdef HOST_WANTS_NO_BANNER
-    msg_printf(driver_banner);
-#endif
-#ifdef TIME_LIMIT
-    {   time_t expire = TIME_LIMIT;
-        msg_fprintf(driver_expire,VENDOR_NAME,ctime(&expire));
+/* full case-insensitive */
+bool cistrneq(const char *s1, const char *s2, size_t n) {
+    while (0 < n--) {
+        int ch1 = *s1++, ch2 = *s2++;
+        if (safe_tolower(ch1) != safe_tolower(ch2)) return NO;
+        if (ch1 == 0) return YES;
     }
-#endif
-    {   msg_t *p = driver_help_text;
-        msg_printf(*p, command_name);
-#ifdef REL193_HACK
-        while (*++p != NULL) msg_printf("%s\n", *p);
-#else
-        while (*++p != NULL) msg_printf(*p,command_name);
-#endif
-    }
+    return YES;
 }
 
-/*************************************************************/
-/*                                                           */
-/*      Set command line options for current flags           */
-/*                                                           */
-/*************************************************************/
-
-#ifdef FORTRAN
-static char pragmax[16];
-static char pragmaw[16];
-#endif
-
-static void set_flag_options(void)
-{
-  int32 flags = driver_flags;
-#ifdef FORTRAN
-  int32 pragmaw_flags = 0;
-  if (flags & KEY_ONETRIP) pragmaw_flags |= F66_ONETRIP;
-  if (flags & KEY_F66)
-      pragmaw_flags |= (F66_ONETRIP + F66_IOSUBLIST + F66_INTRINSGO);
-  if (flags & KEY_LONGLINES) pragmax_flags |= OPT_LONGLINES;
-  if (flags & KEY_STRICT) pragmax_flags = 0;
-  sprintf(pragmaw, "-ZPW%-lu", pragmaw_flags);
-  sprintf(pragmax, "-ZPX%-lu", pragmax_flags);
-  new_cc_arg(pragmaw);
-  new_cc_arg(pragmax);
-#endif
-
-  if (flags & KEY_STRICT)       new_cc_arg("-ZF");
-  if (flags & KEY_MAKEFILE)
-      new_cc_arg(flags & KEY_NOSYSINCLUDES ? "-M<" : "-M");
-  if (flags & KEY_PCC)          new_cc_arg("-ZU");
-#ifdef PASCAL
-  if (flags & KEY_ISO)          new_cc_arg("-ZZ");
-#endif
-
-#ifdef FOR_ACORN
-  if (flags & KEY_THROWBACK)
-      dde_throwback_flag = 1;
-  if (flags & KEY_CFRONTPREPROCESS)
-      cplusplus_flag = 1;
-#endif
-#ifdef CPLUSPLUS
-  if (flags & KEY_CFRONT)       new_cc_arg("-ZZ");
-  if (flags & KEY_CPP)          new_cc_arg("-ZX");
-#endif
-  if (flags & KEY_ANSI)         new_cc_arg("-ZY");
-  if (flags & KEY_PREPROCESS &&
-      flags & KEY_COMMENT)      new_cc_arg("-C");
-#ifdef TARGET_ENDIANNESS_CONFIGURABLE
-  if (flags & KEY_LITTLEEND)    new_cc_arg("-ZE1");
-  if (flags & KEY_BIGEND)       new_cc_arg("-ZE0");
-#endif
-#ifdef TARGET_IS_UNIX
-#  ifdef COMPILING_ON_ACORN_KIT
-  /* Horrid bodge to remove -ZS<system> and -ZI<file> if -strict... */
-  /* AM: why?  Maybe of more general use?                           */
-  if (flags & KEY_STRICT)
-  {   int f, t;
-      for (f = t = 1;  f < cc_argc;  ++f)
-      {   char *arg = (*cc_argv)[f];
-          if (arg[1] != 'Z' || arg[2] != 'I' && arg[2] != 'S')
-              (*cc_argv)[t++] = arg;
-      }
-      cc_argc = t;
-  }
-#  endif
-#endif
-}
 
 /*************************************************************/
 /*                                                           */
@@ -776,15 +655,15 @@ static void set_flag_options(void)
 /*                                                           */
 /*************************************************************/
 
-static int cmd_cat(char *cmd, int posn, const char *extra)
+static int32 cmd_cat(char *cmd, int32 posn, const char *extra)
 {
-  int l = strlen(extra);
+  size_t l = strlen(extra);
   if (posn != 0 && l != 0)
   {
       if (cmd != NULL) cmd[posn] = ' ';
       ++posn;
   }
-  if (cmd != NULL && l != 0) strcpy(cmd + posn, extra);
+  if (cmd != NULL && l != 0) memcpy(cmd + posn, extra, l+1);
   return posn + l;
 }
 
@@ -800,41 +679,38 @@ static int cmd_cat(char *cmd, int posn, const char *extra)
 #  define target_asm_options_(x) ""
 #endif
 
-static int assembler(const char *asm_file, const char *obj_file)
+static int assembler(ToolEnv *t, const char *asm_file, const char *obj_file)
 {
   int32 flags = driver_flags;
   char *cmd;
   char small_cmd[SMALL_COMMAND];
 
+  alloc_perfileinit();
 #ifndef NO_CONFIG
-  config_init();
+  config_init(t);
 #endif
   cmd = NULL;
   for (;;)
   {   /* once round to count the length and once to copy the strings... */
-      int cmdlen = 0;
-      int32 endian;
-      cmdlen = cmd_cat(cmd, cmdlen, setupenv.assembler_cmd);
-      endian =
-#ifdef TARGET_ENDIANNESS_CONFIGURABLE
-         driver_flags & KEY_LITTLEEND ? CONFIG_ENDIANNESS_SET :
-         driver_flags & KEY_BIGEND ? CONFIG_ENDIANNESS_SET+CONFIG_BIG_ENDIAN :
-#endif
-         0;
-      cmdlen = cmd_cat(cmd, cmdlen, target_asm_options_(endian));
+      int32 cmdlen = cmd_cat(cmd, 0, setupenv.assembler_cmd);
+      cmdlen = cmd_cat(cmd, cmdlen, target_asm_options_(t));
+      if (flags & KEY_DEBUG)    cmdlen = cmd_cat(cmd, cmdlen, " -g");
       if (flags & KEY_READONLY) cmdlen = cmd_cat(cmd, cmdlen, " -R");
-      if (!(flags & KEY_UNIX))  cmdlen = cmd_cat(cmd, cmdlen, asm_file);
-      if (flags & KEY_UNIX)     cmdlen = cmd_cat(cmd, cmdlen, "-o");
-      cmdlen = cmd_cat(cmd, cmdlen, obj_file);
-      if (flags & KEY_UNIX)     cmdlen = cmd_cat(cmd, cmdlen, asm_file);
+      if (!Compiling_On_Unix)   cmdlen = cmd_cat(cmd, cmdlen, asm_file);
+      if (Compiling_On_Unix)    cmdlen = cmd_cat(cmd, cmdlen, "-o");
+                                cmdlen = cmd_cat(cmd, cmdlen, obj_file);
+      if (Compiling_On_Unix)    cmdlen = cmd_cat(cmd, cmdlen, asm_file);
       if (cmd != NULL) break;
       if (cmdlen < SMALL_COMMAND)
           cmd = small_cmd;
       else
-          cmd = (char *)malloc(cmdlen+1);
+          cmd = (char *)SynAlloc(cmdlen+1);
   }
   if (driver_flags & KEY_VERIFY) cc_msg("[%s]\n", cmd);
-  return system(cmd);
+  {   int rc = system(cmd);
+      drop_local_store();
+      return rc;
+  }
 }
 
 #endif
@@ -846,25 +722,52 @@ static int assembler(const char *asm_file, const char *obj_file)
 /*************************************************************/
 
 #ifndef target_lib_name_
-#  define target_lib_name_(x,e) x
+#  define target_lib_name_(e,x) x
 #endif
 
 #ifndef HOST_CANNOT_INVOKE_LINKER
 
-static void linker(int32 flags)
-{
-#ifndef TARGET_IS_NULL          /* Hmmm, but, but ... */
-  int count;
-  const char *startup;
-  int32 endian =
-#ifdef TARGET_ENDIANNESS_CONFIGURABLE
-         driver_flags & KEY_LITTLEEND ? CONFIG_ENDIANNESS_SET :
-         driver_flags & KEY_BIGEND ? CONFIG_ENDIANNESS_SET+CONFIG_BIG_ENDIAN :
-#endif
-         0;
+#ifndef LINKER_IS_SUBPROGRAM
+typedef struct {
+  char *cmd;
+  int32 cmdlen;
+  ToolEnv *t;
+} LinkerLibRec;
 
+static int LibEnum_F(void *arg, char const *name, char const *val, bool readonly) {
+  LinkerLibRec *llr = (LinkerLibRec *)arg;
+  IGNORE(readonly); IGNORE(name);
+  llr->cmdlen = cmd_cat(llr->cmd, llr->cmdlen, target_lib_name_(llr->t, &val[1]));
+  return 0;
+}
+
+#else
+typedef struct {
+  char **argv;
+  int count;
+  ToolEnv *t;
+} LinkerLibRec;
+
+static int LibEnum_F(void *arg, char const *name, char const *val, bool readonly) {
+  LinkerLibRec *llr = (LinkerLibRec *)arg;
+  IGNORE(readonly); IGNORE(name);
+  llr->argv[llr->count++] = modifiablecopy(target_lib_name_(llr->t, &val[1]));
+  return 0;
+}
+
+#endif
+
+static void linker(ToolEnv *t, int32 flags)
+{
+#ifdef TARGET_IS_NULL          /* Hmmm, but, but ... */
+  IGNORE(flags);
+#else
+  Uint count;
+  const char *startup;
+
+  alloc_perfileinit();
 #ifndef NO_CONFIG
-  config_init();
+  config_init(t);
 #endif
   switch (flags & (KEY_PROFILE | KEY_XPROFILE))
   {
@@ -875,7 +778,7 @@ default:            startup = setupenv.link_startup;       break;
 
 #ifndef LINKER_IS_SUBPROGRAM
   { char *cmd = NULL;
-    int cmdlen;
+    int32 cmdlen, libstart;
     char small_cmd[SMALL_COMMAND];
 
     for (;;)
@@ -883,94 +786,102 @@ default:            startup = setupenv.link_startup;       break;
         cmdlen = 0;
         cmdlen = cmd_cat(cmd, cmdlen, setupenv.link_cmd);
 
-        for (count = 0;  count < ld_argc;  ++count)
-            cmdlen = cmd_cat(cmd, cmdlen, (*ld_argv)[count]);
+        for (count = 0;  count < ld_arg.n;  ++count)
+            cmdlen = cmd_cat(cmd, cmdlen, ld_arg.v[count]);
 
         cmdlen = cmd_cat(cmd, cmdlen, "-o");
         cmdlen = cmd_cat(cmd, cmdlen, setupenv.output_file);
         cmdlen = cmd_cat(cmd, cmdlen, startup);
 
-        for (count = 0;  count < ld_filc;  ++count)
-            cmdlen = cmd_cat(cmd, cmdlen, (*ld_filv)[count]);
+        for (count = 0;  count < ld_fil.n;  ++count)
+            cmdlen = cmd_cat(cmd, cmdlen, ld_fil.v[count]);
 
-        count = cmdlen;
+        libstart = cmdlen;
 
         if (flags & KEY_HOST_LIB)
-            cmdlen = cmd_cat(cmd, cmdlen, target_lib_name_(setupenv.host_lib, endian));
+            cmdlen = cmd_cat(cmd, cmdlen, target_lib_name_(t, setupenv.host_lib));
 
 #ifdef PASCAL
-        cmdlen = cmd_cat(cmd, cmdlen, target_lib_name_(setupenv.pas_lib, endian));
+        cmdlen = cmd_cat(cmd, cmdlen, target_lib_name_(t, setupenv.pas_lib));
 #endif
 #ifdef FORTRAN
-        cmdlen = cmd_cat(cmd, cmdlen, target_lib_name_(setupenv.fort_lib, endian));
+        cmdlen = cmd_cat(cmd, cmdlen, target_lib_name_(t, setupenv.fort_lib));
 #endif
-        cmdlen = cmd_cat(cmd, cmdlen, target_lib_name_(setupenv.default_lib, endian));
-
+        {   LinkerLibRec llr;
+            llr.cmd = cmd; llr.cmdlen = cmdlen; llr.t = t;
+            Tool_OrderedEnvEnumerate(t, "-L.", LibEnum_F, &llr);
+            cmdlen = llr.cmdlen;
+        }
         if (cmd != NULL) break;
         if (cmdlen < SMALL_COMMAND)
             cmd = small_cmd;
         else
-            cmd = (char *)malloc(cmdlen+1);
+            cmd = (char *)SynAlloc(cmdlen+1);
     }
-    while (count < cmdlen)
+    for (; libstart < cmdlen; libstart++)
     { /* space-separate, rather than comma-join, the library list */
-      if (cmd[count] == ',') cmd[count] = ' ';  ++count;
+      if (cmd[libstart] == ',') cmd[libstart] = ' ';
     }
 
     if (driver_flags & KEY_VERIFY) cc_msg("[%s]\n", cmd);
     count = system(cmd);
   }
-#else
-  { const char **argv = (const char **)malloc((ld_argc+ld_filc+8) * sizeof(char **));
-    extern int do_link(int argc, const char **argv);
-
-    argv[0] = setupenv.link_cmd;
-    memcpy(&argv[1], *ld_argv, ld_argc * sizeof(char **));
-    count = ld_argc+1;
+#else  /* LINKER_IS_SUBPROGRAM */
+  { char **argv = (char **)SynAlloc((ld_arg.n+ld_fil.n+7+TE_Count(t, "-L.")) * sizeof(char **));
+    extern int do_link(int argc, char **argv, backchat_Messenger *bc, void *bcarg);
+    argv[0] = modifiablecopy(setupenv.link_cmd);
+    memcpy(&argv[1], ld_arg.v, ld_arg.n * sizeof(char **));
+    count = ld_arg.n+1;
     argv[count++] = "-o";
-    argv[count++] = setupenv.output_file;
-    if (*startup != 0) argv[count++] = startup;
-    memcpy(&argv[count], *ld_filv, ld_filc * sizeof(char **));
-    count += ld_filc;
+    argv[count++] = modifiablecopy(setupenv.output_file);
+    if (*startup != 0) argv[count++] = modifiablecopy(startup);
+    memcpy(&argv[count], ld_fil.v, ld_fil.n * sizeof(char **));
+    count += ld_fil.n;
     if (flags & KEY_HOST_LIB)
-      argv[count++] = join_strs(target_lib_name_(setupenv.host_lib, endian), "");
+      argv[count++] = modifiablecopy(target_lib_name_(t, setupenv.host_lib));
 
 #ifdef PASCAL
-    argv[count++] = join_strs(target_lib_name_(setupenv.pas_lib, endian), "");
+    argv[count++] = modifiablecopy(target_lib_name_(t, setupenv.pas_lib));
 #endif
 #ifdef FORTRAN
-    argv[count++] = join_strs(target_lib_name_(setupenv.fort_lib, endian), "");
+    argv[count++] = modifiablecopy(target_lib_name_(t, setupenv.fort_lib));
 #endif
-    argv[count++] = target_lib_name_(setupenv.default_lib, endian);
+    {   LinkerLibRec llr;
+        llr.argv = argv; llr.count = count; llr.t = t;
+        Tool_OrderedEnvEnumerate(t, "-L.", LibEnum_F, &llr);
+        count = llr.count;
+    }
     argv[count] = 0;
-    count = do_link(count, argv);
+    count = do_link(count, argv, backchat.send, backchat.handle);
   }
-#endif
+#endif /* LINKER_IS_SUBPROGRAM */
   if (count != 0) ++main_error_count;
 
   /*
    * In PCC mode delete the '.o' file if only one file was compiled.
    * NB. (count==0) is used to check the link was ok.
    */
-  if (
-#ifndef PASCAL
-      (flags & KEY_PCC) &&
-#endif
-      (cc_filc == 1) && (ld_filc == 1) && (count==0))
-      remove((*ld_filv)[0]);
-#else /* TARGET_IS_NULL */
-  flags = flags;  /* keep ncc happy */
-#endif
+  if ((LanguageIsPascal || StrEq(toolenv_lookup(t, ".lang"), "=-pcc"))
+      && cc_fil.n == 1 && ld_fil.n == 1 && count == 0)
+      remove(ld_fil.v[0]);
+  drop_local_store();
+#endif  /* TARGET_IS_NULL */
 }
-#endif
+#endif  /* HOST_CANNOT_INVOKE_LINKER */
+
+static int PrintEnv(void *arg, char const *name, char const *val) {
+  IGNORE(arg);
+  cc_msg(" %s %s", name, val);
+  return 0;
+}
 
 /*
  * Process input file names.
  */
 
-static void process_file_names(int filc, char *filv[])
+static void process_file_names(ToolEnv *t, ArgV *v)
 {
-  int count, saved_cc_argc;
+  Uint count, filc = v->n;
   int32 flags = driver_flags;
   UnparsedName unparse;
 
@@ -980,24 +891,23 @@ static void process_file_names(int filc, char *filv[])
    * there is exactly 1 C file), rather than the number of files to be
    * processed by this function.
    */
-  cc_filc = 0;
-  saved_cc_argc = cc_argc;
+  cc_fil.n = 0;
 
   for (count = 0; count < filc;  ++count)
-  {   char *current = filv[count];
+  {   char const *current = v->v[count];
       int state = 0;            /* hack for contorted program flow */
       int extn_ch;
+      char *source_file, *listing_file = NULL, *md_file = NULL;
 
       if (strlen(current) > MAX_TEXT-5)
       {   cc_msg_lookup(driver_ignored_filename_overlong, current);
           continue;
       }
 
-      cc_argc = saved_cc_argc;
       fname_parse(current, FNAME_SUFFIXES, &unparse);
 
-      if (unparse.extn == NULL)
 #ifndef COMPILING_ON_UNIX
+      if (unparse.extn == NULL)
       /* On non-Unix hosts use a sensible default if no extension was given */
 #ifdef FOR_ACORN
       if (!cplusplus_flag)
@@ -1007,6 +917,7 @@ static void process_file_names(int filc, char *filv[])
       }
       extn_ch = unparse.extn[0];
 #else
+      if (unparse.extn == NULL)
           extn_ch = 0;
       else
           extn_ch = unparse.extn[0];
@@ -1020,17 +931,16 @@ case 'a':
 #  else
 case 'O':
 #  endif
-case 'o':     if ((flags & (KEY_PREPROCESS+KEY_MAKEFILE)) == 0)
+case 'o':     if (!(flags & (KEY_PREPROCESS+KEY_MAKEFILE)))
               {
-                  (*ld_filv)[ld_filc++] = copy_unparse("", &unparse, NULL);
+                  AddArg(&ld_fil, copy_unparse(&unparse, NULL));
                   break;
               }
-              else cc_msg_lookup(driver_inconsistent_EM,
-                          (*cc_argv)[0], current);
+              else cc_msg_lookup(driver_conflict_EM);
               /* and fall through ... */
 #endif
 
-default:      if ((flags & (KEY_PREPROCESS+KEY_MAKEFILE)) == 0)
+default:      if (!(flags & (KEY_PREPROCESS+KEY_MAKEFILE)))
               {   if ((flags & KEY_CFRONTPREPROCESS) != 0) goto case_lang_extn;
                   cc_msg_lookup(driver_unknown_filetype, current);
                   ++cmd_error_count;
@@ -1043,11 +953,11 @@ default:      if ((flags & (KEY_PREPROCESS+KEY_MAKEFILE)) == 0)
 #  ifndef COMPILING_ON_UNIX
 case 'S':
 #  endif
-case 's':     if ((flags & (KEY_PREPROCESS+KEY_MAKEFILE)) == 0)
-              {   const char *asm_file = copy_unparse("", &unparse, NULL);
-                  const char *obj_file = copy_unparse("", &unparse, OBJ_EXTN);
+case 's':     if (!(flags & (KEY_PREPROCESS+KEY_MAKEFILE)))
+              {   const char *asm_file = copy_unparse(&unparse, NULL);
+                  const char *obj_file = copy_unparse(&unparse, OBJ_EXTN);
                   state = 1;
-                  if (assembler(asm_file, obj_file) != 0)
+                  if (assembler(t, asm_file, obj_file) != 0)
                   {   main_error_count++;
                       remove(obj_file);
                   }
@@ -1066,85 +976,50 @@ case_lang_extn:
 case LANG_EXTN:
           {   char *out_file = setupenv.output_file;
               char *out_name = NULL;
-              if (flags & KEY_ASM_OUT)
-              {
-                  if (flags & KEY_RENAME && filc == 1)
-                      /* Assert: KEY_RENAME => setupenv.output_file != NULL */
-                      new_cc_arg(join_strs("-S", out_name = out_file));
-                  else
-                  {   out_name = copy_unparse("-S", &unparse, ASM_EXTN);
-                      new_cc_arg(out_name);
-                      out_name += 2;                       /* skip the -S */
-                  }
-                  new_cc_arg("-C");             /* suppress object output */
-              }
+              if ((flags & KEY_RENAME) && filc == 1 && !(flags & KEY_LINK))
+                /* Assert: KEY_RENAME => setupenv.output_file != NULL */
+                  out_name = out_file;
+              else if (flags & KEY_ASM_OUT)
+                  out_name = copy_unparse(&unparse, ASM_EXTN);
 
-#ifdef TARGET_IS_ALPHA
-#  define NO_OBJECT_OUTPUT2 1           /* @@@ '2' is a temp hack       */
-#endif
 #ifdef NO_OBJECT_OUTPUT2
 /* Turn "cc -c foo.c" into "cc -S foo.c"; as foo.s"                     */
               if (!(flags & (KEY_PREPROCESS|KEY_MAKEFILE|KEY_ASM_OUT)))
-              {   out_name = copy_unparse("-S", &unparse, ASM_EXTN);
-                  new_cc_arg(out_name);
-                  out_name += 2;                         /* skip the -S */
-                  new_cc_arg("-C");           /* suppress object output */
-              }
+                  out_name = copy_unparse(&unparse, ASM_EXTN);
 #endif
-
               if (flags & KEY_LISTING)
-                  new_cc_arg(copy_unparse("-L", &unparse, setupenv.list));
-/*
- * Maybe the -counts option should take a file name.  For the moment
- * it just uses a fixed one...
- */
-              if (flags & KEY_COUNTS) new_cc_arg("-K");
+                  listing_file = copy_unparse(&unparse, setupenv.list);
 
               if (flags & KEY_MD)
-                  new_cc_arg(copy_unparse("-M", &unparse, "d"));
-#ifdef FOR_ACORN
-              /* IDJ 06-Jun-94: -depend <filename> gets turned into     */
-              /* -M+<filename> here                                     */
-              if (flags & KEY_DEPEND)
-                  new_cc_arg(join_strs("-M+", dependfile));
-#endif
-              new_cc_arg(copy_unparse("", &unparse, NULL));
+                  md_file = copy_unparse(&unparse, "d");
 
-              if (out_file == NULL                  ||
-                   filc != 1                        ||
-                   flags & (KEY_LINK)               ||
-                  (flags & KEY_RENAME) == 0)
-              {   /*
-                   * No-default-output-file ||
-                   * more-than-1-file || going-to-link || no -o <file>
-                   */
-                  out_file = copy_unparse("", &unparse, OBJ_EXTN);
+              source_file = copy_unparse(&unparse, NULL);
+
+              if (out_file == NULL           /* No default output file */
+                  || filc != 1               /* more than 1 file */
+                  || (flags & KEY_LINK)      /* going to link */
+                  || !(flags & KEY_RENAME))  /* no -o <file> */
+              {
+                  out_file = copy_unparse(&unparse, OBJ_EXTN);
               }
                   /* else...
                    * -o && no-link && 1-file && default-op-file
                    */
-#ifdef NO_OBJECT_OUTPUT2                /* @@@ '2' is a temp hack       */
-/* Already written as -S<out_name> (see above, sigh).                   */
-#else
-              new_cc_arg(out_file);
-#endif
               if (out_name == NULL) out_name = out_file;
 
-              if ((flags & (KEY_MAKEFILE+KEY_PREPROCESS)) == 0)
+              if (!(flags & (KEY_MAKEFILE+KEY_PREPROCESS)))
               {
-                  (*ld_filv)[ld_filc++] = out_file;
+                  AddArg(&ld_fil, out_file);
                   if (state == 1)
                      /* already called the assembler so... */ break;
               }
 
-              if (driver_flags & KEY_VERIFY)
-              {   int j;
-                  for (j = 0;  j < cc_argc;  ++j)
-                      cc_msg("%c%s", j==0 ? '[':' ', (*cc_argv)[j]);
+              if (flags & KEY_VERIFY) {
+                  cc_msg("[");
+                  toolenv_enumerate(t, PrintEnv, NULL);
                   cc_msg("]\n");
               }
-              (*cc_argv)[cc_argc] = NULL;
-              if (ccom(cc_argc, *cc_argv))
+              if (ccom(t, source_file, out_name, listing_file, md_file))
               {   ++main_error_count;
 #ifdef COMPILING_ON_RISC_OS
 /* The next line is dirty and should be done by checking return code,   */
@@ -1156,7 +1031,7 @@ case LANG_EXTN:
 #ifdef NO_OBJECT_OUTPUT2                /* @@@ '2' is a temp hack       */
 #ifndef HOST_CANNOT_INVOKE_ASSEMBLER
               if (!(flags & (KEY_PREPROCESS|KEY_MAKEFILE|KEY_ASM_OUT)))
-              {   if (assembler(out_name, out_file) != 0)
+              {   if (assembler(t, out_name, out_file) != 0)
                   {   main_error_count++;
                       remove(out_file);
                   }
@@ -1166,21 +1041,135 @@ case LANG_EXTN:
 #endif
           }
           /* and for the benefit of linker(), count the sources */
-          ++cc_filc;
+          ++cc_fil.n;
           break;
       }
 
       /*
        * If no output file has been given, derive one from the 1st file name.
        */
-      if (setupenv.output_file == NULL && flags & KEY_LINK)
-          setupenv.output_file = copy_unparse("", &unparse, setupenv.link_ext);
+      if (setupenv.output_file == NULL && (flags & KEY_LINK))
+          setupenv.output_file = copy_unparse(&unparse, setupenv.link_ext);
   }
 }
 
-/*
- * Extract compilation options from the command line.
- */
+#ifdef FORTRAN
+#  define FortranUnimplementedOption(ch,current)\
+    if (current[1] == ch) { nimp_option(current); break; }
+#else
+#  define FortranUnimplementedOption(ch,current)
+#endif
+
+/*************************************************************/
+/*                                                           */
+/*      Validate the command line keywords                   */
+/*                                                           */
+/*************************************************************/
+
+static void validate_flags(void)
+{
+  int32 flags = driver_flags;
+
+#ifdef WANT_WHINGY_MSGS_EVEN_WHEN_WRONG
+  if (ld_arg.n != 0 && !(flags & KEY_LINK))
+      /* Beware: the next line catches most curios, but not -lxxx   */
+      cc_msg_lookup(driver_ignored_linkerflags);
+#endif
+
+  if (Compiling_On_Unix && (flags & KEY_HOST_LIB))
+  {   cc_msg_lookup(driver_ignored_arthur_unix);
+      flags &= ~KEY_HOST_LIB;
+  }
+
+  if (flags & KEY_COMMENT && !(flags & KEY_PREPROCESS)) flags &= ~KEY_COMMENT;
+
+  if ((flags & (KEY_MAKEFILE+KEY_PREPROCESS+KEY_MD)) ==
+               (KEY_MAKEFILE+KEY_PREPROCESS))
+  {
+      cc_msg_lookup(driver_conflict_EM);
+      flags &= ~KEY_MAKEFILE;
+  }
+
+  if (flags & KEY_PROFILE && flags & KEY_XPROFILE) flags &= ~KEY_PROFILE;
+
+#ifdef FORTRAN
+    if (flags & KEY_STRICT)
+    {   if (flags & KEY_ONETRIP)
+        {   cc_msg_lookup(driver_conflict_strict_onetrip);
+            flags &= ~KEY_ONETRIP;
+        }
+        if (flags & KEY_F66)
+        {   cc_msg_lookup(driver_conflict_strict_f66);
+            flags &= ~KEY_F66;
+        }
+        if (flags & KEY_LONGLINES)
+        {   cc_msg_lookup(driver_conflict_strict_extend);
+            flags &= ~KEY_LONGLINES;
+        }
+    }
+    if ((flags & KEY_F66) && (flags & KEY_ONETRIP))
+    {   cc_msg_lookup(driver_implies_f66_onetrip);
+        flags &= ~KEY_ONETRIP;
+    }
+#endif
+
+  driver_flags = flags;
+}
+
+static void give_help(const char *command_name)
+{
+#ifdef HOST_WANTS_NO_BANNER
+    msg_printf(driver_banner);
+#endif
+#ifdef TIME_LIMIT
+    {   time_t expire = TIME_LIMIT;
+        msg_fprintf(driver_expire,VENDOR_NAME,ctime(&expire));
+    }
+#endif
+    {   msg_t *p = driver_help_text;
+        msg_printf(*p, command_name);
+        while (*++p != NULL) msg_printf(*p,command_name);
+    }
+}
+
+/*************************************************************/
+/*                                                           */
+/*      Set command line options for current flags           */
+/*                                                           */
+/*************************************************************/
+
+#ifdef FORTRAN
+static char pragmax[16];
+static char pragmaw[16];
+#endif
+
+static void set_flag_options(ToolEnv *t)
+{
+#ifdef FORTRAN
+  int32 flags = driver_flags;
+  int32 pragmaw_flags = 0;
+  if (flags & KEY_ONETRIP) pragmaw_flags |= F66_ONETRIP;
+  if (flags & KEY_F66)
+      pragmaw_flags |= (F66_ONETRIP + F66_IOSUBLIST + F66_INTRINSGO);
+  if (flags & KEY_LONGLINES) pragmax_flags |= OPT_LONGLINES;
+  if (flags & KEY_STRICT) pragmax_flags = 0;
+  sprintf(pragmaw, "-zpw%-lu", pragmaw_flags);
+  sprintf(pragmax, "-zpx%-lu", pragmax_flags);
+  new_cc_arg(pragmaw);
+  new_cc_arg(pragmax);
+#endif
+
+#if defined(TARGET_IS_UNIX) && defined (COMPILING_ON_ACORN_KIT)
+  /* Remove -ZS<system> and -ZI<file> if -strict...                 */
+  /* AM: why?  Maybe of more general use?                           */
+  if (driver_flags & KEY_STRICT)
+  {   tooledit_insert(t, "-ZI", NULL);
+      tooledit_insert(t, "-ZS", NULL);
+  }
+#else
+  IGNORE(t);
+#endif
+}
 
 static void bad_option(const char *opt)
 {
@@ -1196,239 +1185,186 @@ static void nimp_option(const char *opt)
 }
 #endif
 
-static char *new_include(const char *file, char *list)
-{
-  unsigned len, l, lim;
+typedef struct {
+  char const *prefix;
+  size_t prefixlen;
+  uint32 n;
+} FindLastRec;
 
-  if (list == NULL)
-  {
-      len = 0;
-      list = (char *)malloc(INCLUDE_BUFLEN);
+static int FindLast_F(void *arg, char const *name, char const *val) {
+  FindLastRec *fr = (FindLastRec *)arg;
+  IGNORE(val);
+  if (StrnEq(name, fr->prefix, fr->prefixlen)) {
+    uint32 n = strtoul(&name[fr->prefixlen], NULL, 16);
+    if (n > fr->n) fr->n = n;
   }
-  else
-  {
-      len = strlen(list);
-      lim = INCLUDE_BUFLEN;
-      while (lim <= len) lim *= 2;    /* -> 2**k */
-      l = len + strlen(file) + 2;     /* + ',' + NUL */
-      if (l > lim)
-      {
-          while (l > lim) lim *= 2;
-          list = (char *)realloc(list, lim);
-      }
-      list[len++] = ',';
-  }
-  strcpy(list + len, file);
-  return list;
+  return 0;
 }
 
-static int mapvia(FILE *v, char *viafile, char **newargv)
-{   int ch, newargc, p, got_via;
-    char word[128];
-
-    if (v == NULL)
-    {   cc_msg_lookup(driver_via_not_opened, viafile);
-        exit(1);
-    }
-    fseek(v, 0L, SEEK_SET);
-
-    newargc = got_via = 0;
-    for (ch = ' ';;)
-    {   while (ch != EOF && isspace(ch)) ch = getc(v);
-        if (ch == EOF) break;
-        p = 0;
-        if (ch == '"' || ch == '\'') {
-            int quote = ch;
-            for (;;) {
-                ch = getc(v);
-                if (ch == EOF || ch == quote) break;
-                if (p < (sizeof(word)-1)) word[p++] = ch;
-            }
-        } else
-            do
-            {   if (p < (sizeof(word)-1)) word[p++] = ch;
-                ch = getc(v);
-            } while (ch != EOF && !isspace(ch));
-        word[p] = 0;
-        if (got_via)
-        {   FILE *f = fopen(word, "r");
-            newargc += mapvia(f, word, newargv==NULL ? NULL : newargv+newargc);
-            fclose(f);
-            got_via = 0;
-        }
-        else if (cistreq(word, "-via"))
-            got_via = 1;
-        else
-        {   got_via = 0;
-            if (newargv != NULL)
-                newargv[newargc] = strcpy((char *)malloc(strlen(word)+1), word);
-            ++newargc;
-        }
-    }
-    return newargc;
+static uint32 FindLast(ToolEnv *t, char const *prefix) {
+  FindLastRec fr;
+  fr.prefix = prefix; fr.prefixlen = strlen(prefix); fr.n = 0;
+  toolenv_enumerate(t, FindLast_F, &fr);
+  return fr.n;
 }
 
-static int read_keyword_options(int argc, char ***argvPtr)
-{
-  char **argv = *argvPtr;
-  int count;
-  for (count=1; count < argc;  ++count)
-  {
-      int32 key = keyword(argv[count]);
-      if (key == 0L)
-      {   int n = count;
-          KW_Status status = mcdep_keyword(argv[count], &n, argv);
-          if (status != KW_OK && status != KW_NONE) {
-              int c = '\'';
-              cc_msg_lookup(driver_option_bad1);
-              while (count <= n) {
-                  cc_msg("%c%s", c, argv[count]);
-                  argv[count++] = NULL;
-                  c = ' ';
-              }
-              count--;
-              cc_msg("'");      /* makes NLS string more sensible */
-              cc_msg_lookup(driver_option_bad2);
-              ++cmd_error_count;
-          } else
-              count = n;
+static void AddInclude(ToolEnv *t, char const *prefix, char const *val) {
+  char b[FILENAME_MAX+16];
+  uint32 n = FindLast(t, prefix);
+  sprintf(b, "%s%lx.%s", prefix, (long)((n + 0x1fffff) & ~0xfffff), val);
+  tooledit_insertwithjoin(t, b, '=', val);
+}
+
+static struct { char const *name; char const *alias; } const EnvNames[] =
+{ { ".-Isearch",".fk" },
+  { ".rolits", ".fw" },
+  { ".enums",  ".fy" },
+  { ".swilr",  ".fz" }
+};
+
+static char const *EnvName(char const *alias) {
+  Uint i;
+  for (i = 0; i < sizeof(EnvNames) / sizeof(EnvNames[0]); i++)
+    if (StrEq(alias, EnvNames[i].alias))
+      return EnvNames[i].name;
+  return alias;
+}
+
+static void EnvFlagSet(ToolEnv *t, char const *opts, int type, char const *valid, bool ignoreerrors) {
+  char name[4]; char val[8];
+  bool plus = NO;
+  int opt;
+  for (; (opt = *opts) != 0; ++opts)
+    if (opt == '+')
+      plus = YES;
+    else if (opt == '-')
+      plus = NO;
+    else {
+      int ch = safe_tolower(opt);
+      if (strchr(valid, ch) == 0) {
+        if (!ignoreerrors) cc_warn(warn_option_letter, type, opt);
       } else {
-          char *keyword = argv[count];
-          argv[count] = NULL;
-#if defined(FORTRAN) && !defined(TARGET_IS_UNIX)
-          if (key == KEY_PCC)
-              pragmax_flags = RISCIX_FORTRAN_PRAGMAX;
-          else
-#endif
-#ifdef FOR_ACORN
-          if (key & KEY_DEPEND)
-          {   /* IDJ 06-Jun-94: this is messy here (but safe, I believe)
-               * We remember the arg after -depend here, so that we can
-               * change it into -M+<filename> later (yuk).
-               */
-              if (++count >= argc)
-              {   cc_msg("Missing file argument for %s\n", keyword);
-                  exit(1);
-              }
-              else
-              {   dependfile    = argv[count];
-                  argv[count]   = NULL;
-                  driver_flags |= key;
-              }
-          }
-          else if (key & KEY_DESKTOP)
-          {   /* IDJ 06-Jun-94: this is messy here (but safe, I believe)
-               * We remember the desktop prefix for running under the wimp.
-               */
-              if (++count >= argc)
-              {   cc_msg("Missing file argument for %s\n", keyword);
-                  exit(1);
-              }
-              else
-              {   dde_desktop_prefix = argv[count];
-                  argv[count]   = NULL;
-                  driver_flags |= key;
-              }
-          }
-          else
-#endif
-          if (key == KEY_ERRORSTREAM || key == KEY_VIAFILE) {
-              if (++count >= argc) {
-                  cc_msg_lookup(driver_option_missing_filearg, keyword);
-                  exit(1);
-              } else if (key == KEY_ERRORSTREAM) {
-                  FILE *e = fopen(argv[count], "w");
-                  if (e == NULL) {
-                      cc_msg_lookup(driver_cant_open_output, argv[count]);
-                      exit(1);
-                  }
-                  fclose(e);
-                  freopen(argv[count], "w", stderr);
-                  argv[count] = NULL;
-              } else { /* KEY_VIAFILE, perforce */
-                  FILE *v = fopen(argv[count], "r");
-                  int n = mapvia(v, argv[count], NULL);
-                  argv[count] = NULL;
-                  if (n < 0) exit(1);
-                  if (n > 0) {
-                      char **newargv = (char **)
-                          malloc(sizeof(char *) * (argc + n));
-                      int j, newargc;
-                      for (j = 0, newargc = 0;  j < count;  ++j)
-                      {   if (argv[j] == NULL) continue;
-                          newargv[newargc++] = argv[j];
-                      }
-                      n = newargc + mapvia(v, NULL, newargv+newargc);
-                      for (j = count;  j < argc;  ++j)
-                      {   if (argv[j] == NULL) continue;
-                          newargv[n++] = argv[j];
-                      }
-                      count = newargc-1;
-                      argc = n;
-                      *argvPtr = argv = newargv;
-                  }
-                  fclose(v);
-              }
-          } else
-              driver_flags |= key;
+        sprintf(name, ".%c%c", type, ch);
+        if (plus)
+          sprintf(val, "=-%c+%c", type, ch);
+        else
+          sprintf(val, "=-%c%c", type, ch);
+        tooledit_insert(t, EnvName(name), val);
       }
-  }
-#ifdef PASCAL /*ECN*/
-  driver_flags |= KEY_ANSI;
-#endif
-  return argc;
+    }
 }
 
-#ifdef FORTRAN
-#  define FortranUnimplementedOption(ch,current)\
-    if (current[1] == ch) { nimp_option(current); break; }
-#else
-#  define FortranUnimplementedOption(ch,current)
+static void AddDefine(ToolEnv *t, char const *s) {
+  char b[256];
+  char *equalp = strchr(s, '=');
+  if (equalp == NULL) {
+    sprintf(b, "-D%s", s);
+    tooledit_insert(t, b, "?");
+  } else {
+    int l = equalp-s;
+    sprintf(b, "-D%.*s", l, s);
+    tooledit_insertwithjoin(t, b, '=', equalp);
+  }
+}
+
+static void debug_set(char const *opts) {
+  int opt;
+  for (; (opt = *opts) != 0; ++opts) {
+    uint32 debugmask = 0;
+    switch (safe_toupper(opt))
+    {
+#ifdef ENABLE_AETREE
+    case 'A': ++aetree_debugcount;
+              debugmask = DEBUG_AETREE;    break;
 #endif
+    case 'B': debugmask = DEBUG_BIND;      break;
+#ifdef ENABLE_CSE
+    case 'C': ++cse_debugcount;
+              debugmask = DEBUG_CSE;       break;
+#endif
+    case 'D': debugmask = DEBUG_DATA;      break;
+    case 'E': debugmask = DEBUG_TEMPLATE;  break;
+    case 'F': debugmask = DEBUG_FNAMES;    break;
+    case 'G': debugmask = DEBUG_CG;        break;
+    case 'H': debugmask = DEBUG_SPILL;     break;
+    case 'I': ++files_debugcount;
+              debugmask = DEBUG_FILES;     break;
+    case 'J': debugmask = DEBUG_SR;        break;
+#ifdef ENABLE_LOCALCG
+    case 'K': ++localcg_debugcount;
+              debugmask = DEBUG_LOCALCG;   break;
+#endif
+    case 'L': debugmask = DEBUG_LEX;       break;
+    case 'M': debugmask = DEBUG_MAPSTORE;  break;
+    case 'O': debugmask = DEBUG_OBJ;       break;
+    case 'P': debugmask = DEBUG_PP;        break;
+    case 'Q': debugmask = DEBUG_Q;         break;
+    case 'R': debugmask = DEBUG_REGS;      break;
+    case 'S': debugmask = DEBUG_SYN;       break;
+    case 'T': debugmask = DEBUG_TYPE;      break;
+    case 'U': debugmask = DEBUG_STORE;     break;
+    case 'W': debugmask = DEBUG_2STORE;    break;
+    case 'X': debugmask = DEBUG_X;         break;
+    case 'Y': debugmask = DEBUG_LOOP;      break;
 
-static void read_compile_options(int argc, char *argv[])
-{
-  int count;
-  int32 flags;
-  char *include_path = new_include("-", NULL),
-       *system_path = new_include("-", NULL),
-       *library_path = NULL;
+    case 'Z': ++syserr_behaviour;
+#ifndef COMPILING_ON_MSDOS
+#ifdef __CC_NORCROFT
+              (void) signal(SIGINT, SIG_DFL);     /* permit NorCroft backtrace */
+#endif
+#endif
+              break;
+    default:  cc_warn(warn_option_zq, opt);
+    }
+    sysdebugmask |= debugmask;
+  }
+}
 
-  flags = driver_flags;
-  for (count=1; count < argc;  ++count)
+static void AddDebugFlags(char *s, uint32 tflags, char const *fl) {
+  char const *p;
+  for (p = fl; *p != 0; p++)
+    if (!(tflags & (1L << (*p - 'a'))))
+      *s++ = *p;
+  *s++ = '+';
+  for (p = fl; *p != 0; p++)
+    if (tflags & (1L << (*p - 'a')))
+      *s++ = *p;
+  *s = 0;
+}
+
+static int ogflags;
+#define OG_O 1
+#define OG_G 2
+#define OG_GX 4
+
+static bool HandleArg(ToolEnv *t, char const *current, char const *nextarg, bool ignoreerrors) {
+  int32 flags = driver_flags;
+  int uc_opt = safe_toupper(current[1]);
+  bool usednext = NO;
+  char b[512];
+  switch(uc_opt)
   {
-      char *current = argv[count];
-      char *next;
-
-      if (current == NULL) continue;        /* already processed */
-
-      if (current[0] == '-')
-      {   int uc_opt = current[1];
-          uc_opt = safe_toupper(uc_opt);
-          switch(uc_opt)
-          {
 #ifdef FORTRAN
-      case 'F': if (current[1] == 'f') break;
+  case 'F': if (current[1] == 'f') break;
 /* @@@ LDS 10Aug89 - DO NOT CATCH 'O' HERE - IT BREAKS Unix Makefiles */
-      case 'M': if (current[1] == 'M') break;
-      case 'U':
-      case 'V':
+  case 'M': if (current[1] == 'M') break;
+  case 'U':
+  case 'V':
 #else
 #ifndef DISABLE_ERRORS
-      case 'E': if (current[2] == 'S' && current[3] == 0) break;
+  case 'E': if (current[2] == 'S' && current[3] == 0) break;
 #endif
 #ifndef PASCAL /*ECN*/
-      case 'R':
+  case 'R':
 #endif
 #endif
-      case 'C':
-      case 'S':
-                if (current[2] == 0) break;
-                bad_option(current);
-          }
+  case 'C':
+  case 'S': if (current[2] == 0) break;
+            if (!ignoreerrors) bad_option(current);
+  }
 
-          switch(uc_opt)
-          {
+  switch(uc_opt)
+  {
 #ifdef FORTRAN
   case '1':   flags |= KEY_ONETRIP;
               break;
@@ -1448,9 +1384,9 @@ static void read_compile_options(int argc, char *argv[])
               if (current[2] != 0) /* -O has no effect currently */
               {
                   int n = (current[2] - '0');
-                  if ((current[3] != 0) || (n < 0) || (n > MINO_MAX))
-                      bad_option(current);
-                  else
+                  if ((current[3] != 0) || (n < 0) || (n > MINO_MAX)) {
+                      if (!ignoreerrors) bad_option(current);
+                  } else
                   {
                       new_cc_arg((n & MINO_CSE) ? "-ZPZ1" : "-ZPZ0");
                       if (n & MINO_NAO) pragmax_flags |= OPT_NOARGALIAS;
@@ -1465,7 +1401,7 @@ static void read_compile_options(int argc, char *argv[])
                   pragmax_flags |= OPT_DEFDOUBLE;
                 else {
                   new_cc_arg("-R");
-                  if (flags & KEY_UNIX) flags |= KEY_READONLY;
+                  if (Compiling_On_Unix) flags |= KEY_READONLY;
                 }
               } break;
 
@@ -1475,7 +1411,7 @@ static void read_compile_options(int argc, char *argv[])
 
   case 'V':   if (current[1] == 'v') {
                  new_cc_arg("-FB");
-                 cc_msg_lookup(driver_banner);
+                 if (!ignoreerrors) cc_msg_lookup(driver_banner);
               }
               else goto link_command;
               break;
@@ -1484,28 +1420,22 @@ static void read_compile_options(int argc, char *argv[])
   case 'C':   if (current[1] == 'c')
                   flags &= ~KEY_LINK;
               else
-                  flags |= KEY_COMMENT;
+                  tooledit_insert(t, "-C", "?");
               break;
 
   case 'I':
   case 'J':   goto may_take_next_arg;
 
   case 'O':   if (current[1] == 'o') goto may_take_next_arg;
-#ifndef TARGET_IS_XAP
-              new_cc_arg("-ZPZ1");
-#endif
+              ogflags |= OG_O;
               if (current[2] != 0) {
                   if (cistreq(&current[2], "time"))
-                      new_cc_arg("-ZT+");
+                      tooledit_insert(t, "-O", "=time");
                   else if (cistreq(&current[2], "space"))
-                      new_cc_arg("-ZT-");
-                  else
+                      tooledit_insert(t, "-O", "=space");
+                  else if (!ignoreerrors)
                       bad_option(current);
               }
-#ifdef TARGET_IS_XAP
-              else      /* on XAP plain 'O' turns off '-g' (default)    */
-                  new_cc_arg("-g0");
-#endif
               break;
 
 #endif /* FORTRAN */
@@ -1516,61 +1446,122 @@ static void read_compile_options(int argc, char *argv[])
   case 'E':   FortranUnimplementedOption('E', current);
 #ifdef DISABLE_ERRORS
               /* provide support for -Exyz to suppress certain errors.  */
-              if (current[2] == 0)
-#else
-#  ifdef COMPILING_ON_UNIX
-              if (current[1] == 'e')
-                  goto may_take_next_arg;      /* X/Open -e epsym to ld */
-              else
-#  endif
+              if (current[2] != 0) {
+                  EnvFlagSet(t, &current[2], 'E', "acfilmpvz", ignoreerrors);
+                  break;
+              }
 #endif
-                  flags = (flags | KEY_PREPROCESS) & ~KEY_LINK;
-              new_cc_arg(current);           break;
-
-  case 'F':   FortranUnimplementedOption('F', current);
-              new_cc_arg(current);           break;
-
-  case 'G':   new_cc_arg(current);
-              if (flags & KEY_UNIX)
-                  library_path = new_include("-lg", library_path);
-              else
-                  (*ld_argv)[ld_argc++] = "-d";
+              if (Compiling_On_Unix && current[1] == 'e')
+                  goto may_take_next_arg;      /* X/Open -e epsym to ld */
+#ifdef COMPILING_ON_MVS
+              if (current[2])
+              {   if (!ignoreerrors) cc_warn(warn_option_E, current);
+                  break;
+              }
+#endif
+              tooledit_insert(t, ".pp_only", "?");
+              flags &= ~KEY_LINK;
               break;
 
-  case 'L':   if (flags & KEY_UNIX)
-              {
-                  if (current[1] == 'l')
-                      library_path = new_include(current, library_path);
+  case 'F':   FortranUnimplementedOption('F', current);
+              EnvFlagSet(t, &current[2], 'f', "abcdefhijklmnopqrstuvwxyz", ignoreerrors);
+              break;
+
+  case 'G':   ogflags |= OG_G;
+              if (current[2] == 0) {
+                  tooledit_insert(t, "-g", "=+");
+                  tooledit_insert(t, "-gt", "=+flvp");
+                  tooledit_insert(t, "-gx", "?");
+              } else if (current[2] == 'x') {
+                  ogflags |= OG_GX;
+                  tooledit_insertwithjoin(t, "-gx", '=', &current[3]);
+                  /* just option setting; no -g implication */
+                  break;
+              } else if (current[2] == 't') {
+                  tooledit_insertwithjoin(t, "-gt", '=', &current[3]);
+                  /* just option setting; no -g implication */
+                  break;
+              } else if (current[2] == '-') {
+                  tooledit_insert(t, "-g", "=-");
+                  break;
+              } else if (current[2] == '+') {
+                  tooledit_insert(t, "-g", "=+");
+                  break;
+              } else {
+                /* old fashioned -g with flags option */
+                  char const *p = &current[2];
+                  int ch;
+                  uint32 tflags = 0, optflags = 0;
+                  while ((ch = *p++) != 0)
+                    switch (ch) {
+                    case 'f': case 'l': case 'v': case 'p':
+                      tflags |= (1L << (ch - 'a')); break;
+
+                    case 'c': case 'r': case 'g': case 'o':
+                      optflags |= (1L << (ch - 'a')); break;
+                    }
+                  if (tflags == 0)
+                    tooledit_insert(t, "-gt", "=+flvp");
+                  else {
+                    char s[6];
+                    AddDebugFlags(s, tflags, "flpv");
+                    tooledit_insertwithjoin(t, "-gt", '=', s);
+                  }
+                  if (optflags == 0)
+                    tooledit_insert(t, "-gx", "?");
+                  else {
+                    char s[5]; int i = 0;
+                    for (ch = 'a'; ch <= 'z'; ch++)
+                      if (optflags & (1L << (ch - 'a')))
+                        s[i++] = ch;
+                    s[i] = 0;
+                    ogflags |= OG_GX;
+                    tooledit_insertwithjoin(t, "-gx", '=', s);
+                  }
+                  tooledit_insert(t, "-g", "=+");
+              }
+              if (Compiling_On_Unix)
+                  AddInclude(t, "-L.", "g");
+              else {
+                  flags |= KEY_DEBUG;
+                  AddArg(&ld_arg, "-d");
+              }
+              break;
+
+  case 'L':   if (Compiling_On_Unix)
+              {   if (current[1] == 'l')
+                      AddInclude(t, "-L.", &current[2]);
                   else
-                      (*ld_argv)[ld_argc++] = current;
+                      AddArg(&ld_arg, current);
               }
               else goto may_take_next_arg;
               break;
 
   case 'M':   FortranUnimplementedOption('m', current);
-#ifdef COMPILING_ON_UNIX
-              if (current[1] == 'm')            /* request link map     */
-                  (*ld_argv)[ld_argc++] = current;
+              if (Compiling_On_Unix && current[1] == 'm')  /* request link map */
+                  AddArg(&ld_arg, current);
               else
-#endif
               switch(safe_toupper(current[2]))
               {
       case 'X':   if (current[3] != 0) goto defolt;
-                  flags |= KEY_NOSYSINCLUDES;
-                  /* fall through... */
-      case '\0':  flags = (flags | KEY_MAKEFILE) & ~KEY_LINK;
+                  tooledit_insert(t, "-M", "=<");
+                  flags &= ~KEY_LINK;
                   break;
-      case 'D':   if (current[3] == '\0')
-                  {   flags |= KEY_MD;
+      case '\0':  tooledit_insert(t, "-M", "?");
+                  flags &= ~KEY_LINK;
+                  break;
+      case 'D':   if (current[3] == '\0' ||
+                      current[3] == '-' && current[4] == 0)
+                  {   tooledit_insert(t, "-M", "=D");
+                      if (current [3] == 0) flags |= KEY_MD;
                       break;
                   }
       default:
-      defolt:     bad_option(current);
+      defolt:     if (!ignoreerrors) bad_option(current);
               }
               break;
 
-  case 'P':   uc_opt = current[2];
-              uc_opt = safe_toupper(uc_opt);
+  case 'P':   uc_opt = safe_toupper(current[2]);
               switch(uc_opt)
               {
       case '\0':  flags |= KEY_PROFILE;
@@ -1580,10 +1571,13 @@ static void read_compile_options(int argc, char *argv[])
                   {   flags |= KEY_XPROFILE;
                       break;
                   }
-      default:    bad_option(current);
-                  continue;
+      default:    if (!ignoreerrors) bad_option(current);
+                  return usednext;
               }
-              new_cc_arg(current);
+              if (current[2] == 0)
+                  tooledit_insert(t, "-p", "?");
+              else
+                  tooledit_insertwithjoin(t, "-p", '=', &current[2]);
               if (setupenv.profile_lib[0] != '\0')
                   setupenv.default_lib = setupenv.profile_lib;
               if (setupenv.fort_profile_lib[0] != '\0')
@@ -1592,57 +1586,128 @@ static void read_compile_options(int argc, char *argv[])
 
 #ifndef FORTRAN
   case 'R':
-#ifdef COMPILING_ON_UNIX
-              if (current[1] == 'r')
-                  (*ld_argv)[ld_argc++] = "-r";    /* X/Open compliance */
-              else
+              if (Compiling_On_Unix && current[1] == 'r')
+                  AddArg(&ld_arg, "-r");    /* X/Open compliance */
+              else {
+#ifdef PASCAL /*ECN*/
+                  EnvFlagSet(t, &current[2], 'r', "acdnpr", ignoreerrors);
+#else
+                  tooledit_insert(t, ".rolits", "=-f+w");
 #endif
-              {   new_cc_arg(current);
-                  if (flags & KEY_UNIX) flags |= KEY_READONLY;
+                  if (Compiling_On_Unix) flags |= KEY_READONLY;
               }
               break;
 #endif
 
   case 'S':
-#ifdef COMPILING_ON_UNIX
-              if (current[1] == 's')
-                  (*ld_argv)[ld_argc++] = "-s";
-              else
-#endif
+              if (Compiling_On_Unix && current[1] == 's')
+                  AddArg(&ld_arg, "-s");
+              else {
                   flags = (flags & ~KEY_LINK) | KEY_ASM_OUT;
+                  tooledit_insert(t, ".asm_out","?");
+              }
               break;
 
-  case 'W':   new_cc_arg(current);
+  case 'W':   if (current[2] == 0) {
+                EnvFlagSet(t, "adfgilnprv", 'W', "acdfgilmnoprstuvz", ignoreerrors);
+                tooledit_insert(t, ".nowarn", "=-W");
+              } else
+                EnvFlagSet(t, &current[2], 'W', "acdfgilmnoprstuvz", ignoreerrors);
               break;
 
-  case 'Z':   uc_opt = current[2];
-              uc_opt = safe_toupper(uc_opt);
+  case 'Z':   uc_opt = safe_toupper(current[2]);
               switch(uc_opt)
               {
       case '\0':  /* Pass on '-z' to the linker */
                   goto link_command;
 
-#ifdef TARGET_IS_HELIOS         /* the miserable -zr helios option */
-      case 'L':                 /* -zl for replacement for -zr */
-      case 'R':   flags &= ~KEY_LINK;
-      case 'S':                 /* -zs for split module tables */
-      case 'D':                 /* extra addressability mode */
-                  /* drop through */
+      case 'A':   if (safe_toupper(current[3]) == 'P' && isdigit(current[4])) {
+                      if (tooledit_insertwithjoin(t, "-zap", '=', &current[4]) != TE_Failed)
+                          break;
+                  }
+#ifdef MIN_ALIGNMENT_CONFIGURABLE
+                  else if (safe_toupper(current[3]) == 'S' && isdigit(current[4])) {
+                      if (tooledit_insertwithjoin(t, "-zas", '=', &current[4]) != TE_Failed)
+                          break;
+                  } else if (safe_toupper(current[3]) == 'T' && isdigit(current[4])) {
+                      if (tooledit_insertwithjoin(t, "-zat", '=', &current[4]) != TE_Failed)
+                          break;
+                  }
 #endif
-      default:    /* leave checking for errors here to compiler.c */
-                  new_cc_arg(current);
+                  goto check_mcdep;
+
+      case 'C':   tooledit_insert(t, ".schar", "=-zc");
+                  break;
+      case 'I':   if (isdigit(current[3]))
+                      goto check_mcdep;
+                  goto may_take_next_arg;
+      case 'Q':   debug_set(&current[3]); break;
+
+      case 'O':   tooledit_insert(t, ".areaperfn", "=-zo");
+                  break;
+      case '+':   switch (safe_toupper(current[3])) {
+                  case 'O': tooledit_insert(t, ".areaperfn", "=-z+o"); break;
+                  case 'C': tooledit_insert(t, ".schar", "=-z+c"); break;
+                  default:  goto check_mcdep;
+                  }
+                  break;
+#ifndef NO_DUMP_STATE
+      case 'G':   switch (safe_toupper(current[3])) {
+                  case 'W': tooledit_insertwithjoin(t, "-zgw", '=', &current[4]); break;
+                  case 'R': tooledit_insertwithjoin(t, "-zgr", '=', &current[4]); break;
+                  default:  goto check_mcdep;
+                  }
+                  break;
+#endif
+      case 'J':   tooledit_insert(t, "-zj", "?");
+                  break;
+      case 'P':   if (isalpha(current[4])) {
+                    bool negate;
+                    PragmaSpelling const *p = keyword_pragma(&current[3], &negate);
+                    if (p != NULL) {
+                      int32 val = p->value;
+                      if (negate) {
+#ifdef FORTRAN
+                        if (pragchar == 'x' || pragchar == 'w')
+                          val = ~val;
+                        else
+#endif
+                          val = !val;
+                      }
+                      sprintf(b, "-zp%c", p->code);
+                      sprintf(&b[8], "=%#lx", (long)val);
+                      tooledit_insert(t, b, &b[8]);
+                    }
+                  } else {
+                    sprintf(b, "-zp%c", current[3]);
+                    tooledit_insertwithjoin(t, b, '=', &current[4]);
+                  }
+                  break;
+      case 'T':   tooledit_insert(t, "-disallow_tentative_statics", "?");
+                  break;
+      case 'Z':   if (safe_toupper(current[3]) == 'T')
+                  {
+                      tooledit_insert(t, "-disallow_tentative_statics", "?");
+                      current++;
+                  }
+                  tooledit_insertwithjoin(t, "-zz", '=', &current[3]);
                   break;
 
-      case 'I':   goto may_take_next_arg;
+      check_mcdep:
+      default:    if (!mcdep_config_option(current[2], &current[3], t)) {
+                      if (!ignoreerrors) cc_warn(warn_option, current);
+                  }
+                  break;
               }
               break;
 
   link_command:
   default:
 #ifndef HOST_CANNOT_INVOKE_LINKER
-              (*ld_argv)[ld_argc++] = current;  break;
+              AddArg(&ld_arg, current);  break;
 #else
-              bad_option(current); break;
+              if (!ignoreerrors) bad_option(current);
+              break;
 #endif
 
 #ifndef FORTRAN
@@ -1650,99 +1715,361 @@ static void read_compile_options(int argc, char *argv[])
 #endif
   case 'D':
   may_take_next_arg:
-              uc_opt = current[1];
-              uc_opt = safe_toupper(uc_opt);
+              uc_opt = safe_toupper(current[1]);
               if (uc_opt == 'Z')
-              {   uc_opt = current[2];
-                  uc_opt = safe_toupper(uc_opt);
+              {   uc_opt = safe_toupper(current[2]);
                   if (uc_opt == 'I') uc_opt = 'S'; else uc_opt = 'Z';
               }
               if (current[2] == 0 || uc_opt == 'S' ||
                   current[3] == 0 && uc_opt == 'Z')
-              {
-                  if (++count < argc) {
-                      next = argv[count];
-                      if (!next) {
-                          cc_msg_lookup(driver_option_missing_arg, current);
-                          ++cmd_error_count;
-                          break;
-                      }
-                  } else
-                  {
-                      driver_abort(msg_lookup(driver_option_missing_lastarg));
-                      return;
+              {   if (nextarg == NULL) {
+                      if (!ignoreerrors) cc_msg_lookup(driver_option_missing_arg, current);
+                      ++cmd_error_count;
+                      break;
                   }
+                  usednext = YES;
               }
               else if (uc_opt == 'Z')
-                  next = current + 3;
+                  nextarg = &current[3];
               else
-                  next = current + 2;
+                  nextarg = &current[2];
               switch (uc_opt)
               {
 #ifdef COMPILING_ON_UNIX
       case 'E':            /* actually can only be "-e" here... X/Open */
 #endif
       case 'U':
-#ifdef COMPILING_ON_UNIX
-                  if (current[1] != uc_opt)  /* e or u */
-                  {   next = join_strs("-e ", next);
+                  if (Compiling_On_Unix && current[1] != uc_opt)  /* e or u */
+                  {   char *next = join_strs("-e ", nextarg);
                       next[1] = current[1];
-                      (*ld_argv)[ld_argc++] = next;           /* X/Open */
+                      AddArg(&ld_arg, next);           /* X/Open */
                       break;
-                  } /* 'E' and 'U' fall through */
-#endif
-      case 'D':   if (current[2] == 0) current = join_strs(current, next);
-                  new_cc_arg(current);
+                  } /* 'U' falls through */
+                  sprintf(b, "-D%s", nextarg);
+                  tooledit_insert(t, b, "=");
                   break;
-      case 'I':   include_path = new_include(next, include_path);
+
+      case 'D':   AddDefine(t, nextarg);
                   break;
-      case 'J':   system_path  = new_include(next, system_path);
+      case 'I':   AddInclude(t, "-I.", nextarg);
+                  break;
+      case 'J':   AddInclude(t, "-J.", nextarg);
                   break;
 #ifndef HOST_CANNOT_INVOKE_LINKER
-      case 'L':   library_path = new_include(next, library_path);
+      case 'L':   AddInclude(t, "-L.", nextarg);
                   break;
 #endif
       case 'O':   flags |= KEY_RENAME;
                   {   UnparsedName unparse;
-                      fname_parse(next, FNAME_SUFFIXES, &unparse);
-                      setupenv.output_file = copy_unparse("", &unparse, NULL);
+                      fname_parse(nextarg, FNAME_SUFFIXES, &unparse);
+                      setupenv.output_file = copy_unparse(&unparse, NULL);
                   }
                   break;
       case 'S':   /* -ZI<system> file */
-                  new_cc_arg(join_strs("-ZS", current+3));
-                  new_cc_arg(join_strs("-ZI", next));
+                  tooledit_insertwithjoin(t, "-ZS", '=', &current[3]);
+                  tooledit_insertwithjoin(t, "-ZI", '=', nextarg);
                   break;
-      case 'Z':   if (current[3] == 0) current = join_strs(current, next);
-                  new_cc_arg(current);
+      case 'Z':   tooledit_insertwithjoin(t, "-zz", '=', nextarg);
                   break;
               }
+  }
+  driver_flags = flags;
+  return usednext;
+}
+
+/*
+ * Extract compilation options from the command line.
+ */
+
+typedef struct { char const *name; int32 key; char const *envname; char const *envval; } KW;
+
+static KW const keytab[] = {
+      {"-help",      KEY_HELP, NULL, NULL},
+      {"-h",         KEY_HELP, NULL, NULL},
+      {"-verify",    KEY_VERIFY, NULL, NULL},
+      {"-echo",      0, ".echo", "=-echo"},
+      {"-link",      KEY_LINK, NULL, NULL},
+      {"-list",      KEY_LISTING, NULL, NULL},
+      {"-errors",    KEY_NEXT+KEY_ERRORSTREAM, NULL, NULL},
+      {"-via",       KEY_NEXT+KEY_VIAFILE, NULL, NULL},
+      {"-config",    KEY_CONFIG},
+#ifdef TARGET_ENDIANNESS_CONFIGURABLE
+      {"-littleend", 0, ".bytesex", "=-li"},
+      {"-li",        0, ".bytesex", "=-li"},
+      {"-bigend",    0, ".bytesex", "=-bi"},
+      {"-bi",        0, ".bytesex", "=-bi"},
+#endif
+#if defined(PASCAL) /*ECN*/
+      {"-iso",       0, ".lang", "-iso"},
+      {"-arthur",    KEY_HOST_LIB, NULL, NULL},
+      {"-super",     KEY_HOST_LIB, NULL, NULL},
+      {"-counts",    KEY_COUNTS+KEY_LISTING, NULL, NULL},
+#elif defined(FORTRAN)
+#  ifndef TARGET_IS_UNIX
+      {"-bsd",       KEY_PCC, NULL, NULL},
+#  endif
+      {"-onetrip",   KEY_ONETRIP, NULL, NULL},
+      {"-fussy",     KEY_STRICT, NULL, NULL},
+      {"-f66",       KEY_F66, NULL, NULL},
+      {"-strict",    KEY_STRICT, NULL, NULL},
+      {"-extend",    KEY_LONGLINES, NULL, NULL},
+#else /* not FORTRAN or PASCAL */
+      {"-ansi",      0, ".lang", "=-ansi"},
+      {"-ansic",     0, ".lang", "=-ansi"},
+      {"-pcc",       0, ".lang", "=-pcc"},
+      {"-fussy",     0, ".lang", "=-strict"},
+      {"-strict",    0, ".lang", "=-strict"},
+      {"-pedantic",  0, ".lang", "=-strict"},
+#ifdef CPLUSPLUS
+      {"-cfront",    0, ".lang", "=-cfront"},
+      {"-cpp",       0, ".lang", "=-cpp"},
+#endif
+      {"-arthur",    KEY_HOST_LIB, NULL, NULL},
+      {"-super",     KEY_HOST_LIB, NULL, NULL},
+      {"-counts",    KEY_COUNTS+KEY_LISTING, NULL, NULL},
+#  ifdef FOR_ACORN
+      {"-throwback", KEY_THROWBACK, NULL, NULL},
+      {"-desktop",   KEY_NEXT+KEY_DESKTOP, NULL, NULL},
+      {"-depend",    KEY_NEXT+KEY_DEPEND, NULL, NULL},
+      {"-c++",       KEY_CFRONTPREPROCESS, NULL, NULL},
+#  endif
+#  ifdef RISCiX113
+      {"-riscix1.2", KEY_RIX120, NULL, NULL},
+#  endif
+#endif /* PASCAL */
+};
+
+static KW const *keyword(const char *string)
+{
+  unsigned count;
+  for (count = 0;  count < sizeof(keytab)/sizeof(keytab[0]);  ++count)
+      if (cistreq(string, keytab[count].name))
+          return &keytab[count];
+
+  return NULL;
+}
+
+typedef struct {
+  char const *s;
+  Uint i;
+} ViaSRec;
+
+static int vias_getc(void *arg) {
+  ViaSRec *p = (ViaSRec *)arg;
+  int ch = p->s[p->i];
+  if (ch == 0) return EOF;
+  p->i++;
+  return ch;
+}
+
+static int via_getc(void *arg) {
+  return fgetc((FILE *)arg);
+}
+
+static int mapvia(
+  void *v, int (*getcfn)(void *), char const *viafile, char **newargv)
+{   int ch, newargc;
+    bool got_via = NO;
+    char word[128];
+
+    if (v == NULL)
+    {   cc_msg_lookup(driver_via_not_opened, viafile);
+        compiler_exit(1);
+    }
+    for (newargc = 0, ch = ' ';;)
+    {   unsigned p = 0;
+        while (ch != EOF && isspace(ch)) ch = getcfn(v);
+        if (ch == EOF) break;
+        if (ch == '"' || ch == '\'') {
+            int quote = ch;
+            for (;;) {
+                ch = getcfn(v);
+                if (ch == EOF || ch == quote) break;
+                if (p < (sizeof(word)-1)) word[p++] = ch;
+            }
+        } else
+            do
+            {   if (p < (sizeof(word)-1)) word[p++] = ch;
+                ch = getcfn(v);
+            } while (ch != EOF && !isspace(ch));
+        word[p] = 0;
+        if (got_via)
+        {   FILE *f = fopen(word, "r");
+            newargc += mapvia(f, via_getc, word, newargv==NULL ? NULL : newargv+newargc);
+            fclose(f);
+            got_via = NO;
+        }
+        else if (cistreq(word, "-via"))
+            got_via = YES;
+        else
+        {   if (newargv != NULL) {
+                size_t len = strlen(word)+1;
+                newargv[newargc] = (char *)memcpy(PermAlloc((int32)len), word, len);
+            }
+            ++newargc;
+        }
+    }
+    return newargc;
+}
+
+static void read_options(
+    int count, int argc, char **argv, ToolEnv *t, bool ignoreerrors) {
+  for (; count < argc;  ++count)
+  {   char const *arg = argv[count];
+      KW const *key = keyword(arg);
+      if (key == NULL)
+      {   KW_Status status = mcdep_keyword(arg, argv[count+1], t);
+          if (status == KW_OKNEXT) {
+              count++;
+              continue;
+          } else if (status == KW_OK) {
+              continue;
+          } else if (status != KW_NONE) {
+              if (!ignoreerrors) {
+                  cc_msg_lookup(driver_option_bad1);
+                  cc_msg("'%s", arg);
+                  if (status == KW_BADNEXT)
+                      cc_msg(" %s", argv[++count]);
+                  cc_msg("'");      /* makes NLS string more sensible */
+                  cc_msg_lookup(driver_option_bad2);
+              }
+              ++cmd_error_count;
+              continue;
           }
+      } else if (key->envname != NULL) {
+          char b[64];
+          char const *s = key->envval;
+          if (StrEq(key->envname, ".lang")) {
+              char const *val = toolenv_lookup(t, key->envname);
+              if (StrEq(key->envval, "=-strict")) {
+                  if (strchr(val, ' ') == NULL) {
+                      strcpy(b, val);
+                      strcat(b, " -strict");
+                      s = b;
+                  }
+              } else if (StrEq(val, "=-strict")) {
+                  strcpy(b, key->envval);
+                  strcat(b, " -strict");
+                  s = b;
+              }
+          }
+          tooledit_insert(t, key->envname, s);
+          continue;
+      } else {
+          if (key->key & KEY_NEXT) {
+              if (++count >= argc) {
+                  if (ignoreerrors)
+                      return;
+                  else {
+                      cc_msg_lookup(driver_option_missing_filearg, arg);
+                      compiler_exit(1);
+                  }
+              }
+#ifdef FOR_ACORN
+              if (key->key & KEY_DEPEND) {
+                  tooledit_insert(t, "-M", "=+");
+                  tooledit_insertwithjoin(t, ".depend", '=', argv[count]);
+              }
+
+              else if (key->key & KEY_DESKTOP)
+                  dde_desktop_prefix = argv[count];
+
+              else
+#endif
+              if (key->key & KEY_ERRORSTREAM) {
+                  if (!ignoreerrors) {
+                      errors = fopen(argv[count], "w");
+                      if (errors == NULL) {
+                          cc_msg_lookup(driver_cant_open_output, argv[count]);
+                          compiler_exit(1);
+                      }
+                  }
+                  argv[count] = NULL;
+              } else if (key->key & KEY_VIAFILE) {
+                  FILE *v = fopen(argv[count], "r");
+                  int n = mapvia(v, via_getc, argv[count], NULL);
+                  if (n < 0) {
+                      if (ignoreerrors)
+                          return;
+                      else
+                          compiler_exit(1);
+                  }
+                  if (n == 0)
+                      ++count;
+                  else {
+                      char **newargv = (char **)
+                          PermAlloc(sizeof(char *) * ((int32)argc - count + n + 1));
+                      int j;
+                      fseek(v, 0L, SEEK_SET);
+                      n = mapvia(v, via_getc, NULL, &newargv[1]);
+                      for (j = count;  ++j < argc;)
+                          newargv[++n] = argv[j];
+                      newargv[++n] = NULL;
+                      count = 0;
+                      argc = n;
+                      argv = newargv;
+                  }
+                  fclose(v);
+              }
+          }
+#if defined(FORTRAN) && !defined(TARGET_IS_UNIX)
+          else if (key->key == KEY_PCC)
+              pragmax_flags = RISCIX_FORTRAN_PRAGMAX;
+#endif
+#ifdef FOR_ACORN
+          else if (key->key & KEY_THROWBACK)
+              dde_throwback_flag = 1;
+          else if (key->key & KEY_CFRONTPREPROCESS)
+              cplusplus_flag = 1;
+#endif
+          else if (key->key & KEY_COUNTS) {
+              tooledit_insert(t, "-K", "?");
+              driver_flags |= key->key;
+          } else
+              driver_flags |= key->key;
+          continue;
       }
-      else (*cc_filv)[cc_filc++] = current;
+        /* not a keyword argument */
+      if (arg[0] == '-') {
+          if (HandleArg(t, arg, argv[count+1], ignoreerrors))
+              count++;
+      } else {
+          AddArg(&cc_fil, arg);
+      }
+  }
+  if (ogflags & OG_O) {
+      tooledit_insert(t, "-zpz", "=1");
+      if (ogflags & OG_G && !(ogflags & OG_GX))
+          tooledit_insert(t, "-gx", "=o");
   }
 
-  driver_flags = flags;
+#ifdef PASCAL /*ECN*/
+  driver_flags |= KEY_ANSI;
+#endif
+}
 
+void TE_DecodeArgumentLine(ToolEnv *t, char const *s, bool ignoreerrors) {
+  ViaSRec vr;
+  int n;
+  vr.i = 0; vr.s = s;
+  n = mapvia(&vr, vias_getc, NULL, NULL);
+  if (n < 0) compiler_exit(1);
+  if (n > 0) {
+    char **newargv = (char **)PermAlloc(sizeof(char *) * ((int32)n+1));
+    vr.i = 0;
+    n = mapvia(&vr, vias_getc, NULL, newargv);
+    newargv[n] = NULL;
+    read_options(0, n, newargv, t, ignoreerrors);
+  }
+}
+
+static void FinishedOptions(ToolEnv *t) {
 #ifdef RISCiX113
-  if (!(flags & KEY_RIX120))
-      new_cc_arg("-D__type=___type");
+  if (!(driver_flags & KEY_RIX120))
+      tooledit_insert(t, "-D__type", "==___type");
 #endif
 
-  /*
-   * Add '-I' and '-J' to the command line for compiler.c
-   */
-  if (system_path[1] == ',')
-  {
-      system_path[1] = 'J';
-      if (include_path[1] == ',')
-      {
-          include_path[1] = 'I';
-          new_cc_arg(include_path);
-      }
-      new_cc_arg(system_path);
-  }
-  else
-  {
+  if (FindLast(t, "-J.") == 0) {
       /*
        * No -J so add default system path to -I list
        */
@@ -1756,16 +2083,10 @@ static void read_compile_options(int argc, char *argv[])
           path = setupenv.include_ansi_path;
 #  endif
 #endif
-      include_path = new_include(path, include_path);
-      include_path[1] = 'I';
-      new_cc_arg(include_path);
+      AddInclude(t, "-I.", path);
   }
 
-  /*
-   * If compiling on Unix and in Ansi mode add extra libraries, then
-   * if 'library_path' is not empty assign it to 'default_lib'.
-   */
-#ifndef TARGET_IS_HELIOS
+  /* If compiling on Unix and in Ansi mode add extra libraries. */
 /*
  * ACN: Oh misery - if I am compiling and linking under Unix, but to generate
  * Helios binaries, I do not want to scan the extra libraries indicated
@@ -1777,40 +2098,38 @@ static void read_compile_options(int argc, char *argv[])
  * Thus the conditional
  * compilation here seems (in the short term) my easiest way out.
  */
-#  ifdef RISCiX113
+#ifdef RISCiX113
   if (((flags & KEY_ANSI) || !(flags & (KEY_PCC))) &&
       !(flags & KEY_RIX120))
   {
-      library_path = new_include("-lansi,-lm", library_path);
+      AddInclude(t, "-L.", "ansi");
+      AddInclude(t, "-L.", "m");
   }
-#  endif
 #endif
 
-  if (library_path != NULL)
-  {
-      if (flags & KEY_UNIX)
-          library_path = new_include(setupenv.default_lib, library_path);
-      setupenv.default_lib = library_path;
-  }
+  if (FindLast(t, "-L.") == 0 || Compiling_On_Unix)
+      AddInclude(t, "-L.", setupenv.default_lib);
+
 }
 
 /*
  * Main.
  */
 
-#ifdef ANTHONY_BERENT_VERSION
-/*
- * On Alpha/OSF, realargv is declared as 64-bit pointer array
- * although other pointers can be 32-bit if -xtaso-short is used.
- * Thus argv needs to be converted to normal (poss 32-bit) ptr array.
- */
-int main(int argc, char *realargv[])
-#else
-int main(int argc, char *argv[])
-#endif
+static void InitArgV(ArgV *p, int n) {
+  p->v = (char const **)PermAlloc(sizeof(char *) * n);
+  p->sz = n; p->n = 0;
+}
+
+static char *progname_copy;
+char const *compiler_name(void) { return progname_copy; }
+
+static void *falloc(size_t n) { return PermAlloc(n); }
+
+static int cc_main(int argc, char **argv, ToolEnv *t)
 {
-  bool is_cpp = NO;
   char *progname;
+  bool is_cpp = NO;
 #if (defined(COMPILING_ON_UNIX) && defined(FORTRAN))
   progname = "f77"; /* rather than the "f77comp" we would get from argv[0] */
 #else
@@ -1818,52 +2137,30 @@ int main(int argc, char *argv[])
   char *default_output = setupenv.output_file;
 #endif
 
-/* Pointer manipulation is only required for Alpha/OSF (NOT Windows NT) */
-#if defined(__alpha) && defined(__osf__)
-/*
- * The next few lines are a disgrace (!) but ACN has put them in as a
- * temporary expedient.  On the DEC Alpha the native version of crt0
- * passes down argv as an array of 8-byte pointers, but this compiler
- * (when sizeof(char *)==4) expects 4-byte pointers.  With the "-taso"
- * option the DEC system arranges that the top half of each pointer is
- * just zero, so I can afford to squeeze things together and then forget the
- * whole misery.  If compilation was with sizeof(char *)==8 no such
- * adjustment is needed.  Beware also sizeof(FILE) and the va_list
- * structure in standard headers.
- */
-/* IJR: I don't understand the above - as the DEC -xtaso_short option
- * sets sizeof(char *)==4 but the argv is declared as a special case
- * with 8-byte pointers.  Thus, the argv[i]=argv[2*i] copy below just
- * skips every second argument.  It would be interesting to try the
- * ((char **)argv)[i] = ((char **)argv[2*i]), but there may be
- * type errors where the long argv is passed to read_keyword_options etc.
- */
-#ifndef ANTHONY_BERENT_VERSION
-  if (sizeof(char *) == 4)
-  {  int i;
-     for (i=0; i<argc; i++) argv[i] = argv[2*i];
-     argv[i] = 0;
-  }
-#else
-  char **argv = malloc(sizeof(char *)*argc);
+  errors = NULL;
+  sysdebugmask     = 0;
+  syserr_behaviour = 0;
+  aetree_debugcount = 0;
+#ifdef ENABLE_CSE
+  cse_debugcount   = 0;
+#endif
+  localcg_debugcount = 0;
+#ifdef TARGET_HAS_DEBUGGER
+  usrdbgmask       = 0;
+#endif
 
-  /* The following is needed to on alpha to create an argv array with a
-   * 32 bit pointer size
-   */
-  {
-    int i;
-    for(i=0; i<argc; i++)
-      argv[i] = realargv[i];
-  }
-#endif
-#endif
+  alloc_initialise();
+  trackfile_initialise(falloc);
+  errstate_initialise();
+
   progname = program_name(argv[0], p, 32);
+  progname_copy = PermString(progname);
 #ifdef TIME_LIMIT
   if (time(0) > TIME_LIMIT) {
     fprintf(stderr, "This time-limited software has expired.\nPlease contact "
                     VENDOR_NAME     /* specified in options.h */
                     " for an up to date release.\n");
-    exit(99);
+    compiler_exit(99);
   }
 #endif
   main_error_count = cmd_error_count = 0;
@@ -1876,34 +2173,29 @@ int main(int argc, char *argv[])
   msg_init(argv[0], MSG_TOOL_NAME);
 #endif
 
-  errstate_init();   /* needed before cc_msg */
-
 #ifndef HOST_WANTS_NO_BANNER
     cc_msg_lookup(driver_banner);
 #endif
 #ifndef COMPILING_ON_UNIX
 #ifndef COMPILING_ON_MSDOS
   (void) signal(SIGINT, compile_abort);
+#else /* DOS, Windows, Win32 */
+  (void) signal(SIGTERM, compile_abort);
 #endif
 #else
 #  ifdef DRIVER_PRE_RELEASE_MSG
      cc_msg_lookup(driver_prerelease);
 #  endif
-  /* The signal ignore state can be inherited from the parent... */
 #ifndef COMPILING_ON_MSDOS
-#ifdef __STDC__
-#  define sig_ign ((void (*)(int))(SIG_IGN))
-#else
-#  define sig_ign SIG_IGN
-#endif
-  if (signal(SIGINT,  sig_ign) != sig_ign)
+  /* The signal ignore state can be inherited from the parent... */
+  if (signal(SIGINT, SIG_IGN) != SIG_IGN)
     (void) signal(SIGINT, compile_abort);
 #ifdef SIGHUP
-  if (signal(SIGHUP,  sig_ign) != sig_ign)
-    (void) signal(SIGINT, compile_abort);
+  if (signal(SIGHUP, SIG_IGN) != SIG_IGN)
+    (void) signal(SIGHUP, compile_abort);
 #endif
-  if (signal(SIGTERM, sig_ign) != sig_ign)
-    (void) signal(SIGINT, compile_abort);
+  if (signal(SIGTERM, SIG_IGN) != SIG_IGN)
+    (void) signal(SIGTERM, compile_abort);
 #endif
 #endif
 
@@ -1916,35 +2208,30 @@ int main(int argc, char *argv[])
   if (argc == 1)
   {   /* used with no argument */
       give_help(progname);
-      exit(1);
+      compiler_exit(1);
   }
 
   {   UnparsedName un;
       fname_parse(argv[0], ".exe .EXE" , &un);
       if (un.rlen == 3 &&
-          (strncmp(un.root, "cpp", 3) == 0 ||
-           strncmp(un.root, "CPP", 3) == 0))
+          (StrnEq(un.root, "cpp", 3) ||
+           StrnEq(un.root, "CPP", 3)))
       {
           /* The compiler was called as '...cpp' - treat as 'cc -E'.  */
           driver_flags = (driver_flags | KEY_PREPROCESS) & ~KEY_LINK;
-          is_cpp = YES;
+          tooledit_insert(t, ".pp_only", "?");
       }
   }
 
-  argc = read_keyword_options(argc, &argv);
+  InitArgV(&cc_arg, argc);
+  InitArgV(&cc_fil, argc);
+  InitArgV(&ld_arg, argc);
+  InitArgV(&ld_fil, argc);
 
-  cc_argv = (char *(*)[]) malloc(sizeof(char *) *
-                          (argc + sizeof(driver_options)/sizeof(char *) + 3));
-  cc_filv = (char *(*)[]) malloc(sizeof(char *) * argc);
-  ld_argv = (const char *(*)[]) malloc(sizeof(const char *) * argc);
-  ld_filv = (const char *(*)[]) malloc(sizeof(const char *) * argc);
-  cc_argc = cc_filc = ld_argc = ld_filc = 0;
-
-  new_cc_arg(argv[0]);
-  if (is_cpp) new_cc_arg("-E");
-
-  set_default_options();
-  read_compile_options(argc, argv);
+  { char const *etc = toolenv_lookup(t, ".etc");
+    if (etc != NULL) TE_DecodeArgumentLine(t, &etc[1], NO);
+  }
+  read_options(1, argc, argv, t, NO);
 
 #ifdef FOR_ACORN
   if (!(driver_flags & KEY_CFRONTPREPROCESS))
@@ -1955,28 +2242,64 @@ int main(int argc, char *argv[])
   validate_flags();
   if (driver_flags & KEY_HELP)
   {   give_help(progname);
-      exit(0);
+      compiler_exit(0);
+  }
+  if (driver_flags & KEY_CONFIG)
+  {   if (toolenv_putinstallationdelta(t) != 0)
+      {   cc_msg_lookup(driver_toolenv_writefail);
+          compiler_exit(EXIT_error);
+      }
+      compiler_exit(0);
   }
 
-  set_flag_options();
+  FinishedOptions(t);
 
-  if (is_cpp)
-  {   if (cc_filc >= 2)
-      {   if (cc_filc > 2)
-              cc_msg_lookup(driver_cpp_toomanyfileargs);
-          if (freopen((*cc_filv)[1], "w", stdout) == NULL)
-          {   cc_msg_lookup(driver_cpp_cantopenoutput, (*cc_filv)[1]);
-              exit(EXIT_error);
+  {   char const *echoval = toolenv_lookup(t, ".echo");
+      if (echoval != NULL && StrEq(echoval, "=-echo")) {
+          size_t atstart = 1;
+          char line[256];
+          char *dynline = NULL;
+          char *linep = line;
+          int len;
+          if (argv[0] != NULL) atstart += strlen(argv[0])+1;
+          len = tooledit_getcommandline(t, line+atstart, 254-atstart);
+          if (len > (int)(254-atstart)) {
+            dynline = (char *)malloc(len+2+atstart);
+            len = tooledit_getcommandline(t, dynline+atstart, len+2);
+            linep = dynline;
           }
-          cc_filc = 1;
+          linep[0] = '[';
+          if (argv[0] != NULL) {
+            strcpy(linep+1, argv[0]);
+            linep[atstart-1] = ' ';
+          }
+          linep[len+atstart-1] = ']';
+          linep[len+atstart] = '\n';
+          linep[len+atstart+1] = 0;
+          cc_msg(linep);
+          if (dynline != NULL) free(dynline);
+      }
+  }
+  set_flag_options(t);
+
+  if (toolenv_lookup(t, ".pp_only") != NULL)
+  {   is_cpp = YES;
+      if (cc_fil.n >= 2)
+      {   if (cc_fil.n > 2)
+              cc_msg_lookup(driver_cpp_toomanyfileargs);
+          if (freopen(cc_fil.v[1], "w", stdout) == NULL)
+          {   cc_msg_lookup(driver_cpp_cantopenoutput, cc_fil.v[1]);
+              compiler_exit(EXIT_error);
+          }
+          cc_fil.n = 1;
       }
   }
 
-  if (cc_filc > 0)
+  if (cc_fil.n > 0)
   {
       if (driver_flags & KEY_STDIN)
           cc_msg_lookup(driver_stdin_otherfiles);
-      process_file_names(cc_filc, *cc_filv);
+      process_file_names(t, &cc_fil);
   }
   else if (is_cpp || (driver_flags & KEY_STDIN))
   {   char *output_file = setupenv.output_file == default_output ? NULL :
@@ -1988,21 +2311,7 @@ int main(int argc, char *argv[])
           setupenv.output_file == NULL)
           output_file = DEFAULT_STDIN_OBJECT;
 #endif
-      new_cc_arg("-");
-      if (output_file != NULL) {
-          if (driver_flags & KEY_ASM_OUT)
-              new_cc_arg(join_strs("-S", output_file));
-          else
-              new_cc_arg(output_file);
-      }
-      if (driver_flags & KEY_VERIFY)
-      {   int j;
-          for (j = 0;  j < cc_argc;  ++j)
-              cc_msg("%c%s", j==0 ? '[':' ', (*cc_argv)[j]);
-          cc_msg("]\n");
-      }
-      (*cc_argv)[cc_argc] = NULL;
-      if (ccom(cc_argc, *cc_argv))
+      if (ccom(t, "-", output_file, NULL, NULL))
       {  ++main_error_count;
          if (output_file != NULL)
 #ifdef COMPILING_ON_RISC_OS
@@ -2018,19 +2327,317 @@ int main(int argc, char *argv[])
 #ifndef HOST_CANNOT_INVOKE_LINKER
 #  ifdef LINKER_IS_SUBPROGRAM
 /* IJR: hack to ensure that path gets passed to linker in argv[0] for NLS */
-  setupenv.link_cmd = argv[0];
+  { UnparsedName un;
+    size_t n;
+    char *new_name;
+    fname_parse(argv[0], "" , &un);
+    un.root = setupenv.link_cmd;
+    un.rlen = strlen(un.root);
+    n = un.vlen + un.plen + un.rlen + un.elen + 10;
+    new_name = (char *)PermAlloc(n);
+    if (fname_unparse(&un, FNAME_AS_NAME, new_name, n) < 0)
+        driver_abort("internal fault in \"copy_unparse\""); /* @@@ syserr? */
+    setupenv.link_cmd = new_name;
+  }
 #  endif
-  if ((main_error_count == 0) && (driver_flags & KEY_LINK) && (ld_filc > 0))
-      linker(driver_flags);
+  if (main_error_count == 0 && (driver_flags & KEY_LINK) && ld_fil.n > 0)
+      linker(t, driver_flags);
 #endif
 
   /*
    * The SUN ignores the return value from main so exit() instead
    */
-  if (main_error_count + cmd_error_count > 0) exit(EXIT_error);
-  exit(0);
+  compiler_exit(main_error_count + cmd_error_count > 0 ? EXIT_error : 0);
 
   return 0;
+}
+
+static int cc(int argc, ArgvType *argv, ToolEnv *t,
+              backchat_Messenger *sendmsg, void *backchathandle)
+{   int status;
+    backchat.send = sendmsg;
+    backchat.handle = backchathandle;
+    status = setjmp(exitbuf);
+    if (status == 0)
+        status = cc_main(argc, argv, t);
+    else
+        status = compiler_exit_status;
+    return status;
+}
+
+char const *toolenv_toolname(void) {
+  return MSG_TOOL_NAME;
+}
+
+ToolEnv *cc_default_env;
+
+static int cc_finalise(ToolEntryPoints const *te) {
+  IGNORE(te);
+  if (cc_default_env != NULL) toolenv_dispose(cc_default_env);
+  return 0;
+}
+
+static int MergeEnv(ToolEnv *t, ToolEnvDelta delta) {
+  int rc;
+  alloc_initialise();
+  rc = toolenv_merge(t, delta);
+  if (rc == 0) TE_NormaliseEtc(t);
+  alloc_finalise();
+  return rc;
+}
+
+static int CC_EditEnv(ToolEnv *t, HWND wh) {
+  int rc;
+  alloc_initialise();
+  rc = Tool_EditEnv(t, wh);
+  alloc_finalise();
+  return rc;
+}
+
+static ToolEntryPoints const entries = {
+  cc_finalise,
+  cc,
+  toolenv_new,
+  toolenv_dispose,
+  MergeEnv,
+  toolenv_mark,
+  toolenv_getdelta,
+  toolenv_putinstallationdelta,
+  CC_EditEnv,
+  NULL
+};
+
+const ToolEntryPoints *armccinit(void) {
+  cc_default_env = NULL;
+  return &entries;
+}
+
+typedef struct {
+  char const *name;
+  char const *val;
+} EnvItem;
+
+#ifdef TARGET_DEFAULT_BIGENDIAN
+#  if TARGET_DEFAULT_BIGENDIAN
+#    define BYTESEX_DEFAULT_STR "=-bi"
+#  else
+#    define BYTESEX_DEFAULT_STR "=-li"
+#  endif
+#else
+#  define BYTESEX_DEFAULT_STR "=-li"
+#endif
+
+#define str(s) #s
+#define xstr(s) str(s)
+
+static EnvItem const builtin_defaults[] = {
+  {".bytesex", BYTESEX_DEFAULT_STR},
+#if defined(CPLUSPLUS)
+  {".lang",    "=-cpp"},
+#elif defined(TARGET_IS_UNIX)
+  {".lang",    "=-fc"},
+#else
+  {".lang",    "=-ansi"},
+#endif
+#if (D_SUPPRESSED & D_IMPLICITCAST)
+  {".Ec",      "=-Ec"},
+#else
+  {".Ec",      "=-E+c"},
+#endif
+#if (D_SUPPRESSED & D_PPALLOWJUNK)
+  {".Ep",      "=-Ep"},
+#else
+  {".Ep",      "=-E+p"},
+#endif
+#if (D_SUPPRESSED & D_ZEROARRAY)
+  {".Ez",      "=-Ez"},
+#else
+  {".Ez",      "=-E+z"},
+#endif
+#if (D_SUPPRESSED & D_CAST)
+  {".Ef",      "=-Ef"},
+#else
+  {".Ef",      "=-E+f"},
+#endif
+#if (D_SUPPRESSED & D_LINKAGE)
+  {".El",      "=-El"},
+#else
+  {".El",      "=-E+l"},
+#endif
+#ifdef TARGET_WANTS_FUNCTION_NAMES
+  {".ff",      "=-f+f"},
+#else
+  {".ff",      "=-ff"},
+#endif
+  {".fa",      "=-f+a"},
+  {".fv",      "=-f+v"},
+#if (D_SUPPRESSED & D_ASSIGNTEST)
+  {".Wa",      "=-Wa"},
+#else
+  {".Wa",      "=-W+a"},
+#endif
+#if (D_SUPPRESSED & D_DEPRECATED)
+  {".Wd",      "=-Wd"},
+#else
+  {".Wd",      "=-W+d"},
+#endif
+#if (D_SUPPRESSED & D_IMPLICITFNS)
+  {".Wf",      "=-Wf"},
+#else
+  {".Wf",      "=-W+f"},
+#endif
+#if (D_SUPPRESSED & D_GUARDEDINCLUDE)
+  {".Wg",      "=-Wg"},
+#else
+  {".Wg",      "=-W+g"},
+#endif
+#if (D_SUPPRESSED & D_LOWERINWIDER)
+  {".Wl",      "=-Wl"},
+#else
+  {".Wl",      "=-W+l"},
+#endif
+#if (D_SUPPRESSED & D_IMPLICITNARROWING)
+  {".Wn",      "=-Wn"},
+#else
+  {".Wn",      "=-W+n"},
+#endif
+#if (D_SUPPRESSED & D_MULTICHAR)
+  {".Wm",      "=-Wm"},
+#else
+  {".Wm",      "=-W+m"},
+#endif
+#if (D_SUPPRESSED & D_LONGLONGCONST)
+  {".Wo",      "=-Wo"},
+#else
+  {".Wo",      "=-W+o"},
+#endif
+#if (D_SUPPRESSED & D_PPNOSYSINCLUDECHECK)
+  {".Wp",      "=-Wp"},
+#else
+  {".Wp",      "=-W+p"},
+#endif
+#if (D_SUPPRESSED & D_STRUCTPADDING)
+  {".Ws",      "=-Ws"},
+#else
+  {".Ws",      "=-W+s"},
+#endif
+#if (D_SUPPRESSED & D_FUTURE)
+  {".Wu",      "=-Wu"},
+#else
+  {".Wu",      "=-W+u"},
+#endif
+#if (D_SUPPRESSED & D_IMPLICITVOID)
+  {".Wv",      "=-Wv"},
+#else
+  {".Wv",      "=-W+v"},
+#endif
+#if (D_SUPPRESSED & D_STRUCTASSIGN)
+  {".Wz",      "=-Wz"},
+#else
+  {".Wz",      "=-W+z"},
+#endif
+
+#ifdef CPLUSPLUS
+#  if (D_SUPPRESSED & D_CFRONTCALLER)
+  {".Wc",      "=-Wc"},
+#  else
+  {".Wc",      "=-W+c"},
+#  endif
+#  if (D_SUPPRESSED & D_IMPLICITCTOR)
+  {".Wi",      "=-Wi"},
+#  else
+  {".Wi",      "=-W+i"},
+#  endif
+#  if (D_SUPPRESSED & D_IMPLICITVIRTUAL)
+  {".Wr",      "=-Wr"},
+#  else
+  {".Wr",      "=-W+r"},
+#  endif
+#  if (D_SUPPRESSED & D_UNUSEDTHIS)
+  {".Wt",      "=-Wt"},
+#  else
+  {".Wt",      "=-W+t"},
+#  endif
+#endif
+
+  {".-Isearch","=-f+k"},
+  {"-O",       "=mix"},
+#if defined(TARGET_IS_UNIX) || defined(TARGET_HAS_SEPARATE_CODE_DATA_SEGS)
+  {".rolits",  "=-fw"},
+#else
+  {".rolits",  "=-f+w"},
+#endif
+  {".enums",   "=-f+y"},
+  {".schar",   "=-z+c"},
+  {".swilr",   "=-f+z"},
+
+  {"-gx",      "?"},
+  {"-gt",      "=+p"},
+  {"-g",       "=-"},
+
+  {".nowarn",  "?"},
+#ifdef PASCAL
+  {".rd",      "=-rd"},
+#endif
+#ifdef DEFAULT_DOES_NO_CSE
+  {"-zpz",     "=0"},
+#else
+  {"-zpz",     "=1"},
+#endif
+  {"-D__CC_NORCROFT", "==1"},
+/*
+ * Predefine some symbols that give basic information about the size
+ * of objects.  These are made to exist because ANSI rules mean that
+ * one can not go
+ *    #if sizeof(xxx) == nnn
+ * as a pre-processing directive.
+ */
+  {"-D__sizeof_int", "==" xstr(sizeof_int)},
+  {"-D__sizeof_long", "==" xstr(sizeof_long)},
+  {"-D__sizeof_ptr", "==" xstr(sizeof_ptr)},
+
+  { "-zat", "=" xstr(alignof_toplevel_static_default) },
+
+  {NULL, NULL}
+};
+
+int toolenv_insertdefaults(ToolEnv *t) {
+  EnvItem const *p = builtin_defaults;
+  char v[8];
+  char const *s = TOOLVER_ARMCC;
+  int i;
+  int rc;
+  v[0] = v[1] = '=';
+  for (i = 2; isdigit(s[0]) || s[0] == '.'; i++, s++) v[i] = s[0];
+  v[i] = 0;
+  tooledit_insert(t, "-D__ARMCC_VERSION", v);
+  for (; p->name != NULL; p++) {
+    ToolEdit_InsertStatus rc = tooledit_insert(t, p->name, p->val);
+    if (rc == TE_Failed) return 1;
+  }
+  { int argc = 0;
+    char **argp;
+    for (argp = driver_options; *argp != NULL; ++argp) argc++;
+    read_options(0, argc, driver_options, t, NO);
+  }
+  { static char const * const predefs[] = TARGET_PREDEFINES;
+    Uint i;
+    for (i=0; i < sizeof(predefs)/sizeof(predefs[0]); i++)
+            /* note that the arg may be of the form "name" or "name=toks" */
+            /* the "name" form is equivalent to "name=1".                 */
+      AddDefine(t, predefs[i]);
+  }
+  if (setupenv.initial_flags & KEY_PCC)
+    tooledit_insert(t, ".lang", "-pcc");
+
+#ifdef TARGET_SUPPORTS_TOOLENVS
+  rc = mcdep_toolenv_insertdefaults(t);
+#endif
+  TE_NormaliseEtc(t);
+  if (cc_default_env == NULL) {
+    cc_default_env = toolenv_copy(t);
+  }
+  return rc;
 }
 
 /* End of driver.c */

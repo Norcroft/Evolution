@@ -3,12 +3,13 @@
  * Copyright (C) Codemist Ltd, 1988-1992.
  * Copyright (C) Acorn Computers Ltd., 1988-1990.
  * Copyright (C) Advanced RISC Machines Limited, 1990-1992.
+ * SPDX-Licence-Identifier: Apache-2.0
  */
 
 /*
- * RCS $Revision: 1.48 $  Codemist 70
- * Checkin $Date: 1995/11/01 16:46:38 $
- * Revising $Author: hmeekings $
+ * RCS $Revision$  Codemist 70
+ * Checkin $Date$
+ * Revising $Author$
  */
 
 /* Find cc_err below for discussion on error messages, and errors.h   */
@@ -36,6 +37,7 @@
 #  include "defs.h"
 #endif
 #include "store.h"
+#include "compiler.h"
 #include "aeops.h"
 #include "aetree.h"
 #include "lex.h"               /* for curlex... */
@@ -44,17 +46,17 @@
 #ifdef CPLUSPLUS
 #  include "unmangle.h"
 #else
-#  define unmangle(a,b,c) 0
+#  define unmangle_with_class(name,b,c,d,e) name
+#  define unmangle_class(name,b,c) name
 #endif
 #include "msg.h"                /* NLS */
+#include "backchat.h"
 
 #ifdef FOR_ACORN
 #include "dde.h"
 #include "dem.h"     /* cfront name demangling */
-#define listing()    (listingstream != NULL || dde_throwback_flag != 0)
-#else
-#define listing()    (listingstream != NULL)
 #endif
+#define listing()    (listingstream != NULL)
 
 #ifndef NLS
 #  undef msg_sprintf
@@ -75,11 +77,9 @@ long sysdebugmask;
 int32 suppress, feature;
 int32 localcg_debugcount;
 FILE *listingstream;
+FILE *errors;
 #ifdef PASCAL /*ECN*/
 int32 rtcheck;
-#endif
-#ifdef FOR_ACORN
-static int32 throwback_idx;   /* id of throwback session */
 #endif
 
 /* The following routines are generic list-manipulation routines.       */
@@ -88,7 +88,7 @@ static int32 throwback_idx;   /* id of throwback session */
 /* In C, a struct S with a 'cdr' pointer at offset 0 can be reversed    */
 /* destructively by (e.g.)  (S *)dreverse((List *)whatever).            */
 
-int32 length(List *l)
+int32 length(List const *l)
 {
     int32 i = 0;
     for (; l != NULL; l = cdr_(l)) i++;
@@ -100,6 +100,18 @@ List *dreverse(List *x)         /* return reverse(x) by destroying x.   */
     while (x != 0)
     {   t = cdr_(x);
         cdr_(x) = y;
+        y = x;
+        x = t;
+    }
+    return y;
+}
+
+/* Similar to above except for cdr_ */
+Binder *dreverse_binder(Binder *x)
+{   Binder *y = 0, *t;
+    while (x != 0)
+    {   t = bindcdr_(x);
+        bindcdr_(x) = y;
         y = x;
         x = t;
     }
@@ -133,16 +145,8 @@ int32 logbase2(int32 n)
 {
 /* n known to be a power of two                                          */
     int32 r = 0;
-    unsigned32 m = n & 0xffffffff;
-    while ((m & 1)==0) m >>= 1, r++;
+    while ((n & 1)==0) n >>= 1, r++;
     return r;
-}
-
-int32 power_of_two(int32 n)
-{
-/* If n is an exact power of two this returns the power, else -1         */
-    if (n == 0 || n != (n&(-n))) return -1;
-    return logbase2(n);
 }
 
 /* 'real' in the following represents generic float/double/long double */
@@ -159,13 +163,21 @@ FloatCon *real_of_string(const char *s, int32 flag)
         x->floatlen = flag;       /* the bitoftype_ / curlex.a2.flag pun!!! */
 /* Currently sizeof_double==sizeof_ldble is assumed.                    */
         failed = fltrep_stod(s, &x->floatbin.db, NULL);
-        if (failed != flt_ok) flt_report_error(failed);
+        if (failed > flt_ok) flt_report_error(failed);
         if (sizeof_double == 4 ||
             sizeof_float < sizeof_double  &&  (flag & bitoftype_(s_short)))
             /* so we only need to narrow once  */
             fltrep_narrow_round(&x->floatbin.db, &x->floatbin.fb);
     }
     return x;
+}
+
+Int64Con *mkint64const(SET_BITMAP m, int64 const *i64) {
+    Int64Con *e = (Int64Con *)GlobAlloc(SU_Const, sizeof(Int64Con));
+    h0_(e) = s_int64con;
+    e->typespec = m;
+    e->bin.i = *i64;
+    return e;
 }
 
 /* the next two routines do not really belong here, but they do manipulate
@@ -236,9 +248,11 @@ int32 syserr_behaviour = 0;
 #ifndef NO_LISTING_OUTPUT
 /* The following variables should only be ref'd if listingstream != NULL */
 static char *errsaves;
-static int32 errsaven;
-static int32 errsavep;
+static uint32 errsavep, errsaven;
 #endif
+
+static char *errbuf;
+static uint32 errbufp, errbufn;
 
 /* VERY HACKED - INTEGRATE THESE CHANGES */
 
@@ -313,127 +327,153 @@ static void unfetch_string_char(int ch)
 
 #endif
 
-void sstart_string_char(char *s)
+static void sstart_string_char(char *s)
 {
     errmsg.height = 0;
     errmsg.pointer = s;
     errmsg.compressed = 0;
 }
 
-static void nprintf(msg_t errcode, ...)
+static void snprintf(char *b, msg_t errcode, ...)
 {
-    va_list a;
+  va_list a;
 #ifndef NLS
-    char s[80];
-    char *p = s;
-    start_string_char(msg_lookup(errcode));
+  char s[80];
+  char *p = s;
+  start_string_char(msg_lookup(errcode));
 /*
  * Convert error code into a string so that it can be printed. I expect
  * all strings used to be less than 80 characters long.
  */
-    while ((*p++ = fetch_string_char()) != 0);
+  while ((*p++ = fetch_string_char()) != 0) continue;
 #endif
 
-    va_start(a, errcode);
+  va_start(a, errcode);
 #ifdef NLS
-    msg_vfprintf(stderr, errcode, a);
+  msg_vsprintf(b, errcode, a);
 #else
-    _vfprintf(stderr, s, a);
+  vsprintf(b, s, a);
 #endif
-    va_end(a);
+  va_end(a);
+}
+
+static void SendErrorReport(backchat_Diagnostic *bd) {
+  if (errors == NULL)
+    backchat.send(backchat.handle, BC_DIAGMSG, bd);
+  else {
+    char const *msg = bd->msgtext;
+    unsigned line = bd->lineno;
+    char b[256];
+    cc_announce_error(b, bd->severity, bd->filename, line);
+    fputs(b, errors);
+    fputs(msg, errors);
+  }
 }
 
 void summarise(void)
 {
-    if (warncount || recovercount || errorcount ||
-        (feature & FEATURE_VERBOSE))
-    {
-      /* The NLS here is very minimal. We only special case 0 or 1 errors
-       * (sufficient for most Western European languages). Generalising
-       * this to any language would require a reworking of the NLS system
-       * to allow some form of parameterised message. (bleugh)
-       */
+  char b[FILENAME_MAX+64]; /*mls xdevt thread 1682
+                            *Space for message and filename, we hope.
+                            */
+  if (warncount != 0 || recovercount != 0 || errorcount != 0
+      || (feature & FEATURE_VERBOSE))
+  { /* The NLS here is very minimal. We only special case 0 or 1 errors
+     * (sufficient for most Western European languages). Generalising
+     * this to any language would require a reworking of the NLS system
+     * to allow some form of parameterised message. (bleugh)
+     */
+    char *s = b;
 
 #ifndef COMPILING_ON_MPW
-      switch (warncount) {
-      case 0: nprintf(misc_message_sum1_zero,curlex.fl.f); break;
-      case 1: nprintf(misc_message_sum1_sing,curlex.fl.f); break;
-      default:
-        nprintf(misc_message_sum1(curlex.fl.f, (long)warncount));
-        break;
-      }
+    switch (warncount) {
+    case 0: snprintf(s, misc_message_sum1_zero,curlex.fl.f); break;
+    case 1: snprintf(s, misc_message_sum1_sing,curlex.fl.f); break;
+    default:snprintf(s, misc_message_sum1(curlex.fl.f, (long)warncount)); break;
+    }
 #else
-      switch (warncount) {
-      case 0: nprintf(misc_message_sum1_zero_mpw,curlex.fl.f); break;
-      case 1: nprintf(misc_message_sum1_sing_mpw,curlex.fl.f); break;
-      default:
-        nprintf(misc_message_sum1_mpw(curlex.fl.f, (long)warncount));
-        break;
-      }
-#endif
-      if (xwarncount && !(feature & FEATURE_PCC))
-        nprintf(misc_message_sum2, (long)xwarncount);
-
-      switch (recovercount) {
-      case 0: nprintf(misc_message_sum3_zero); break;
-      case 1: nprintf(misc_message_sum3_sing); break;
-      default:
-        nprintf(misc_message_sum3,recovercount);
-        break;
-      }
-
-      switch (errorcount) {
-      case 0: nprintf(misc_message_sum5_zero); break;
-      case 1: nprintf(misc_message_sum5_sing); break;
-      default:
-        nprintf(misc_message_sum5,errorcount);
-        break;
-      }
+    switch (warncount) {
+    case 0: snprintf(s, misc_message_sum1_zero_mpw,curlex.fl.f); break;
+    case 1: snprintf(s, misc_message_sum1_sing_mpw,curlex.fl.f); break;
+    default:snprintf(s, misc_message_sum1_mpw(curlex.fl.f, (long)warncount)); break;
     }
+#endif
+    s += strlen(s);
+    if (xwarncount && !(feature & FEATURE_PCC)) {
+      snprintf(s, misc_message_sum2, (long)xwarncount);
+      s += strlen(s);
+    }
+
+    switch (recovercount) {
+    case 0:  snprintf(s, misc_message_sum3_zero); break;
+    case 1:  snprintf(s, misc_message_sum3_sing); break;
+    default: snprintf(s, misc_message_sum3,(long)recovercount); break;
+    }
+    s += strlen(s);
+
+    switch (errorcount) {
+    case 0:  snprintf(s, misc_message_sum5_zero); break;
+    case 1:  snprintf(s, misc_message_sum5_sing); break;
+    default: snprintf(s, misc_message_sum5,(long)errorcount); break;
+    }
+
+    { backchat_Diagnostic bd;
+      bd.toolname = NULL;
+      bd.filename = NULL;
+      bd.msgtext = b;
+      bd.severity = BC_SEVERITY_INFO;
+      bd.column = (unsigned short)-1;
+      bd.lineno = (unsigned)-1;
+      bd.filepos = -1;
+      SendErrorReport(&bd);
+    }
+  }
 }
 
-#ifndef NO_LISTING_OUTPUT
-static void check_error_buffer(void)
+static void check_error_buffer(size_t len)
 {   /* don't rely on ANSI realloc(NULL, ..) semantics */
-    if (errsaves == NULL)
-        errsaves = (char *)malloc((size_t)(errsaven = 1024));
-    else if (errsavep > errsaven - 200)
-        errsaves = (char *)realloc(errsaves, (size_t)(errsaven += 1024));
-    if (errsaves == NULL)
-    {   fclose(listingstream);
-        listingstream = NULL;
-        cc_fatalerr(misc_fatalerr_space1);
+    if (errbuf == NULL)
+        errbuf = (char *)PermAlloc((errbufn = 1024));
+    else if (errbufp + len > errbufn) {
+        char *old = errbuf;
+        errbuf = (char *)PermAlloc((errbufn += 1024));
+        memcpy(errbuf, old, errbufp);
     }
 }
-#endif
 
-static void announce(msg_t msg_reason, int32 line)
+void cc_announce_error(char *s, int severity, char const *file, int32 line)
 {
-  char *reason;
-  reason=msg_lookup(msg_reason);
+  const char *reason = "";
+  if (severity != BC_SEVERITY_NONE && severity != BC_SEVERITY_INFO)
+  { msg_t msg_severity =
+        severity == BC_SEVERITY_WARN ?    misc_message_warning :
+        severity == BC_SEVERITY_ERROR ?   misc_message_error :
+        severity == BC_SEVERITY_SERIOUS ? misc_message_serious :
+                                          misc_message_fatal;
+    reason = msg_lookup(msg_severity);
+  }
+  if (file == NULL) {
+    snprintf(s, misc_message_nofile(reason));
+  } else if (line == -1) {
 #ifndef TARGET_IS_UNIX
 #  ifndef COMPILING_ON_MPW
-    nprintf(misc_message_lineno(curlex.fl.f, (long)line, reason));
+    snprintf(s, misc_message_nolineno(file, reason));
 #  else
-    nprintf(misc_message_lineno_mpw(curlex.fl.f, (long)line, reason));
+    snprintf(s, misc_message_nolineno_mpw(file, reason));
 #  endif
 #else
-    nprintf(misc_message_lineno_unix(curlex.fl.f, (long)line, reason));
+    snprintf(s, misc_message_nolineno_unix(file, reason));
 #endif
-#ifndef NO_LISTING_OUTPUT
-    if (listing())
-    {   check_error_buffer();
-        if (list_this_file)
-            msg_sprintf(&errsaves[errsavep], misc_message_announce, reason);
-        else
-            msg_sprintf(&errsaves[errsavep], misc_message_announce1,
-                    curlex.fl.f, (long)line, reason);
-        errsavep += strlen(&errsaves[errsavep]);
-#ifdef FOR_ACORN
-        throwback_idx = errsavep;
+  } else {
+#ifndef TARGET_IS_UNIX
+#  ifndef COMPILING_ON_MPW
+    snprintf(s, misc_message_lineno(file, (long)line, reason));
+#  else
+    snprintf(s, misc_message_lineno_mpw(file, (long)line, reason));
+#  endif
+#else
+    snprintf(s, misc_message_lineno_unix(file, (long)line, reason));
 #endif
-    }
-#endif
+  }
 }
 
 void listing_diagnostics(void)
@@ -449,30 +489,17 @@ void listing_diagnostics(void)
 static void errprintf(char const *s, ...)
 {
   /* Takes a format, not a tag */
+  /* It has previously been checked that errbuf has enough space to contain */
+  /* the data to be written                                                 */
     va_list a;
     va_start(a, s);
-    _vfprintf(stderr, s, a);
-    va_end(a);
-#ifndef NO_LISTING_OUTPUT
-    if (listing())
-    {   check_error_buffer();
-        va_start(a, s);
-#ifdef FOR_ACORN
-        /* there is no _vsprintf() in Acorn's shared library stub...    */
-        vsprintf(&errsaves[errsavep], s, a);
-#else   /* ...use integer-only variant... which IS exported from armlib */
-        /* or, for non-ARM hosts, is #defined in host.h to be vsprint.  */
-        _vsprintf(&errsaves[errsavep], s, a);
-#endif
-        errsavep += strlen(&errsaves[errsavep]);
-        va_end(a);
-    }
-#endif
+    vsprintf(&errbuf[errbufp], s, a);
+    errbufp += strlen(&errbuf[errbufp]);
 }
 
-static void qprints(char const *s)
+static void qprints(char const *s, bool quoted)
 {   /* used to print symbols (quoted) or syntactic categories */
-    if (s[0] == '<' && isalpha(s[1])) errprintf("%s", s);
+    if (!quoted || (s[0] == '<' && isalpha(s[1]))) errprintf("%s", s);
     else errprintf("'%s'", s);
 }
 
@@ -514,38 +541,63 @@ static void escstring(char *d, int32 dl, char const *s, int32 sl)
 /* separate functions for names of types and of storage classes,
    since they now use distinct bitmaps.
 */
-static char *xstgbit_name(SET_BITMAP stg)
+static const char *xstgbit_name(SET_BITMAP stg)
 {  AEop s;
+   if (stg & bitofstg_(s_weak))
+       stg &= ~bitofstg_(s_extern);
    for (s = s_auto; bitofstg_(s) & STGBITS; s++)
        if (stg & bitofstg_(s)) return sym_name_table[s];
    return "???";
 }
 
-static char *xtypebit_name(SET_BITMAP typespec)
+static const char *xtypebit_name(SET_BITMAP typespec)
 {  AEop s;
-   /* Hack: the next line helps printing 'long int', but not much else.   */
-   if (typespec & bitoftype_(s_long))
-   {   if (typespec & bitoftype_(s_short))
-          typespec ^= bitoftype_(s_longlong) ^ bitoftype_(s_int) ^
-                     (bitoftype_(s_long) | bitoftype_(s_short));
-       typespec &= ~bitoftype_(s_int);
+   if (typespec & (bitoftype_(s_long)|bitoftype_(s_short)))
+   {   if (typespec & bitoftype_(s_int))
+       {   /* don't need to worry about bool since s_bool < s_int */
+           if (int_islonglong_(typespec))
+               typespec ^= ts_longlong^bitoftype_(s_longlong);
+           else
+               typespec &= ~bitoftype_(s_int); /* leave just short or long or longlong */
+       }
+       else if (typespec & bitoftype_(s_double))
+       {   if (typespec & bitoftype_(s_short))
+               typespec ^= ts_float^bitoftype_(s_float);
+           else
+               return msg_lookup(errname_longdouble); /* there is no s_longdouble */
+       }
    }
    for (s = s_bool; s < s_bool + NUM_OF_TYPES; s++)
        if (typespec & bitoftype_(s)) return sym_name_table[s];
    return "???";
 }
 
-static char const *xtype_name(TypeExpr const *e)
+static char const *xtype_name(char *v, TypeExpr const *e)
 {   switch (h0_(e))
     {   case s_typespec:
-            if (typespecmap_(e) & ENUMORCLASSBITS)
-                return symname_(tagbindsym_(typespectagbind_(e)));
-            return xtypebit_name(typespecmap_(e));
+          { SET_BITMAP m = typespecmap_(e);
+            if (m & ENUMORCLASSBITS) {
+                TagBinder *tb = typespectagbind_(e);
+                if (isgensym(tagbindsym_(tb))
+                    && tb->typedefname != NULL && !isgensym(tb->typedefname))
+                    return symname_(tb->typedefname);
+                sprintf(v, "%s %s", xtypebit_name(m),
+                                    symname_(tagbindsym_(tb)));
+                return v;
+            }
+            if (m & (bitoftype_(s_signed)|bitoftype_(s_unsigned))) {
+                sprintf(v, "%s %s", xtypebit_name(m & (bitoftype_(s_signed)|bitoftype_(s_unsigned))),
+                                    xtypebit_name(m & ~(bitoftype_(s_signed)|bitoftype_(s_unsigned))));
+                return v;
+            }
+            return xtypebit_name(m);
+          }
         case t_ovld: return "<overloaded function>";
         case t_fnap: return "<function>";
         case t_content: return "<pointer>";
         case t_subscript: return "<array>";
         case t_ref: return "<reference>";
+        case t_unknown: return "<typevar>";
         default: return "???";
     }
 }
@@ -559,41 +611,65 @@ int cplusplus_flag;
 #endif
 #endif
 
-static void printsym(char const *format, Symstr const *sym)
-{   char const *name = symname_(sym);
+#define printsym(format, sym) \
+    printsym_with_class((format), (sym), NULL)
+
+static void printsym_with_class(char const *format, Symstr const *sym,
+                                TagBinder const *parent)
+{   char const *name = sym == NULL ? "<no name>" : symname_(sym);
 #ifdef input_from_cfront
-    static char *sbuf;
     if (input_from_cfront)
-    {   if (!sbuf) sbuf = malloc(MAXDBUF);
+    {   char sbuf[MAXDBUF];
         demangle(name, sbuf);
-        name = sbuf;
+        errprintf(format, sbuf);
+    }
+#else
+    if (LanguageIsCPlusPlus)
+    {   const char *classname = parent != NULL ? symname_(tagbindsym_(parent)) : NULL;
+        int classlen = classname != NULL ? strlen(classname) : 0;
+        char buf[256];
+        name = unmangle_with_class(name, classname, classlen, buf, sizeof(buf));
     }
 #endif
+    check_error_buffer(strlen(name));
     errprintf(format, name);
+}
+
+static void printclasssym(char const *format, Symstr const *sym)
+{   char const *name = sym == NULL ? "<no name>" : symname_(sym);
     if (LanguageIsCPlusPlus)
     {   char buf[256];
-        unmangle(name, buf, sizeof(buf));
-        if (strcmp(name, buf) != 0) errprintf(" [%s]", buf);
+        name = unmangle_class(name, buf, sizeof(buf));
     }
+    check_error_buffer(strlen(name));
+    errprintf(format, name);
 }
 
 static void printparents(TagBinder const *b)
 {   if (b == 0) return;
     printparents(b->tagparent);
-    if (!isgensym(tagbindsym_(b)))
+    if (!isgensym(tagbindsym_(b))) {
+        check_error_buffer(strlen(symname_(tagbindsym_(b))));
         errprintf("%s::", symname_(tagbindsym_(b)));
+    }
 }
 
-static void printbinder(Binder const *b)
-{   if (b == 0) { errprintf("<nullbinder>"); return; }
+static void printbinder(Binder const *b, bool quote)
+{   const TagBinder *parent = NULL;
+    if (b == 0) { errprintf("<nullbinder>"); return; }
+    if (quote)
+        errprintf("'");
     if (h0_(b) == s_binder || h0_(b) == s_member) {
-        printparents(bindparent_(b)); /* for C, always NULL */
-        printsym("%s", bindsym_(b));
+        parent = bindparent_(b); /* for C, always NULL */
+        if (parent != NULL)
+            printparents(parent->tagparent);
+        printsym_with_class("%s", bindsym_(b), parent);
     } else if (h0_(b) == s_tagbind) {
         printparents(((TagBinder const *)b)->tagparent);
-        printsym("%s", bindsym_(b));
-    } else
-        printsym("'%s'", bindsym_(b));
+        printclasssym("%s", bindsym_(b));
+    }
+    if (quote)
+        errprintf("'");
 }
 
 #ifdef NLS
@@ -665,14 +741,15 @@ static nls_type *va2type(const char *format,va_list args)
         arg=i++;                /* Doesn't allow $*<f> etc. */
       }
 
+      if (s[0] == '#') ++s;     /* Allow '$#<f>' */
       switch (*s) {
       case '\0': break;
       case '$': case 'l':       /* $l takes no argument */
       default:                  /* really an error */
         s++; i=j;
         break;
-      case 's': case 'q': case 'r': case 'e':
-      case 'b': case 'c': case 't': case 'g':
+      case 's': case 'p': case 'r': case 'e':
+      case 'b': case 'c': case 't': case 'g': case 'k':
       case 'm':
         fmt[arg]=*s;
         type[arg]='$';
@@ -726,8 +803,8 @@ static nls_type *va2type(const char *format,va_list args)
       case 'g': case 'm':
         result[i].cardinal=va_arg(args,SET_BITMAP);
         break;
-      case 'q': case 'r': case 'e': case 'b':
-      case 'c': case 't':
+      case 'p': case 'r': case 'e': case 'b':
+      case 'c': case 't': case 'k':
         result[i].pointer=va_arg(args,void *);
         break;
       }
@@ -743,8 +820,51 @@ static nls_type *va2type(const char *format,va_list args)
 
 #endif
 
+struct FnApContext
+{
+    struct FnApContext *cdr;
+    const Binder* b;  /* the function */
+    int n;            /* the argument number; 0 means 'this' */
+};
 
-void ssuperrprintf(va_list a)
+static struct FnApContext* fnap_context;
+
+void push_fnap_context(Binder* fn) /* NULL fn ok */
+{
+    fnap_context = (struct FnApContext*)syn_list3(fnap_context, fn, 0);
+}
+
+void set_fnap_arg(int i)
+{
+    if (fnap_context == NULL)
+        syserr("no fnap context");
+    else
+        fnap_context->n = i;
+}
+
+void pop_fnap_context(void)
+{
+    if (fnap_context == NULL)
+        syserr("no fnap context");
+    fnap_context = (struct FnApContext*)discard3(fnap_context);
+}
+
+static void ssuperrprintf(va_list a, bool newlineterminate);
+
+/* like cc_msg but takes a compressed string and can be used recursively
+ this is just about cc_msg_lookup and they should be unified */
+static void cc_printf(msg_t errorcode, ...)
+{
+    va_list a;
+    struct uncompression_record save = errmsg;
+    va_start(a, errorcode);
+    start_string_char(msg_lookup(errorcode));
+    ssuperrprintf(a, NO);
+    va_end(a);
+    errmsg = save;
+}
+
+static void ssuperrprintf(va_list a, bool newlineterminate)
 {
     /* This routine behaves like printf but also recognises escape chars of
      * the form $<char> and acts upon them.   It writes its output to
@@ -756,6 +876,7 @@ void ssuperrprintf(va_list a)
     nls_type *m=va2type(errmsg.pointer,a);
     int cur_arg_n=0;
 #endif
+    const TagBinder *parent = NULL;
 
     for (;;)
     {
@@ -780,7 +901,8 @@ void ssuperrprintf(va_list a)
         while ((ch = fetch_string_char()) != 0 &&
                ch != '$' &&
                n != 80 &&       /* also break at char 80... */
-               ch != '%') v[n++] = ch;
+               ch != '%')
+            v[n++] = ch;
 
         if (ch == '%')
         {
@@ -808,9 +930,11 @@ void ssuperrprintf(va_list a)
                 v[n++] = ch;
                 switch (safe_tolower(ch))
                 {
-        case 'l':   arg_type |= long_qualifier;
+                case 'l':
+                    arg_type |= long_qualifier;
                     continue;
-        case '*':   arg_type |= star_qualifier;
+                case '*':
+                    arg_type |= star_qualifier;
 #ifdef NLS
                     if (isdigit(*errmsg.pointer) &&
                         errmsg.pointer[1]=='$') {
@@ -823,49 +947,37 @@ void ssuperrprintf(va_list a)
                     continue;
         /* Note that 'h' indicates that an int should be treated as a */
         /* short value, but the va_arg() call still fetches an int.   */
-        default:    continue;
-        case '%':   break;
-        case 'c': case 'd': case 'i': case 'o':
-        case 'u': case 'x':
+                default:    continue;
+                case '%':   break;
+                case 'c': case 'd': case 'i': case 'o':
+                case 'u': case 'x':
                     arg_type |= int_arg_type;
                     break;
-        case 'p': case 's':
+                case 'p': case 's': case 'k':
                     arg_type |= ptr_arg_type;
                     break;
-        case 'e': case 'f': case 'g':   /* disallow floating point here */
-        case 'n': case 0:
+                case 'e': case 'f': case 'g':   /* disallow floating point here */
+                case 'n': case 0:
                     syserr(syserr_bad_fmt_dir);
                 }
                 break;
-              }
+            }
             ch=fetch_string_char();
-          }
+        }
 
         v[n] = 0;           /* terminate format string */
 
-#ifndef NO_LISTING_OUTPUT
-        if (listing()) check_error_buffer();
-#endif
+        check_error_buffer(200);
         switch (arg_type)
         {
-    default:
-    case no_arg_type:
-#ifndef NO_LISTING_OUTPUT
-            if (listing())
-                errsavep += (_sprintf(&errsaves[errsavep], v),
-                             strlen(&errsaves[errsavep]));
-#endif
-            _fprintf(stderr, v);
+        default:
+        case no_arg_type:
+            errprintf("%s", v);
             break;
 
-    case ptr_arg_type:
+        case ptr_arg_type:
             pnt = ARG(void *,pointer);
-#ifndef NO_LISTING_OUTPUT
-            if (listing())
-                errsavep += (_sprintf(&errsaves[errsavep], v, pnt),
-                             strlen(&errsaves[errsavep]));
-#endif
-            _fprintf(stderr, v, pnt);
+            errprintf(v, pnt);
             break;
 
 /* At present I am only supporting '*' qualifiers for use with string    */
@@ -873,50 +985,37 @@ void ssuperrprintf(va_list a)
 /* one such format in errors.h - I might like to get rid of it by        */
 /* achieving the same result some other way so that this extra mess here */
 /* wrt format decoding could be discarded.                           ACN */
-    case ptr_arg_type + star_qualifier:
+        case ptr_arg_type + star_qualifier:
 #ifdef NLS
             w = star_arg->cardinal;
 #else
             w = ARG(int,cardinal);
 #endif
             pnt = ARG(void *,pointer);
-#ifndef NO_LISTING_OUTPUT
-            if (listing())
-                errsavep += (_sprintf(&errsaves[errsavep], v, w, pnt),
-                             strlen(&errsaves[errsavep]));
-#endif
-            _fprintf(stderr, v, w, pnt);
+            errprintf(v, w, pnt);
             break;
 
-    case int_arg_type + long_qualifier:
+        case int_arg_type + long_qualifier:
             l_int = ARG(long,cardinal);
-#ifndef NO_LISTING_OUTPUT
-            if (listing())
-                errsavep += (_sprintf(&errsaves[errsavep], v, l_int),
-                             strlen(&errsaves[errsavep]));
-#endif
-            _fprintf(stderr, v, l_int);
+            errprintf(v, l_int);
             break;
 
-    case int_arg_type:
+        case int_arg_type:
             w = ARG(int,cardinal);
-#ifndef NO_LISTING_OUTPUT
-            if (listing())
-               errsavep += (_sprintf(&errsaves[errsavep], v, w),
-                            strlen(&errsaves[errsavep]));
-#endif
-            _fprintf(stderr, v, w);
+            errprintf(v, w);
             break;
         }
 
         if (ch == 0)
         {
             if (syserr_behaviour==3) abort();
+            if (newlineterminate) errprintf("\n");
             return;        /* Message now complete */
         }
 
         if (ch != '$') unfetch_string_char(ch);
         else {
+          bool alt = false;
           ch=fetch_string_char();
 #ifdef NLS
           if (isdigit(ch) && *errmsg.pointer=='$') {
@@ -926,51 +1025,90 @@ void ssuperrprintf(va_list a)
           }
 #endif
 
+          if (ch == '#')
+          {   alt = true;
+              ch = fetch_string_char();
+          }
           switch (ch) {
           case 0:
+            if (newlineterminate) errprintf("\n");
             return;
-          case 's':
-            qprints(sym_name_table[ARG(AEop,cardinal) & 255]);
-            break;
-          case 'l':   /* current lexeme */
-            switch (curlex.sym & 255)
-            {   case s_integer:
-                    errprintf("'%ld'", (long)curlex.a1.i); break;
-                case s_floatcon:
-                    errprintf("'%s'", curlex.a1.fc->floatstr); break;
-                case s_identifier:
-                case s_pseudoid:
-                    printsym("'%s'", curlex.a1.sv);
-                    break;
-                case s_string:
-                    {   char e[80];
-                        escstring(e, 20, curlex.a1.s, curlex.a2.len);
-                        errprintf("'\"%s\"'", e);
+          case 's':   /* AEop */
+            {   AEop op = ARG(AEop,cardinal);
+                if (op == s_fnap && fnap_context != NULL)
+                {   if (fnap_context->n == 0)
+                    {   if (fnap_context->b == 0)
+                            cc_printf(misc_msg_fnarg_this_fnap);
+                        else
+                            cc_printf(misc_msg_fnarg_this_fnname, fnap_context->b);
                     }
-                    break;
-                default:
-                    qprints(sym_name_table[curlex.sym & 255]);
-                    break;
+                    else
+                    {   if (fnap_context->b == 0)
+                            cc_printf(misc_msg_fnarg_fnap, fnap_context->n);
+                        else
+                            cc_printf(misc_msg_fnarg_fnname, fnap_context->n, fnap_context->b);
+                    }
+                }
+                else
+                    qprints(sym_name_table[op & 255], !alt);
             }
             break;
-          case 'q':
-          case 'r':
+          case 'l':   /* current lexeme -- curlex */
+          case 'k':   /* supplied lexeme -- SymInfo* */
+            {
+                SymInfo *p = (ch == 'l') ? &curlex :
+                    ARG(SymInfo *,pointer);
+                if (!alt)
+                    errprintf("'");
+                switch (p->sym & 255)
+                {   case s_integer:
+                        errprintf("%ld", (long)p->a1.i); break;
+                    case s_floatcon:
+                        errprintf("%s", p->a1.fc->floatstr); break;
+                    case s_identifier:
+                    case s_pseudoid:
+                        printsym("%s", p->a1.sv);
+                        break;
+                    case s_string:
+                        {   char e[80];
+                            escstring(e, 20, p->a1.s, p->a2.len);
+                            errprintf("\"%s\"", e);
+                        }
+                        break;
+                    default:
+                        qprints(sym_name_table[p->sym & 255], false);
+                        break;
+                }
+                if (!alt)
+                    errprintf("'");
+            }
+            break;
+          case 'p': /* set parent for $r */
+            parent = ARG(const TagBinder *,pointer);
+            break;
+          case 'r': /* Symstr* */
             {   Symstr *r = ARG(Symstr *,pointer);
                 if (r==0 || h0_(r) != s_identifier)
                 {   if (r == 0) errprintf("<missing>");
                     else errprintf("<oddity>");
                 }
-                else if (ch == 'r')
-                    printsym("'%s'", r);
                 else
-                    printsym("%s", r);
+                {   if (ch == 'r' && !alt)
+                        errprintf("'");
+                    if (parent != NULL)
+                        printparents(parent->tagparent);
+                    printsym_with_class(ch == 'r' && !alt ? "%s'" : "%s",
+                                        r, parent);
+                }
             }
             break;
-    case 'e':
+          case 'e': /* Expr* */
             {   Expr *e = ARG(Expr *,pointer);
                 while (h0_(e) == s_invisible) e = arg1_(e);
                 if (h0_(e) != s_binder && h0_(e) != s_member)
                 {   AEop op = h0_(e);
+                    if (!alt)
+                        errprintf("'");
                     if (op == s_string
 #ifdef EXTENSION_UNSIGNED_STRINGS
                         || op == s_ustring || op == s_string
@@ -982,57 +1120,184 @@ void ssuperrprintf(va_list a)
                         errprintf("'\"%s\"'", s);
                     }
                     else
-                    {   char *opname = sym_name_table[op & 255];
+                    {   const char *opname = sym_name_table[op & 255];
                         if (isdiad_(op))
                             errprintf("<expr> %s <expr>", opname);
                         else if (op >= s_binder)
                             errprintf("%s<expr>", opname);
                         else
-                            errprintf("'%s'", opname);
+                            errprintf("%s", opname);
                     }
+                    if (!alt)
+                        errprintf("'");
                 }
                 else
-                    printbinder((Binder *)e);
+                    printbinder((Binder *)e, !alt);
             }
             break;
-    case 'b':   /* ordinary binder, but works for tag binder too.       */
-            printbinder(ARG(Binder *,pointer));
+          case 'b':   /* ordinary binder, but works for tag binder too.       */
+            printbinder(ARG(Binder *,pointer), !alt);
             break;
-    case 'c':   /* tag binder -- this will simplify many err msgs.      */
+          case 'c':   /* tag binder -- this will simplify many err msgs.      */
             {   TagBinder *b = ARG(TagBinder *,pointer);
                 if (b == 0) break;
-                errprintf("%s ", sym_name_table[tagbindsort(b)]);
-                printbinder((Binder *)b);
+                if (isgensym(tagbindsym_(b))
+                    && b->typedefname != NULL && !isgensym(b->typedefname))
+                    printsym(alt ? "%s" : "'%s'", b->typedefname);
+                else {
+                    if (!alt)
+                        errprintf("'");
+                    if (tagbindbits_(b) & TB_TEMPLATE)
+                        errprintf("%s ", sym_name_table[s_template]);
+                    errprintf("%s ", sym_name_table[tagbindsort(b)]);
+                    printbinder((Binder *)b, false);
+                    if (!alt)
+                        errprintf("'");
+                }
             }
             break;
-    case 't':
-            qprints(xtype_name(ARG(TypeExpr *,pointer)));
+          case 't': /* TypeExpr* */
+            qprints(xtype_name(v, ARG(TypeExpr *,pointer)), !alt);
             break;
-    case 'g':
+          case 'g': /* stgbits -- SET_BITMAP */
             errprintf("'%s'", xstgbit_name(ARG(SET_BITMAP,cardinal)));
             break;
-    case 'm':
+          case 'm': /* typebits -- SET_BITMAP */
             errprintf("'%s'", xtypebit_name(ARG(SET_BITMAP,cardinal)));
             break;
-    default:
+          default:
             errprintf("$%c", (int)ch);   /* really an error */
             break;
           }
         }
       }
-  }
+}
 
 static void superrprintf(msg_t errorcode, va_list a)
 {
     start_string_char(msg_lookup(errorcode));
-    ssuperrprintf(a);
+    ssuperrprintf(a, YES);
+}
+
+static backchat_Diagnostic bd;
+
+static void ReportError_1(int severity, const char *filename, int32 line)
+{
+    bd.filename = filename;
+    bd.msgtext = errbuf;
+    bd.severity = (unsigned short)severity;
+    bd.column = (unsigned short)-1;
+    bd.lineno = (unsigned)line;
+    bd.filepos = -1;
+    SendErrorReport(&bd);
+#ifndef NO_LISTING_OUTPUT
+    if (listing()) {
+        char b[256];
+        size_t blen;
+        cc_announce_error(b, severity, filename, line);
+        blen = strlen(b);
+        if (errsaves == NULL)
+            errsaves = (char *)PermAlloc((errsaven = 1024));
+        else if (errsavep + blen + errbufp + 1 >= errsaven) {
+            char *old = errsaves;
+            errsaves = (char *)PermAlloc((errsaven += 1024));
+            memcpy(errsaves, old, (size_t)errsavep);
+        }
+        if (errsaves == NULL)
+        {   fclose(listingstream);
+            listingstream = NULL;
+            cc_fatalerr(misc_fatalerr_space1);
+        }
+        memcpy(&errsaves[errsavep], b, blen);
+        memcpy(&errsaves[errsavep += blen], errbuf, (size_t)errbufp+1);
+        errsavep += errbufp+1;
+    }
+#endif
+    errbufp = 0;
+}
+
+static void ReportError(int severity, int32 line)
+{
+     ReportError_1(severity, (line == -1) ? NULL : curlex.fl.f, line);
+}
+
+static void ReportErrorContinuation(void)
+{
+    bd.filename = NULL;
+    bd.lineno = (unsigned)-1;
+    bd.severity = BC_SEVERITY_NONE;
+    SendErrorReport(&bd);
+#ifndef NO_LISTING_OUTPUT
+    if (listing()) {
+        if (errsaves == NULL)
+            errsaves = (char *)PermAlloc((errsaven = 1024));
+        else if (errsavep + errbufp + 1 >= errsaven) {
+            char *old = errsaves;
+            errsaves = (char *)PermAlloc((errsaven += 1024));
+            memcpy(errsaves, old, (size_t)errsavep);
+        }
+        if (errsaves == NULL)
+        {   fclose(listingstream);
+            listingstream = NULL;
+            cc_fatalerr(misc_fatalerr_space1);
+        }
+        memcpy(&errsaves[errsavep], errbuf, (size_t)errbufp+1);
+        errsavep += errbufp+1;
+    }
+#endif
+    errbufp = 0;
+}
+
+struct NestedContext
+{
+    struct NestedContext *cdr;
+    FileLine fl;
+    msg_t msg;
+    IPtr arg1;
+    IPtr arg2;
+};
+
+static struct NestedContext* nested_context;
+
+void push_nested_context(msg_t errorcode, IPtr arg1, IPtr arg2)
+{   struct NestedContext *c = NewBind(struct NestedContext);
+    cdr_(c) = nested_context;
+    c->fl = curlex.fl;
+    c->msg = errorcode;
+    c->arg1 = arg1;
+    c->arg2 = arg2;
+    nested_context = c;
+}
+
+void pop_nested_context(void)
+{
+    if (nested_context == NULL)
+        syserr("no nested context");
+    nested_context = cdr_(nested_context);
+}
+
+static void Report1NestedContext(const char *filename, int line, msg_t s, ... /*IPtr arg, IPtr arg2*/)
+{
+    va_list a;
+    va_start(a, s);
+    superrprintf(s, a);
+    ReportError_1(BC_SEVERITY_INFO, filename, line);
+    va_end(a);
+}
+
+static void ReportNestedContexts(void)
+{   struct NestedContext *c = nested_context;
+    for (; c != NULL; c = cdr_(c))
+        Report1NestedContext(c->fl.f, c->fl.l, c->msg, c->arg1, c->arg2);
 }
 
 void cc_msg(char *s, ...)
 {
     va_list a;
     va_start(a, s);
-    sstart_string_char(s); ssuperrprintf(a);
+    sstart_string_char(s); ssuperrprintf(a, NO);
+    if (errbuf[errbufp-1] == '\n')
+        ReportError(BC_SEVERITY_NONE, -1);
     va_end(a);
 }
 
@@ -1041,7 +1306,8 @@ void cc_msg_lookup(msg_t s, ...)
 {
     va_list a;
     va_start(a, s);
-    sstart_string_char(msg_lookup(s)); ssuperrprintf(a);
+    sstart_string_char(msg_lookup(s)); ssuperrprintf(a, NO);
+    ReportError(BC_SEVERITY_NONE, -1);
     va_end(a);
 }
 #endif
@@ -1057,36 +1323,43 @@ void syserr(syserr_message_type errorcode, ...)
  * extra args are treated by printing two of them as hex values -
  * if less than two args were passed this will display junk!
  */
-    _sprintf(s, "maintainer-info(errors.h,%d,%%.8x,%%.8x)", errorcode);
+    sprintf(s, "maintainer-info(errors.h,%d,%%.8x,%%.8x)", errorcode);
 #else
     char *s = errorcode;
 #endif
-    announce(misc_message_fatal_internal, curlex.fl.l);
     va_start(a, errorcode);
-    sstart_string_char(s); ssuperrprintf(a);
+    superrprintf(misc_message_internal, a);
     va_end(a);
-    errprintf("\n");
+    ReportError(BC_SEVERITY_FATAL, curlex.fl.l);
+    va_start(a, errorcode);
+    sstart_string_char(s); ssuperrprintf(a, YES);
+    ReportErrorContinuation();
+    va_end(a);
+    ReportNestedContexts();
     switch (syserr_behaviour)
     {   case 1: return;         /* Try to go on with compilation */
         case 2: abort();        /* hard stop - would like diagnostics */
                 break;
         default:                /* stop tolerably quietly and tidily */
-#ifndef TARGET_IS_INTERPRETER
+#ifndef CALLABLE_COMPILER
                 va_start(a, errorcode);
                 superrprintf(misc_disaster_banner, a);  /* no escapes */
+                ReportErrorContinuation();
                 va_end(a);
 #endif
                 compile_abort(0);
                 break;
     }
-    exit(EXIT_syserr);
+    compiler_exit(EXIT_syserr);
 }
 
 void cc_fatalerr_l(int32 n, msg_t errorcode, va_list a)
 {
-    announce(misc_message_fatal, n);
     superrprintf(errorcode, a);
+    ReportError(BC_SEVERITY_FATAL, n);
+    ReportNestedContexts();
     errprintf(msg_lookup(misc_message_abandoned));
+    ReportErrorContinuation();
     if (syserr_behaviour)
     {   show_store_use();
         syserr(syserr_syserr);  /* rethink this msg if syserrs lack strings */
@@ -1105,16 +1378,13 @@ void cc_fatalerr(msg_t errorcode, ...)
 void cc_warn_l(int32 n, msg_t errorcode, va_list a)
 {
     if (!(feature & FEATURE_NOWARNINGS))
-    {
-        ++warncount;
-        announce(misc_message_warning, n);
+    {   ++warncount;
         superrprintf(errorcode, a);
-        errprintf("\n");
-#ifdef FOR_ACORN
-        if (dde_throwback_flag != 0)
-            dde_throwback_send(THROWBACK_WARN, n, &errsaves[throwback_idx]);
-#endif
+        ReportError(BC_SEVERITY_WARN, n);
+        ReportNestedContexts();
     }
+    else
+        ++xwarncount;
 }
 
 void cc_warn(msg_t errorcode, ...)
@@ -1142,37 +1412,20 @@ void cc_pccwarn(msg_t errorcode, ...)
 /* can be suppressed using the -w option on the command line.       */
 {
     va_list a;
-    if (feature & FEATURE_PCC)
-    {   if (feature & FEATURE_NOWARNINGS) return;
-        ++warncount;
-        announce(misc_message_warning, (int32)curlex.fl.l);
-    }
-    else
-    {   ++recovercount;
-        announce(misc_message_error, (int32)curlex.fl.l);
-    }
     va_start(a, errorcode);
-    superrprintf(errorcode, a);
+    if (feature & FEATURE_PCC)
+        cc_warn_l(curlex.fl.l, errorcode, a);
+    else
+        cc_rerr_l(curlex.fl.l, errorcode, a);
     va_end(a);
-    errprintf("\n");
-#ifdef FOR_ACORN
-    if (dde_throwback_flag!= 0)
-        dde_throwback_send(
-            (feature & FEATURE_PCC) ? THROWBACK_WARN : THROWBACK_ERROR,
-                curlex.fl.l, &errsaves[throwback_idx]);
-#endif
 }
 
 void cc_rerr_l(int32 n, msg_t errorcode, va_list a)
 {
     ++recovercount;
-    announce(misc_message_error, n);
     superrprintf(errorcode, a);
-    errprintf("\n");
-#ifdef FOR_ACORN
-    if (dde_throwback_flag != 0)
-        dde_throwback_send(THROWBACK_ERROR, n, &errsaves[throwback_idx]);
-#endif
+    ReportError(BC_SEVERITY_ERROR, n);
+    ReportNestedContexts();
 }
 
 void cc_rerr(msg_t errorcode, ...)
@@ -1221,13 +1474,9 @@ void cc_rerr_cwarn(msg_t errorcode, ...)
 void cc_err_l(int32 n, msg_t errorcode, va_list a)
 {
     if (++errorcount > 100) cc_fatalerr(misc_fatalerr_toomanyerrs);
-    announce(misc_message_serious, n);
     superrprintf(errorcode, a);
-    errprintf("\n");
-#ifdef FOR_ACORN
-    if (dde_throwback_flag != 0)
-        dde_throwback_send(THROWBACK_SERIOUS, n, &errsaves[throwback_idx]);
-#endif
+    ReportError(BC_SEVERITY_SERIOUS, n);
+    ReportNestedContexts();
 }
 
 void cc_err(msg_t errorcode, ...)
@@ -1248,17 +1497,24 @@ void flt_report_error(int failure) {
     }
 }
 
-void errstate_init(void)
+void errstate_perfileinit(void)
 {
     /* reset the following vars for each one of a many file compilation */
     warncount=0, recovercount=0, errorcount=0;
     xwarncount=0;
 /* The next line is scrappy, but avoids printing the null string.       */
     curlex.fl.f = "<command line>", curlex.fl.l = 1;
+    fnap_context = NULL;
+}
+
+void errstate_initialise(void)
+{
+    errbuf = NULL; errbufp = errbufn = 0;
 #ifndef NO_LISTING_OUTPUT
     errsaves = NULL;
     errsaven = errsavep = 0;
 #endif
+    errstate_perfileinit();
 }
 
 /* end of mip/misc.c */

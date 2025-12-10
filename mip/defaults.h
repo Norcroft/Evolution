@@ -2,12 +2,13 @@
  * mip/defaults.h - default sizes of things, debugging options etc...
  * Copyright (C) Codemist Ltd., 1989-1992.
  * Copyright (C) Advanced RISC Machines Limited, 1992.
+ * SPDX-Licence-Identifier: Apache-2.0
  */
 
 /*
- * RCS $Revision: 1.24 $ Codemist 9
- * Checkin $Date: 1996/01/10 14:54:29 $
- * Revising $Author: hmeeking $
+ * RCS $Revision$ Codemist 9
+ * Checkin $Date$
+ * Revising $Author$
  */
 
 /* This file is included after host.h, options.h and target.h and       */
@@ -26,6 +27,30 @@
   #error options.h and target.h did not specify TARGET_SYSTEM (Unix assumed)
   #define TARGET_SYSTEM "Unix"
   #define TARGET_IS_UNIX 1
+#endif
+
+#ifndef TOOL
+#  ifdef CPLUSPLUS
+#    ifdef TARGET_IS_THUMB
+#      define TOOL tcpp
+#    else
+#      ifdef TARGET_IS_ARM
+#        define TOOL armcpp
+#      else
+#        define TOOL cpp
+#      endif
+#    endif
+#  else
+#    ifdef TARGET_IS_THUMB
+#      define TOOL tcc
+#    else
+#      ifdef TARGET_IS_ARM
+#        define TOOL armcc
+#      else
+#        define TOOL cc
+#      endif
+#    endif
+#  endif /* CPLUSPLUS */
 #endif
 
 #ifndef SIMPLIFY_OPTIMISE_CHAR_AND_SHORT_ARITHMETIC
@@ -47,7 +72,8 @@
 /* constant to suffice.                                                 */
 #ifndef BSS_THRESHOLD
 /* ECN: Changed from 100 to 8 (Apr 95) */
-#  define BSS_THRESHOLD 8
+#  define BSS_THRESHOLD_DEFAULT 8
+#  define BSS_THRESHOLD bss_threshold
 #endif
 
 #ifndef NTEMPREGS                       /* gentle upwards compatibility */
@@ -152,7 +178,7 @@
 #  define alignof_long sizeof_long      /* 4 */
 #endif
 #ifndef alignof_longlong
-#  define alignof_longlong sizeof_longlong /* 4, 8 */
+#  define alignof_longlong 4            /* 4, 8 */
 #endif
 #ifndef alignof_ptr
 #  define alignof_ptr sizeof_ptr        /* 4, 8 */
@@ -271,14 +297,6 @@
 #define TARGET_MAX_FRAMESIZE 256
 #endif
 
-#ifndef TARGET_LDRK_QUANTUM
-#  define target_ldrk_quantum(size, flt) 1
-#endif
-
-#ifndef TARGET_LDRK_QUANTUM
-#  define target_ldrk_quantum(size, flt) 1
-#endif
-
 #ifndef MEMCPYQUANTUM
 /* These might look like things that properly belong in cgdefs.h or     */
 /* jopcode.h, but unfortunately they're wanted by the front end to      */
@@ -301,7 +319,7 @@
 /* The following lines serve to make the compiler use wchar_t == int.   */
 /* This happens works with both 16 and 32 bit target ints.              */
 #  define sizeof_wchar sizeof_int
-#  define te_wchar     te_int   /* for sem.c */
+#  define wchar_typespec bitoftype_(s_int)
 #  define NUM_WCHAR    NUM_INT  /* for lex.c */
 #endif
 
@@ -352,7 +370,7 @@
 #  ifndef ENABLE_AETREE
 #     define ENABLE_AETREE    1
 #  endif
-# ifndef TARGET_IS_INTERPRETER
+# ifndef CALLABLE_COMPILER
 #  ifndef ENABLE_CG
 #     define ENABLE_CG        1
 #  endif
@@ -397,6 +415,9 @@
 #  endif
 #  ifndef ENABLE_TEMPLATE
 #     define ENABLE_TEMPLATE  1
+#  endif
+#  ifndef ENABLE_SR
+#     define ENABLE_SR        1
 #  endif
 # endif
 #endif
@@ -506,6 +527,11 @@
 #else
 #  define DEBUG_TEMPLATE 0
 #endif
+#ifdef ENABLE_SR
+#  define DEBUG_SR       0x400000L
+#else
+#  define DEBUG_SR       0
+#endif
 
 /* The following generates no code in if (debugging(n)) if 'n' is 0 */
 extern long sysdebugmask;
@@ -558,12 +584,21 @@ extern long sysdebugmask;
 
 #endif /* POLICE_THE_SIX_CHAR_NAME_LIMIT */
 
+#ifndef SOFTWARE_FLOATING_POINT
+#  define software_floating_point_enabled 0
+#  define software_floats_enabled 0
+#  define software_doubles_enabled 0
+#endif
+
 #ifndef software_floating_point_enabled
-#  define software_floating_point_enabled 1 /* only used if SOFTWARE_FLOATING_POINT defined */
+#  define software_floating_point_enabled 1
+#  define software_floats_enabled 1
+#  define software_doubles_enabled 1
 #endif
 
 #ifndef just32bits_
 #  define just32bits_(x) (x)
+#  define widen32bitint_(x) (((x) & 0x80000000) ? (x) | ~0x7fffffff : (x) & 0x7fffffff)
 #endif
 
 #ifndef target_stack_moves_once

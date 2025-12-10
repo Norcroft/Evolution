@@ -1,29 +1,31 @@
 /*
  * cfe/feerrs.h - prototype for front-end error messages file
+ * Copyright (C) Acorn Computers Ltd., 1988-1990.
+ * Copyright (C) Codemist Ltd., 1987-1992.
+ * Copyright (C) Advanced RISC Machines Limited, 1991-1992.
+ * SPDX-Licence-Identifier: Apache-2.0
  * version 3b.
  */
 
 /*
- * RCS $Revision: 1.38 $
- * Checkin $Date: 1995/10/06 14:05:00 $
- * Revising $Author: sdouglas $
+ * RCS $Revision$
+ * Checkin $Date$
+ * Revising $Author$
  */
 
 #ifndef NLS                     /* if NLS, miperrs will have included tags */
 
 %O  /* Ordinary error messages - mapped onto numeric codes */
 
-#define pp_warn_macro_arg_exp_in_string "argument %s of macro %s expanded in %c...%c"
-#define pp_warn_pragma_suppress "#pragma -b suppresses errors (hence non-ANSI)"
-#define pp_warn_not_guarded "Header file not guarded against multiple inclusion"
-#define pp_warn_guard_not_defined "File is guarded by '%s' but does not #define it"
-#define pp_warn_continued_comment "trailing '\\' continues comment"
-#define pp_warn_directive_in_args \
-    "preprocessor directive ignored in macro argument list\n"
+/* Preprocessor messages are in miperrs.h */
 
-#define lex_warn_force_unsigned "%s treated as %sul in 32-bit implementation"
+#define lex_warn_force_unsigned "'%s' treated as '%sul' in 32-bit implementation"
+#define lex_warn_force_longlong "'%s' treated as '%sll'"
+#define lex_warn_force_ulonglong "'%s' treated as '%sull'"
 #define lex_warn_multi_char "non-portable - not 1 char in '...'"
 #define lex_warn_cplusplusid "C++ keyword used as identifier: $r"
+#define lex_warn_cplusplusimpl \
+        "Functionality of C++ keyword may not yet be fully implemented: $r"
 
 #define syn_warn_hashif_undef "Undefined macro '%s' in #if - treated as 0"
 #define syn_warn_invent_extern "inventing 'extern int %s();'"
@@ -39,7 +41,7 @@
 #define syn_warn_give_args "Deprecated declaration %s() - give arg types"
 #define syn_warn_ANSI_decl "ANSI style function declaration used, '%s(...)'"
 #define syn_warn_archaic_init "Ancient form of initialisation, use '='"
-#define syn_warn_untyped_fn "'int %s()' assumed - 'void' intended?"
+#define syn_warn_untyped_fn "implicit 'int' return type for $r - 'void' intended?"
 #define syn_warn_no_named_member "$c has no named member"
 #define syn_warn_extra_comma "Superfluous ',' in 'enum' declaration"
 #define syn_warn_struct_padded "padding inserted in struct $b"
@@ -51,22 +53,28 @@
         "declaration lacks type/storage-class (assuming 'int'): $r"
 #define syn_warn_archaic_fnpara "archaic C-style function parameter $l"
 #define syn_warn_special_ops "'=', ',' or unary '&' defined as non-member"
-#define syn_warn_ineffective_asm_decl "ineffective declaration: asm(...)"
-#define syn_warn_ignored_asm_decl "declaration ignored at top-level: asm(...)"
+#define syn_warn_ineffective_asm_decl "asm(...) ignored: inline assembler not available"
 #define syn_warn_insert_sym_anachronism "inserting $r in ':(...)' anachronism"
-#define syn_warn_uninit_const_ref "uninitialisable const or ref: $r"
 #define syn_warn_superfluous_prefix \
      "superfluous 'union','class', 'struct' or 'enum' prefix"
-#define syn_warn_no_default_structor "$b: $c has no default $r"
+#define syn_warn_no_default_structor "$b: $c has no default %s"
 
-#define xsyn_warn_AAM_cctor_suppress \
+
+#define xsyn_info_instantiate_class \
+        "while instantiating $c"
+#define xsyn_info_instantiate_fn \
+        "while instantiating function $p$r"
+#define xsyn_warn_ARM_cctor_suppress \
         "$b suppresses default copy constructor under ARM semantics"
 #define xsyn_warn_ISO_cctor_no_suppress \
         "$b does not suppress default copy constructor under ISO semantics"
-#define xsyn_warn_AAM_opeq_suppress \
+#define xsyn_warn_ARM_opeq_suppress \
         "$b suppresses default operator= under ARM semantics"
 #define xsyn_warn_ISO_opeq_no_suppress \
         "$b does not suppress default operator= under ISO semantics"
+#define xsyn_warn_delete_undef \
+        "delete of pointer to undefined $c; no destructor will be called"
+#define xsyn_warn_implicit_private_base "base class $c is implicitly private"
 
 #define simp_warn_checkvar "syserr soon: checkvar use %ld"
 
@@ -77,6 +85,7 @@
         "Attempt to initialise non-aggregate"
 
 #define lex_err_ioverflow "Number %s too large for 32-bit implementation"
+#define lex_err_ioverflow_64 "Number %s too large for 64-bit implementation"
 #define lex_err_overlong_fp "Grossly over-long floating point number"
 #define lex_err_fp_syntax1 "Digit required after exponent marker"
 #define lex_err_overlong_hex "Grossly over-long hexadecimal constant"
@@ -92,7 +101,7 @@
 #define lex_err_ellipsis "(...) must have exactly 3 dots"
 #define lex_err_illegal_whitespace "$s may not have whitespace in it"
 
-#define syn_err_illdtor "illegal destructor ~$l"
+#define syn_err_illdtor "illegal destructor '~$#l'"
 #define syn_err_bitsize "bit size %ld illegal - 1 assumed"
 #define syn_err_zerobitsize "zero width named bit field - 1 assumed"
 #define syn_err_arraysize "Array size %ld illegal - 1 assumed"
@@ -117,6 +126,7 @@
 #define syn_err_hashif_junk "Junk after #if <expression>"
 #define syn_err_initialisers "too many initialisers in {} for aggregate"
 #define syn_err_initialisers1 "{} must have 1 element to initialise scalar"
+#define syn_rerr_empty_init "Initialiser list must contain at least one expression"
 #define syn_err_default "'default' not in switch - ignored"
 #define syn_err_default1 "duplicate 'default' case ignored"
 #define syn_err_case "'case' not in switch - ignored"
@@ -157,7 +167,7 @@
 #define syn_err_undef_enum "Undefined enum $r"
 #define syn_err_misplaced_brace "Misplaced '{' at top level - ignoring block"
 #define syn_err_not_friend "not a friend class $r"
-#define syn_err_undef_basetag "undefined base tag: $l"
+#define syn_err_undef_basetag "undefined base: $c"
 #define syn_err_missing_basetag "missing base tag: $l"
 #define syn_err_incomp_arg_ovld "Incompatible arguments to $b (overload missing?)"
 #define syn_err_no_operator_ovld "No operator $s with this type signature"
@@ -169,16 +179,26 @@
     "ambiguous %d-way choice of constructor from $t to $c"
 #define syn_err_ambiguous_user_defined_conv \
     "ambiguous implicit user-defined conversion from $c to $c"
+#define syn_err_illegal_asm_decl "illegal asm(...) declaration (ignored)"
+#define syn_err_recursive_app_operator_arrow \
+        "recursive application of operator->() to object of type $c; return type intended?"
+
 #define sem_err_assign_ovld \
     "no suitable operator=() for $c: overload missing?"
+#define sem_warn_virtual "virtual function call of $b"
+#define sem_warn_addr_of_memfn "address of member function $b"
+#define xsem_warn_cast_undef_struct \
+    "cast from ptr/ref to $c to ptr/ref to $c; one is undefined, assuming unrelated"
+#define xsem_warn_unreachable_handler "handler is unreachable"
+
 #define syn_err_constructor_init "constructor forbids $r = {...} initialiser"
 #define syn_err_no_named_member "$c has no $r member"
-#define syn_err_not_found_named_member "member $r not found in struct/class $b"
+#define syn_err_not_found_named_member "member $r not found in $c"
 #define syn_err_missing_named_mfn "Missing class member function name"
 #define syn_err_classname_not_found "class-name $r not found"
 #define syn_err_member_cannot_init "member cannot be initialised: $r"
 #define syn_err_lacks_bclass_anachronism "$c lacks base class for ':(...)' anachronism"
-#define syn_err_not_member "$l is not a member of struct/class $b\n"
+#define syn_err_not_member "$l is not a member of struct/class $b"
 #define syn_err_try_catch "'try-catch' unimplemented"
 #define syn_err_catch_ignored "misplaced 'catch' ignored"
 #define syn_err_illegal_simple_types "illegal <simple type>: $m"
@@ -202,6 +222,37 @@
 #define syn_err_expected_id_in_mem_init "expecting <identifier> in <member-initialiser>"
 #define syn_err_missing_catch_after_try "omitted 'catch' after 'try'"
 #define syn_err_ill_this "legal only in member function: $l"
+#define syn_err_template_notclassorfunction "'template' not class nor function"
+#define syn_err_template_scope "invalid $c scope"
+#define syn_err_unspecialized_template "attempt to use template $b"
+#define syn_err_asm_not_available "inline assembler not available in strict ANSI mode"
+
+#define sem_err_temp_type_float "floating point type not allowed"
+#define sem_err_addr_template "attempt to take address of template $b"
+#define sem_err_typededuce_disagree "type deduction fails: $t disagrees with $t"
+#define sem_warn_typededuce_arraysize "type deduction fails: array size differs"
+#define sem_err_typededuce_ambiguous "type deduction fails: function type %d-way resolvable"
+#define sem_err_typededuce_pointer "type deduction fails: $t incompatible to $t"
+#define sem_err_typededuce_recognize "type deduction fails: un-recognizable type $t"
+#define sem_err_typededuce_type "type deduction fails: free template type arg $r"
+#define sem_err_typededuce_const "type deduction fails: free template non-type arg $r"
+#define sem_err_typename_not_found "type deduction failed: typename $b not found\n"
+#define sem_err_template_ambiguous "Ambiguous class/function templates"
+#define sem_err_non_type_arg_linkage "extern linkage expected for template argument $b"
+#define sem_err_non_type_arg_value "illegal non-type template arg $e"
+#define sem_err_template_arg_linkage "template type arg $t must have extern linkage"
+#define sem_err_call_dependency "call to $e not dependent on template args to $c"
+#define sem_err_type_arg_expected "template type arg expected"
+#define sem_err_typeclash_1 "type $m is inconsistent with $m"
+#define sem_err_typeclash_2 "template type expected, found $e"
+#define sem_err_typeclash_3 "template type inconsistent with $t"
+#define sem_err_lvalue_needed "temporary required for template argument"
+#define sem_err_dotdotdot_handler_not_last "handler for '...' must come last"
+#define sem_rerr_template_formal_length_class \
+        "number of template formals for $c differs from a previous declaration"
+#define sem_rerr_template_formal_length_function \
+        "number of template formals for $b differs from a previous declaration"
+#define sem_rerr_template_formal_type "template formal type $t inconsistent with $t"
 
 #define vargen_err_long_string "string initialiser longer than %s [%ld]"
 #define vargen_err_nonstatic_addr \
@@ -240,6 +291,7 @@
 #define lex_rerr_empty_char "no chars in character constant ''"
 #define lex_rerr_overlong_char "more than 4 chars in character constant"
 
+#define syn_rerr_qualified_void "Return type may not be a void type other than 'void'"
 #define syn_rerr_array_0 "array [0] found"
 #ifdef EXTENSION_VALOF
 #define syn_rerr_void_valof "void valof blocks are not permitted"
@@ -248,12 +300,15 @@
 #define syn_rerr_undeclared_fn "undeclared name, inventing 'extern \"C\" int %s(...);'"
 #define syn_rerr_insert_parens \
         "parentheses (..) inserted around expression following $s"
-#define syn_rerr_return "return <expr> illegal for void function"
+#define syn_rerr_return_expr_void "return <expr> illegal for void function"
+#define syn_rerr_return_expr_ctor "return <expr> illegal for constructor"
+#define syn_rerr_return_expr_dtor "return <expr> illegal for destructor"
 #define syn_rerr_qualified_typedef(_b,_m) \
         "$m typedef $b has $m re-specified", _m, _b, _m
 #define syn_rerr_no_quals_allowed \
         "only non-static member functions can be const or volatile"
 #define syn_rerr_missing_type "missing type specification - 'int' assumed"
+#define syn_rerr_missing_type_for "missing type specification for $r - 'int' assumed"
 #define syn_rerr_long_float "ANSI C does not support 'long float'"
 #define syn_rerr_missing_type1 \
         "omitted <type> before formal declarator - 'int' assumed"
@@ -279,7 +334,8 @@
 #define syn_rerr_ANSIbitfield "ANSI C forbids bit field type $t"
 #define syn_rerr_missing_formal "formal name missing in function definition"
 #define syn_rerr_ineffective "declaration with no effect"
-#define syn_rerr_duplicate_member(sv,_b) "duplicate member $r of $c", sv, _b
+#define syn_rerr_duplicate_member(b) "duplicate member $b", b
+#define syn_rerr_duplicate_member2(cl, sv) "duplicate member $p$r", cl, sv
 #define syn_rerr_semicolon_in_arglist \
         "',' (not ';') separates formal parameters"
 #define syn_rerr_no_members "$c has no members"
@@ -287,15 +343,24 @@
 #define syn_rerr_badly_placed_access \
     "access declarations only in public and protected parts"
 #define syn_rerr_modify_access "base access rights cannot be altered"
-#define syn_rerr_illegal_type "illegal type for $r"
+#define xsyn_rerr_bad_conv "illegal conversion $p$r"
+#define xsyn_rerr_zero_params "$p$r must have zero parameters"
+#define xsyn_rerr_non_memfn_operator "$p$r must be a non-static member function"
+#define xsyn_rerr_no_return_type_allowed "no return type allowed for $p$r"
+#define xsyn_rerr_must_be_function "$p$r must be a function"
 #define syn_rerr_jump_past_init "jump past initialisation for $b"
 #define syn_rerr_ambiguous_qualification "$r is ambiguously qualified"
 #define syn_rerr_abstract_class_member(_b,_s) \
         "abstract $c member: $r", _b, _s
 #define syn_rerr_abstract_class_object(_b,_s) \
         "abstract $c object: $r", _b, _s
+#define syn_rerr_opaque_class_member(_b,_s) \
+        "opaque $c member: $r", _b, _s
+#define syn_rerr_opaque_class_object(_b,_s) \
+        "opaque $c object: $r", _b, _s
 #define syn_rerr_insert_braces "inserting { } around command after $s"
-#define syn_rerr_not_decl_packed "Definition of tag $r not __packed: qualifier ignored"
+#define syn_rerr_not_decl_qual(tb,s) \
+        "Definition of $c not $s: qualifier ignored", tb, s
 #define syn_rerr_ignored_non_fn "$g ignored for non-function $r"
 #define syn_rerr_global_anon_union "global anonymous union must be static"
 #define syn_rerr_defaults_ordering "defaulted parameter $r followed by non-defaulted"
@@ -309,19 +374,23 @@
 #define syn_rerr_superfluous_access_adjuster \
         "superfluous type for access adjuster, declaration ignored"
 #define syn_rerr_private_bmember_ignored "private overloaded base member ignored"
-#define syn_rerr_local_default "auto variable being referenced"
-#define syn_rerr_declaree_out_of_scope "$b::$q cannot be declared here"
+#define syn_rerr_local_default "$b has auto storage"
+#define syn_rerr_declaree_out_of_scope "'$#b::$#r' cannot be declared here"
 #define syn_rerr_friend_class_not_definable "friend $c shall not be defined"
 #define syn_rerr_expect_dtor "expecting destructor for $c, found $r"
 #define syn_rerr_union_w_base "unions may not have bases"
 #define syn_rerr_meminit_wrong_args \
    "too few/many arguments to initialiser for simple member $b"
-#define syn_rerr_ref_not_initialised "reference $r must be initialised"
-#define syn_rerr_const_not_initialised "constant $r must be initialised"
+#define syn_rerr_ref_not_initialised "reference $b must be initialised"
+#define syn_rerr_const_not_initialised "constant $b must be initialised"
 #define syn_rerr_addrof_cdtor_taken "can't take address of constructor or destructor"
 #define syn_rerr_multi_convfn_bool \
     "ambiguous %d-way choice of conversion from $c in Boolean context"
 #define syn_rerr_tagdef_in_formals "cannot define within formals: $c"
+#define syn_rerr_neg_unsigned_enum "$c cannot have both negative and unsigned enumerators"
+#define xsyn_rerr_instantiate_mixup "instantiate don't mix with template or specialization"
+#define xsyn_rerr_spurious_instantiate "too many instantiate request"
+#define syn_rerr_extra_template_actuals "extra template actual(s) ignored"
 
 /* Split for the NLS */
 #define syn_moan_hashif_nonconst "illegal in #if <expression>: <unknown>"
@@ -339,6 +408,10 @@
 
 #define syn_moan_hashif "#if <expression>"
 #define syn_moan_case "case expression (ignored)"
+#define xsyn_constructor_string "constructor"
+#define xsyn_copy_constructor_string "copy constructor"
+#define xsyn_destructor_string "destructor"
+#define xsyn_copy_assign_string "copy assignment"
 
 #endif                          /* Under NLS these are not tags */
 

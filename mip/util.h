@@ -1,12 +1,13 @@
 /*
  * C compiler file util.h, version 0.02
  * Copyright (C) Codemist Ltd., 1987.
+ * SPDX-Licence-Identifier: Apache-2.0
  */
 
 /*
- * RCS $Revision: 1.3 $
- * Checkin $Date: 1993/10/07 17:43:38 $
- * Revising $Author: irickard $
+ * RCS $Revision$
+ * Checkin $Date$
+ * Revising $Author$
  */
 
 #ifndef _util_LOADED

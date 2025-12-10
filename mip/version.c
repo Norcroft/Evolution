@@ -2,13 +2,14 @@
  * Copyright (C) Acorn Computers Ltd., 1988-1990.
  * Copyright (C) Advanced RISC Machines Limited, 1991-1992.
  * Copyright (C) Codemist Ltd, 1987-1994.
+ * SPDX-Licence-Identifier: Apache-2.0
  * Defines the version string and banner for the Codemist or OEM compiler.
  */
 
 /*
- * RCS $Revision: 1.7 $
- * Checkin $Date: 1994/02/07 16:02:00 $
- * Revising $Author: hmeekings $
+ * RCS $Revision$
+ * Checkin $Date$
+ * Revising $Author$
  */
 
 #ifdef __STDC__

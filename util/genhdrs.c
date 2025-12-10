@@ -1,19 +1,20 @@
-/* 
+/*
  * C compiler support file genhdrs.c
  * Copyright (C) Codemist Limited, 1987, 1989.
  * Copyright (C) Acorn Computers Limited., 1988
  * Copyright (C) Advanced RISC Machines Limited 1992-93.
+ * SPDX-Licence-Identifier: Apache-2.0
  * All rights reserved.
  */
 
 /*
- * RCS $Revision: 1.14 $
- * Checkin $Date: 1995/11/05 21:52:59 $
- * Revising $Author: sdouglas $
+ * RCS $Revision$
+ * Checkin $Date$
+ * Revising $Author$
  */
 
 /*
- * This file is a program that is run in order to create a file called 
+ * This file is a program that is run in order to create a file called
  * headers.c which is part of the source of the compiler.  It also creates
  * errors.h.  To do its work it needs prototype files miperrs.h, feerrs.h &
  * mcerrs.h, and access to directories containing the standard headers,
@@ -71,13 +72,13 @@
  * DEC Unix (OSF) cc can be used with the -xtaso-short compiler option
  * to force pointers to be 32-bit.
  */
-#if defined(__alpha) && defined(__osf__) 
-#pragma pointer_size (save) 
-#pragma pointer_size (long) 
+#if defined(__alpha) && defined(__osf__)
+#pragma pointer_size (save)
+#pragma pointer_size (long)
 #endif
-typedef char *ArgvType; 
-#if defined(__alpha) && defined(__osf__) 
-#pragma pointer_size (restore) 
+typedef char *ArgvType;
+#if defined(__alpha) && defined(__osf__)
+#pragma pointer_size (restore)
 #endif
 
 #define  MAXPATHS        40
@@ -525,7 +526,7 @@ static void scan_msg_file(FILE *fq)
             case 'x': case 'X':
             case '0':   fprintf(stderr,
                                 "Bad escape found in header prototype\n");
-            
+
             default:
                         break;
                     }
@@ -634,7 +635,7 @@ static void copy_msg_file(FILE *fe, FILE *fq, FILE *ft)
             case 'x': case 'X':
             case '0':   fprintf(stderr,
                         "%s: Bad escape found in header prototype\n", SELF);
-            
+
             default:
                         putc('\\', fe), efilecol++;
                         if (ft != NULL)
@@ -652,7 +653,7 @@ static void copy_msg_file(FILE *fe, FILE *fq, FILE *ft)
             putc(ch, ft), tfilecol++;
         if (ch == '\n')
             efilecol = tfilecol = 0;
-        else 
+        else
             efilecol++;
         if (state == STREND)
         {   state = NORMAL;
@@ -678,7 +679,7 @@ static int make_headers(char *headers, int argc, ArgvType *argv, char *viafile)
 
     fprintf(stderr, "%s: Creating %s...\n", SELF, headers);
 
-    {   time_t t0 = time(NULL);                 
+    {   time_t t0 = time(NULL);
         struct tm *tm = localtime(&t0);
         fprintf(fh, "/*\n");
         fprintf(fh, " * Copyright (C) Advanced RISC Machines Limited and\n");
@@ -710,7 +711,7 @@ static int make_headers(char *headers, int argc, ArgvType *argv, char *viafile)
         {   arg = argv[j];
             if (arg[0] == '-')
             {   int flag;
-                if (arg[2] == 0 && 
+                if (arg[2] == 0 &&
                     (flag = tolower(arg[1])) != 'n' && flag != 's') ++j;
                continue;
             }
@@ -841,7 +842,7 @@ static int make_messages(char *messages, int squeeze_msgs, char *text)
         charpoint = stringcount = 0;
     }
 
-    {   time_t t0 = time(NULL);                 
+    {   time_t t0 = time(NULL);
         struct tm *tm = localtime(&t0);
         fprintf(fe, "/*\n");
         fprintf(fe, " * Copyright (C) Advanced RISC Machines Limited and\n");
@@ -1020,7 +1021,7 @@ int main(int argc, ArgvType *argv)
  */
     case 'q':
     case 'Q':   if (npaths >= MAXPATHS)
-                { 
+                {
                     fprintf(stderr,
                         "%s: Too many paths - only %u allowed\n",
                         SELF, MAXPATHS);
@@ -1045,7 +1046,7 @@ int main(int argc, ArgvType *argv)
     case 'u':
     case 'U':   safe_compress = 0;
                 break;
-default:        
+default:
                 fprintf(stderr, "%s: Unknown option %s\n", SELF, arg);
                 ++nerrors;
                 break;

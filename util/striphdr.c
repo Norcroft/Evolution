@@ -1,13 +1,14 @@
 /*
- * RCS $Revision: 1.1 $
- * Checkin $Date: 1991/04/24 11:59:51 $
- * Revising $Author: plg $
+ * RCS $Revision$
+ * Checkin $Date$
+ * Revising $Author$
  */
 
-/* 
+/*
  * C compiler support file StripHdrs.c
  * Copyright (C) Codemist Ltd, 1987.
  * Copyright (C) Acorn Computers Ltd., 1988
+ * SPDX-Licence-Identifier: Apache-2.0
  */
 
 #include <stdio.h>
@@ -111,7 +112,7 @@ char *name;
  * Copyright (C) Acorn Computers Ltd., %s\n\
  * Copyright (C) Codemist Ltd., %s\n\
  */\n",
-        name, year, year);  
+        name, year, year);
 
     lastchar = '\n';
 

@@ -2,6 +2,7 @@
 /*   loosely taken from Unix sysV operating system programmer's guide.  */
 /* version 1d.                                                          */
 /* Copyright (C) Codemist Ltd, 1988, 1991.                              */
+/* SPDX-Licence-Identifier: Apache-2.0                                  */
 /* MIPS parts: (C) Copyright 1984 by Third Eye Software, Inc.           */
 /*   Third Eye Software, Inc. grants reproduction and use rights to     */
 /*   all parties, PROVIDED that this comment is maintained in the copy. */

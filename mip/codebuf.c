@@ -3,12 +3,13 @@
  * Copyright (C) Codemist Ltd, 1988-1992.
  * Copyright (C) Acorn Computers Ltd., 1988-1990.
  * Copyright (C) Advanced RISC Machines Limited, 1990-1992.
+ * SPDX-Licence-Identifier: Apache-2.0
  */
 
 /*
- * RCS $Revision: 1.37 $ Codemist 30
- * Checkin $Date: 1996/01/10 14:54:23 $
- * Revising $Author: hmeeking $
+ * RCS $Revision$ Codemist 30
+ * Checkin $Date$
+ * Revising $Author$
  */
 
 /* Memo to AM: 1. tidy up mustlitby interface (only arm uses so far).      */
@@ -51,15 +52,16 @@
 #  include "compiler.h"
 #endif
 
-DataDesc data, *datap;
+static DataDesc data, *datap, extable, exhandler;
 #ifdef CONST_DATA_IN_CODE
-DataDesc constdata;         /* ensure not used by accident                */
+static DataDesc constdata;         /* ensure not used by accident                */
 #endif
+
+ExceptionEnv *currentExceptionEnv;
 
 int32 code_area_idx;        /* exported for armcc -S -ZO ... */
 
 static bool codebuf_inroutine;
-static bool end_of_fn;
 
 /* codeloc and codeseg_flush added by AM (to old emit.c),
    *** probably in a silly position ***
@@ -96,6 +98,154 @@ static int32 next_label_name;
 LabList *asm_lablist;         /* @@@ This is not really part of codebuf */
                               /* One day it might join obj_symref in    */
                               /* here as "gen/obj/asm support.          */
+
+/* For the sake of a cleaner separation between the FE and the BE       */
+DataInit *get_datadesc_ht(bool head)
+{   return (head) ? datap->head : datap->tail;
+}
+
+void set_datadesc_ht(bool head, DataInit *val)
+{   if (head) datap->head = val; else datap->tail = val;
+}
+
+int32 get_datadesc_size(void)
+{   return datap->size;
+}
+
+void set_datadesc_size(int32 val)
+{   datap->size = val;
+}
+
+DataXref *get_datadesc_xrefs(void)
+{   return datap->xrefs;
+}
+
+void set_datadesc_xrefs(DataXref *val)
+{   datap->xrefs = val;
+}
+
+int get_datadesc_xrarea(void)
+{   return datap->xrarea;
+}
+
+void set_datadesc_xrarea(int val)
+{   datap->xrarea = val;
+}
+
+DataDesc *get_datadesc(void)
+{   return datap;
+}
+
+void copy_datadesc(DataDesc *dest)
+{   *dest = data;
+}
+
+void restore_datadesc(DataDesc *src)
+{   data = *src;
+}
+
+int32 data_size(void)
+{   return data.size;
+}
+
+DataInit *data_head(void)
+{   return data.head;
+}
+
+DataXref *data_xrefs(void)
+{   return data.xrefs;
+}
+
+DataInit *get_extable_ht(bool head)
+{   return (head) ? extable.head : extable.tail;
+}
+
+void set_extable_ht(bool head, DataInit *val)
+{   if (head) extable.head = val; else extable.tail = val;
+}
+
+void set_extable_size(int32 val)
+{   extable.size = val;
+}
+
+int32 extable_size(void)
+{   return extable.size;
+}
+
+DataInit *extable_head(void)
+{   return extable.head;
+}
+
+DataXref *extable_xrefs(void)
+{   return extable.xrefs;
+}
+
+bool is_extable(void)
+{   return (datap == &extable);
+}
+
+DataInit *get_exhandler_ht(bool head)
+{   return (head) ? exhandler.head : exhandler.tail;
+}
+
+void set_exhandler_ht(bool head, DataInit *val)
+{   if (head) exhandler.head = val; else exhandler.tail = val;
+}
+
+void set_exhandler_size(int32 val)
+{   exhandler.size = val;
+}
+
+int32 exhandler_size(void)
+{   return exhandler.size;
+}
+
+DataInit *exhandler_head(void)
+{   return exhandler.head;
+}
+
+DataXref *exhandler_xrefs(void)
+{   return exhandler.xrefs;
+}
+
+bool is_exhandler(void)
+{   return (datap == &exhandler);
+}
+
+#ifdef CONST_DATA_IN_CODE
+int32 constdata_size(void)
+{   return constdata.size;
+}
+
+DataInit *constdata_head(void)
+{   return constdata.head;
+}
+
+DataXref *constdata_xrefs(void)
+{   return constdata.xrefs;
+}
+
+bool is_constdata(void)
+{   return (datap == &constdata);
+}
+
+DataAreaSort SetDataArea(DataAreaSort sort) {
+    DataAreaSort oldsort = is_constdata() ? DS_Const : DS_ReadWrite;
+    if (sort == DS_Const)
+        datap = &constdata;
+    else if (sort == DS_ReadWrite)
+        datap = &data;
+    return oldsort;
+}
+
+#else
+
+DataAreaSort SetDataArea(DataAreaSort sort) {
+    datap = &data;
+    return DS_ReadWrite;
+}
+
+#endif
 
 /* obj/asm calls totargetsex() to get host word (as used internally     */
 /* in the compiler) into target sex for asm output or object file.      */
@@ -144,6 +294,8 @@ case LIT_ADCON:
 case LIT_FPNUM:
 case LIT_FPNUM1:
 case LIT_FPNUM2:
+case LIT_INT64_1:
+case LIT_INT64_2:
                 return w;
     }
 }
@@ -202,12 +354,12 @@ void gendcI_a(int32 len, int32 val, bool aligned)
                            else gendcI(4, 0), gendcI(4, val);
         return;
     }
+    if (datap->wpos & (len-1)) vg_wflush();
     if ((len != 1 && len != 2 && len != 4) ||
         (aligned && (datap->wpos & len-1 & alignof_int-1)))
         /* check consistent - includes integral alignment */
         syserr(syserr_gendcI, (long)len, (long)datap->wpos);
 
-    if (datap->wpos & (len-1)) vg_wflush();
 
     switch (len)
     {   case 1: datap->wbuff.w8[datap->wpos] = (unsigned8)val; break;
@@ -247,88 +399,12 @@ void gendcE(int32 len, FloatCon *val)
     datap->size += len;
 }
 
-typedef struct StringCache { struct StringCache *next;
-                             int32 constsegoff;
-                             int32 len; 
-                             char str[1];
-                   } StringCache;
-
-static StringCache *scache = NULL;
-
-static int32 cachestring(StringSegList *p)
-{   int32 size = stringlength(p)+4 & ~3;
-    StringCache *x, *scnew = GlobAlloc(SU_Data,
-                                       offsetof(StringCache, str) + size);
-    int32 planted = 0;
-    StringSegList *px;
-    for (px = p; px != 0; px = px->strsegcdr)
-    {   unsigned char *s = (unsigned char *)px->strsegbase;
-        int32 n = px->strseglen;
-        while (n-- > 0) scnew->str[planted++] = *s++;
-    }
-    do scnew->str[planted++] = 0; while (planted & 3);
-    scnew->len = size;
-    for (x = scache; x != NULL; x = x->next)
-    {   if (size <= x->len && memcmp(x->str, scnew->str, size) == 0)
-          return x->constsegoff;
-    }
-    scnew->constsegoff = constdata.size;
-    scnew->next = scache;
-    scache = scnew;
-    if (debugging(DEBUG_DATA))
-        cc_msg("new string %p size %d planted = %d '%s...' @ 0x%.6x\n",
-               scnew,
-               offsetof(StringCache, str) + size, planted,
-               scnew->str, scnew->constsegoff);
-    return -1;
-}
-
-Binder *gendcSlit(StringSegList *s)
-{   Binder *b;
-    b = genlitbinder(te_char);
-#ifdef CONST_DATA_IN_CODE
-    if (!(feature & FEATURE_WR_STR_LITS))
-    {   int32 loc = cachestring(s);
-        binduses_(b) |= u_constdata;         /* @@@ nasty */
-        if (loc != -1)
-        {   if (debugging(DEBUG_DATA))
-                cc_msg("sharing string '%.20s...' @ 0x%.6x\n",
-                       s->strsegbase, loc);
-            bindaddr_(b) = loc;
-            datap = &vardata;
-            return b;
-        }
-    }
-#endif
-    gendlabel(b, lit_keepname(b),
-#ifdef CONST_DATA_IN_CODE
-                    !(feature & FEATURE_WR_STR_LITS) ? &constdata :
-#endif
-                                                       &vardata);
-/* The following two lines don't work for 'long' widestrings ...          */
-/* ... fails if sizeof_wchar>sizeof_int && sizeof_wchar>alignof_toplevel. */
-    vg_genstring(s, stringlength(s)+1, 0);
-/* It has been important to post-align after vg_genstring in case         */
-/* following data is generated unlabelled.  Maybe less so now.            */
-/* It also plays its part in optimising string constants to word          */
-/* boundaries which improves performance on many machines (not just RISC) */
-    padstatic(alignof_toplevel_static);
-    datap = &vardata;                               /* not really tidy */
-    return b;
-}
-
 #ifdef TARGET_CALL_USES_DESCRIPTOR
 void gendcF(Symstr *sv, int32 offset)
 {   /* (possibly external) function name + (illegal) offset */
     if (offset != 0) cc_err(vargen_err_badinit, sv, offset);
     (void)obj_symref(sv, xr_code, 0);
-#ifdef TARGET_IS_ACW
-    datap->xrefs = (DataXref *) global_list3(SU_Xref, datap->xrefs,
-                 datap->size | ((assembler_call) ? X_sysname : 0),
-                 sv);
-#else /* TARGET_IS_ACW */
     datap->xrefs = (DataXref *) global_list3(SU_Xref, datap->xrefs, datap->size, sv);
-#endif /* TARGET_IS_ACW */
     vg_wflush();                /* only if sizeof_ptr == 2 */
     adddata(0, 1, LIT_FNCON, (int32)sv, offset);
     if (debugging(DEBUG_DATA))
@@ -363,13 +439,7 @@ void gendcAX(Symstr *sv, int32 offset, int xrflavour)
 #endif
     if (sizeof_ptr == 8 && !target_lsbytefirst) gendcI(4, 0);
 
-#ifdef TARGET_IS_ACW
-    datap->xrefs = (DataXref *) global_list3(SU_Xref, datap->xrefs,
-                 datap->size | ((assembler_call) ? X_sysname : 0),
-                 sv);
-#else /* TARGET_IS_ACW */
     datap->xrefs = (DataXref *) global_list3(SU_Xref, datap->xrefs, datap->size, sv);
-#endif /* TARGET_IS_ACW */
     vg_wflush();                /* only if sizeof_ptr == 2 */
     adddata(0, 1, LIT_ADCON, (IPtr)sv, offset);
     if (debugging(DEBUG_DATA))
@@ -422,8 +492,9 @@ void padstatic(int32 align)
 void labeldata(Symstr *s)
 {
     vg_wflush();                /* only if sizeof_ptr == 2 */
-    if (asmstream) /* nasty space-saving hack */
-        adddata1((DataInit *)global_list3(SU_Data, (DataInit *)0, s, LIT_LABEL));
+    if (asmstream != NULL       /* nasty space-saving hack */
+        && s != NULL)           /* labeldata(NULL) provides access to vg_wflush() externally */
+        adddata1((DataInit *)global_list5(SU_Data, (DataInit *)0, s, LIT_LABEL, 0, 0));
 }
 
 /* The following procedure is used to delete trailing zeros in
@@ -476,10 +547,6 @@ void show_code(Symstr *name)
         {   maxprocsize = codep;
             maxprocname = symname_(name);
         }
-        if (codebuf_inroutine && name==currentfunction.symstr)
-            end_of_fn = YES;
-        else
-            end_of_fn = NO;
     }
     codebase += codep;
     codep = 0;               /* for static init by string constants */
@@ -491,7 +558,6 @@ LabelNumber *nextlabel(void)
     w->block = (BlockHead *) DUFF_ADDR;  /* unset label - illegal ptr */
     w->u.frefs = NULL;             /* no forward refs yet              */
     w->name = next_label_name++;   /* name + union discriminator for u */
-    w->lndraft = 0x7fffffff;
     return w;
 }
 
@@ -617,23 +683,8 @@ static void dumplits_inner(void)
     {   LitPoolEntry *p = &litpool_(i);
         int32 f = p->type;
         poolentry_(q, i) = *p;
-#ifdef TARGET_IS_ACW  /* was TARGET_HAS_BYTE_INSTRUCTIONS ...  */
-                      /* but syserr below would kill 80386 etc */
-        if ((f & ~(int32)3) == LIT_STRING)      /* special ACW use */
-        {   /* WGD 20-8-87 */
-            int32 j, wlen = f & 3;
-            char *s = (char *)&(p->val);  /* transsex compilation worry */
-            for (j = 0; j <= wlen; j++) outbytef(s[j], LITB_CHAR);
-            for (; j < 4; j++) outbytef(0, LITB_PROVIGN);
-        }
-        else
-            syserr(syserr_nonstring_lit, (long)f);
-#else
 
         if (f == LIT_ADCON || f == LIT_FNCON)
-#ifdef TARGET_IS_HELIOS
-            syserr(syserr_addr_lit);
-#else
 /* Note that xref list entries of type X_backaddrlit have an extra word  */
 /* that indicates a numeric offset relative to the named symbol. This    */
 /* field should ONLY be relevant when scanning to see if an existing     */
@@ -651,7 +702,6 @@ static void dumplits_inner(void)
 #endif
                 (void)obj_symref(p->xref, xr_data, 0);
         }
-#endif  /* TARGET_IS_HELIOS */
 #if defined(TARGET_IS_ARM) || defined(TARGET_IS_THUMB)
         if (f != LIT_STRING) {
             outcodewordaux(p->val, f, p->litaux);
@@ -683,7 +733,6 @@ static void dumplits_inner(void)
         /* transfer relocation info (if any) to the planted literal */
         outcodewordaux(p->val, f, p->litaux);
 #endif
-#endif
     }
     litpoolp = 0;
     localcg_newliteralpool();
@@ -707,7 +756,7 @@ static void dumplits0(void)
     /* ECN: Change | to + as codebase need not be aligned */
     if ((codebase+codep) & 3) syserr(syserr_dumplits);
     while (codebase+codep & litalign-1) outcodeword(0, LIT_NUMBER);
-    if (litlab->u.frefs != NULL) setlabel(litlab);
+    setlabel(litlab);
     dumplits_inner();
     litlab = nextlabel();
 }
@@ -727,9 +776,6 @@ void dumplits2(bool needsjump)
     }
     else
     {
-#ifdef TARGET_IS_MIPS
-        if (litpoolp != 0) dumplits0();     /* FIXME: temp */
-#else
         if (litlab->u.frefs == NULL)
         {   if (litpoolp != 0) syserr(syserr_dumplits2);
         }
@@ -737,7 +783,6 @@ void dumplits2(bool needsjump)
             localcg_newliteralpool();
             dumplits0();
         }
-#endif
     }
 }
 
@@ -840,8 +885,11 @@ int32 lit_findwordsincurpool(int32 w[], int32 count, int32 flavour)
     for (i=0; i<litpoolp; i++) {
         for (j = 0 ; (i+j) < litpoolp ; j++) {
             LitPoolEntry *p = &litpool_(i+j);
-            int32 f = ((flavour==LIT_FPNUM && count==2) ?
-                           (j==0 ? LIT_FPNUM1 : LIT_FPNUM2) : flavour);
+            int32 f = ((flavour==LIT_FPNUM && count==2)
+                         ? (j==0 ? LIT_FPNUM1 : LIT_FPNUM2) :
+                       (flavour == LIT_INT64_1 && count == 2 && j == 1)
+                         ? LIT_INT64_2 :
+                           flavour);
             if (!(p->type == f && p->val == w[j] && p->xref == NULL))
                 break;
             if (j == count-1)
@@ -874,8 +922,11 @@ int32 lit_findwordsinprevpools(int32 w[], int32 count, int32 flavour,
             int32 j;
             for (j = 0 ; (i+j) < size ; j++) {
                 LitPoolEntry *p = &poolentry_(q, i+j);
-                int32 f = ((flavour==LIT_FPNUM && count==2) ?
-                               (j==0 ? LIT_FPNUM1 : LIT_FPNUM2) : flavour);
+                int32 f = ((flavour==LIT_FPNUM && count==2)
+                             ? (j==0 ? LIT_FPNUM1 : LIT_FPNUM2) :
+                           (flavour == LIT_INT64_1 && count == 2 && j == 1)
+                             ? LIT_INT64_2 :
+                               flavour);
                 if (!(p->type == f && p->val == w[j] && p->xref == NULL))
                     break;
                 if (j == count-1) return poolbase_(q)+4*i;
@@ -975,13 +1026,7 @@ void codeseg_stringsegs(StringSegList *x, bool incode)
     for ( ; ; ) {
         int32 n;
         int32 w = nextstringword(&x, &i, &n);
-#ifdef TARGET_IS_ACW
-/* @@@ This code is rather vestigial, and has not been fixed to take    */
-/* account of LIT_STRING with flags to say where the end is.            */
-#  define lit_strnbytes(n) LIT_STRING+n
-#else
-#  define lit_strnbytes(n) LIT_STRING
-#endif
+#define lit_strnbytes(n) LIT_STRING
         if (x == NULL) {
             outlitword(w, lit_strnbytes(n), 0, 0, litf | LITF_LAST);
             return;
@@ -1003,16 +1048,6 @@ void codeseg_flush(Symstr *strlitname)
 /* One day the nargwords argument may be sensibly the function type info */
 int32 codeseg_function_name(Symstr *name, int32 nargwords)
 {      int32 result = codebase;
-#ifdef TARGET_IS_ACW
-                char *sname = symname_(name);
-                int32 q, length = strlen(sname);
-                int32 magic = FUNMAGIC>>8 & 0x00FFFFFF | length<<24;
-                for (q=0; q < length; q++) outbytef(sname[q], LITB_CHAR);
-/* end string with number of args (set in cg.c) instead of usual null */
-                outbytef(nargwords, LITB_CHAR);
-                for (q=0; q<32; q += 8) outbytef(magic>>q, LITB_HEX);
-                show_code(NULL);
-#else /* TARGET_IS_ACW */
     char *sname = symname_(name);
     union { char c[4]; int32 i; } w;
     int32 p, length;
@@ -1034,27 +1069,8 @@ int32 codeseg_function_name(Symstr *name, int32 nargwords)
  */
     outcodeword(0xff000000 | (length + 4), LIT_NUMBER);
 #endif
-#ifdef TARGET_IS_CLIPPER
-/*
- * This magic bit-pattern is used by Clipper _mapstore() etc and helps
- * the system when interpreting code-images.  On some other machines the
- * first few bytes of a full function entry are sufficiently distinctive
- * that this sort of thing is not needed.
- */
-    if (profile_option) outcodeword(0xb6050000, LIT_NUMBER);
-#endif
-#ifdef TARGET_IS_SPARC
-/*
- * This magic bit-pattern is used by SPARC _mapstore() etc and helps
- * the system when interpreting code-images.  On some other machines the
- * first few bytes of a full function entry are sufficiently distinctive
- * that this sort of thing is not needed.
- */
-    if (profile_option) outcodeword(0x000fbace, LIT_NUMBER);
-#endif
     show_code(NULL);
     IGNORE(nargwords);
-#endif /* TARGET_IS_ACW */
     return result;
 }
 
@@ -1085,6 +1101,7 @@ int32 addbsssym(Symstr *sym, int32 size, int32 align, bool statik, bool local)
         int32 offset;
         if (bss_size == 0)
             obj_symref(bindsym_(bsssegment), xr_bss+xr_defloc, 0);
+        obj_symref(sym, xr_bss+(statik ? xr_defloc : xr_defext), bss_size);
         padbss(align);
         offset = bss_size;
         endbssobject(size);
@@ -1098,44 +1115,6 @@ int32 addbsssym(Symstr *sym, int32 size, int32 align, bool statik, bool local)
 }
 
 #endif
-
-void gendlabel(Binder *b, bool topflag, DataDesc *seg)
-{
-    datap = seg;
-    padstatic(alignoftype(bindtype_(b)));
-    if (debugging(DEBUG_DATA))
-        cc_msg("%.6lx: %s%s\n", (long)datap->size, topflag ? "":"; ",
-               symname_(bindsym_(b)));
-    if (!(seg->xrarea & xr_constdata) != !(binduses_(b) & u_constdata) ||
-        !(seg->xrarea & xr_bss) != !(binduses_(b) & u_bss) ||
-#ifdef TARGET_IS_NEC
-        !(seg->xrarea & xr_zeropage2) != !(binduses_(b) & u_zeropage2) ||
-#endif
-#ifdef REL193_HACK
-        0)
-#else
-        !(seg->xrarea & xr_zeropage) != !(binduses_(b) & u_zeropage))
-#endif
-        syserr("segment confusion(%lx,%lx) $b", (long)binduses_(b),
-               (long)seg->xrarea, b);
-    bindaddr_(b) = datap->size;
-    if (topflag) /* note: names of local statics may clash but cannot be
-                    forward refs (except for fns which don't come here) */
-    {   labeldata(bindsym_(b));
-        (void)obj_symref(bindsym_(b),
-                   (bindstg_(b) & bitofstg_(s_extern) ? datap->xrarea+xr_defext :
-                                                        datap->xrarea+xr_defloc),
-                   datap->size);
-    }
-#ifdef TARGET_ASM_NAMES_LITERALS /* was TARGET_IS_XAP_OR_NEC */
-    else
-    {   Binder *topb = genlocalstaticbinder(bindsym_(b));
-        realbinder_(b) = topb;
-        bindstg_(b) |= b_pseudonym2;
-        gendlabel(topb, 1, datap);
-    }
-#endif
-}
 
 /* This has to be called before the front-end so that initialised     */
 /* statics (e.g. pointers to strings) can be put in the code segment. */
@@ -1178,7 +1157,7 @@ void codebuf_reinit(void)
     litalign = 4;
 #ifdef TARGET_HAS_MULTIPLE_CODE_AREAS
     if (codebase > 0 &&
-        (end_of_fn && (feature & FEATURE_AOF_AREA_PER_FN) ||
+        ((feature & FEATURE_AOF_AREA_PER_FN) ||
          (var_aof_code_area > code_area_idx)))
 #ifdef PUT_FILE_NAME_IN_AREA_NAME
     {   int32 n = var_aof_code_area;
@@ -1216,16 +1195,17 @@ void codebuf_reinit2(void)
     litlab = nextlabel();
 }
 
-#ifdef TARGET_ASM_NAMES_LITERALS
-#define genseglabel(name, seg)
-#else
-#define genseglabel(name, seg) gendlabel(name, 1, seg)
-#endif
-
 void codebuf_init(void)
 {
-    data.head = NULL; data.size = 0; data.xrefs = NULL; data.xrarea = xr_data;
+    data.head = NULL;  data.tail = NULL;
+    data.size = 0; data.xrefs = NULL; data.xrarea = xr_data;
     data.wpos = 0, data.wtype = 0, data.wbuff.w32[0] = 0;
+    extable.head = NULL; extable.size = 0;
+    extable.xrefs = NULL; extable.xrarea = xr_constdata;
+    extable.wpos = 0; extable.wtype = 0; extable.wbuff.w32[0] = 0;
+    exhandler.head = NULL; exhandler.size = 0;
+    exhandler.xrefs = NULL; exhandler.xrarea = xr_constdata;
+    exhandler.wpos = 0; exhandler.wtype = 0; exhandler.wbuff.w32[0] = 0;
 #ifdef CONST_DATA_IN_CODE
     constdata.head = NULL; constdata.size = 0;
     constdata.xrefs = NULL; constdata.xrarea = xr_constdata;
@@ -1235,10 +1215,6 @@ void codebuf_init(void)
 #ifdef TARGET_CALL_USES_DESCRIPTOR
     fnconlab = 0;                                  /* WGD 27-3-88 */
 #endif
-#ifdef CONST_DATA_IN_CODE
-    genseglabel(constdatasegment, &constdata);
-    datap = &data;
-#endif
 #ifdef TARGET_HAS_BSS
     bss_size = 0;
 #endif
@@ -1247,17 +1223,12 @@ void codebuf_init(void)
     codebuf_reinit();      /* in case mcdep_init() is wild */
     count_name_pointer = 0;
     prevpools = NULL;
-    end_of_fn = YES;
     code_area_idx = 1;
-    scache = NULL;
+    currentExceptionEnv = 0;
 }
 
 void codebuf_tidy(void)
 {
-#ifdef TARGET_IS_MIPS
-    codebuf_reinit2();
-    localcg_flush_literals();
-#endif
     if (debugging(DEBUG_STORE)) {
         cc_msg( "Code/data generated (%ld,%ld) bytes\n",
             (long)codeloc(), (long)data.size);

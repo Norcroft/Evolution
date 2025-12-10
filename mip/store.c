@@ -3,12 +3,13 @@
  * Copyright (C) Codemist Ltd., 1987-1992.
  * Copyright (C) Acorn Computers Ltd., 1988-1990.
  * Copyright (C) Advanced RISC Machines Limited, 1990-1992.
+ * SPDX-Licence-Identifier: Apache-2.0
  */
 
 /*
- * RCS $Revision: 1.11 $
- * Checkin $Date: 1995/07/06 14:40:35 $
- * Revising $Author: amycroft $
+ * RCS $Revision$
+ * Checkin $Date$
+ * Revising $Author$
  */
 
 #ifdef __STDC__
@@ -30,16 +31,28 @@ void ClearToNull(void **a, int32 n) {
   while (--n >= 0) a[n] = NULL;
 }
 
-#define STORE_TRASHING 0
-#define CHECKING_TRASH 0
 /* STORE_TRASHING and CHECKING_TRASH allow building a compiler that     */
 /* fills all allocations with trash, fills all disposed memory with     */
 /* trash and checks all allocations to make sure they still contain     */
 /* trash.  @@@ These are yet complete.  STORE_TRASHING works but does   */
-/* not trash memory freed by alloc_unmark and drop_local_store.  Also   */
-/* discard2 & discard3 trash their blocks in a different way.           */
+/* not trash memory lost when alloc_unmark and drop_local_store set     */
+/* {syn,bind}all{2,3} to NULL.  Also discard2 & discard3 trash their    */
+/* blocks in a different way.                                           */
 /* CHECKING_TRASH does not work because of the above problems with      */
-/* STORE_TRASHING                                                       */
+/* STORE_TRASHING.                                                      */
+/* WATCH_FOR adds code that watches in alloc_unmark and                 */
+/* drop_local_store for blocks being freed that a static varible,       */
+/* watch_for points into.                                               */
+
+#ifndef WATCH_FOR
+  #define WATCH_FOR 0
+#endif
+#ifndef STORE_TRASHING
+  #define STORE_TRASHING 0
+#endif
+#ifndef CHECKING_TRASH
+  #define CHECKING_TRASH 0
+#endif
 
 typedef struct AllocHeader AllocHeader;
 struct AllocHeader {
@@ -54,6 +67,18 @@ static AllocHeader *alloc_chain;    /* see alloc_init(), alloc_dispose() */
 static int32 stuse_total, stuse_waste;
 static int32 stuse[SU_Other-SU_Data+1];
 static int32 maxAEstore;
+
+#if WATCH_FOR
+static void* watch_for = 0; /* set from debugger; note: this isn't watched for by discard2, discard3 yet */
+static void check_watch_for(const char* base, unsigned32 size, const char* kind)
+{
+    if (watch_for != 0 && base <= (char*)watch_for &&
+        (char*)watch_for < (base + size))
+        syserr("Dropped %s containing %p\n", kind, watch_for);
+}
+#else
+#define check_watch_for(b,s,k) ((void)0)
+#endif
 
 #if STORE_TRASHING
 typedef struct Trasher Trasher;
@@ -75,14 +100,15 @@ static void trash_block(VoidStar p, unsigned32 size) {
 #if CHECKING_TRASH
 static void check_trashed(VoidStar p, unsigned32 size) {
     Trasher *t = (Trasher *)p;
+check_watch_for(p, size, "trashed block");
     while (sizeof(Trasher) < size)
     {
-        if (memcmp(t++, p, sizeof(Trasher)) != 0)
+        if (memcmp(t++, trash, sizeof(Trasher)) != 0)
             syserr("free memory has been altered somewhere between [%p and %p)\n",
                    t - 1, t);
         size -= sizeof(Trasher);
     }
-    if (memcmp(t, p, size) != 0)
+    if (memcmp(t, trash, size) != 0)
         syserr("free memory has been altered somewhere between [%p and %p)\n",
                t, (char*)t + size);
 }
@@ -94,7 +120,6 @@ static void check_trashed(VoidStar p, unsigned32 size) {
 #define trash_block(p, size) ((void)0)
 #define check_trashed(p, size) ((void)0)
 #endif
-
 
 static VoidStar cc_alloc(int32 n)
 {   AllocHeader *p;
@@ -121,7 +146,7 @@ static VoidStar cc_alloc(int32 n)
     return 0;   /* stop compiler wingeing re implicit junk return */
 }
 
-void alloc_dispose(void)
+void alloc_finalise(void)
 {
     unsigned32 count = 0;
     if (debugging(DEBUG_STORE)) cc_msg("Freeing block(s) at:");
@@ -136,13 +161,14 @@ void alloc_dispose(void)
     if (debugging(DEBUG_STORE)) cc_msg("\n");
 }
 
-typedef struct Mark {
+struct Mark {
     struct Mark *prev;
     int syn_segno;
     char *syn_allp; int32 syn_hwm;
     int bind_segno;
     char *bind_allp; int32 bind_hwm;
-} Mark;
+    bool unmarked;
+};
 
 static Mark *marklist;
 static Mark *freemarks;
@@ -152,7 +178,18 @@ typedef struct FreeList {
     int32 rest[1];
 } FreeList;
 
-static int     globallcnt;       /* count of segments allocated (int ok) */
+typedef struct OverlargeBlockHeader OverlargeBlockHeader;
+struct OverlargeBlockHeader {
+    OverlargeBlockHeader *next;
+    int32 size;
+};
+
+static char *permallp, *permalltop;
+
+static OverlargeBlockHeader *globoschain;
+static char    **globsegbase;    /* list of blocks of 'per file' store */
+static int32   *globsegsize;
+static int     globsegcnt;       /* count of segments allocated (int ok) */
 static int32   globallxtra;      /* oversize global store allocated.    */
 static char    *globallp;        /* pointers into symbol table          */
 static char    *globalltop;      /* end of symbol table                 */
@@ -182,62 +219,6 @@ static FreeList *bindall2;          /* and a dispose list */
 static FreeList *bindall3;
 
 char *phasename;
-
-static char *new_global_segment(void)
-{
-    char *w;
-/* I will recycle a segment that had been used for local space if there  */
-/* are any such available.                                               */
-    if (bindsegcur < bindsegcnt)
-    {   w = bindsegbase[--bindsegcnt];
-        if (debugging(DEBUG_STORE))
-            cc_msg("Global store %d from binder size %ld at %p\n",
-                    (int)globallcnt, (long)SEGSIZE, w);
-        check_trashed((VoidStar)w, SEGSIZE);
-    }
-    else
-    {   w = (char *)cc_alloc(SEGSIZE);
-        if (debugging(DEBUG_STORE))
-            cc_msg("Global store alloc %d size %ld at %p (in $r)\n",
-                    (int)globallcnt, (long)SEGSIZE, w, currentfunction.symstr);
-    }
-    globallcnt++;
-    globallp = w, globalltop = w + SEGSIZE;
-    return w;
-}
-
-/*
- * The value RR here is used when rounding store allocations up - it
- * is intended to ensure that this code runs properly when hosted on machines
- * where sizeof(char *) == 8.  Put a pad_to_hosttype() macro in util.h?
- */
-#define RR (sizeof(char *) - 1)
-
-VoidStar GlobAlloc(StoreUse t, int32 n)
-{   char *p = globallp;
-    n = (n + RR) & ~(int32)RR;          /* n = pad_to_hosttype(n, IPtr) */
-    if (n > SEGSIZE)
-    {   /* Big global store requests get a single oversize page.        */
-        p = (char *)cc_alloc(n);
-        if (debugging(DEBUG_STORE))
-            cc_msg("Global overlarge store alloc size %ld at %p (in $r)\n",
-                    (long)n, p, currentfunction.symstr);
-        globallxtra += n;               /* could update globallcnt?     */
-    }
-    else
-    {   if (p+n > globalltop)
-            stuse_waste += globalltop-p,
-            p = new_global_segment();
-        else
-            check_trashed(p, n);
-        globallp = p + n;
-    }
-    stuse[(int)t] += n;
-#ifndef ALLOC_DONT_CLEAR_MEMORY
-    memset(p, 0xbb, n);
-#endif
-    return p;
-}
 
 VoidStar xglobal_cons2(StoreUse t, IPtr a, IPtr b)
 {
@@ -282,7 +263,7 @@ VoidStar xglobal_list6(StoreUse t, IPtr a, IPtr b, IPtr c, IPtr d, IPtr e, IPtr 
 /* The argument sizes are in bytes and old is unexamined if oldsize=0.  */
 static VoidStar expand_array(VoidStar oldp, int32 oldsize, int32 newsize)
 {   /* beware the next line if we ever record GlobAlloc's:              */
-    VoidStar newp = GlobAlloc(SU_Other, newsize);
+    VoidStar newp = PermAlloc(newsize);
     if (oldsize != 0) memcpy(newp, oldp, (size_t)oldsize);
     trash_block(oldp, oldsize);
     return newp;
@@ -291,11 +272,120 @@ static VoidStar expand_array(VoidStar oldp, int32 oldsize, int32 newsize)
 static void expand_segmax(int newsegmax)
 {   int32 osize = (int32)segmax * sizeof(char *),
           nsize = (int32)newsegmax * sizeof(char *);
+    globsegsize = (int32 *)expand_array((VoidStar)globsegsize, osize, nsize);
+    globsegbase = (char **)expand_array((VoidStar)globsegbase, osize, nsize);
     synsegbase =  (char **)expand_array((VoidStar)synsegbase, osize, nsize);
     synsegptr  =  (char **)expand_array((VoidStar)synsegptr, osize, nsize);
     bindsegbase = (char **)expand_array((VoidStar)bindsegbase, osize, nsize);
     bindsegptr  = (char **)expand_array((VoidStar)bindsegptr, osize, nsize);
     segmax = newsegmax;
+}
+
+static char *new_perm_segment(void)
+{
+    char *w;
+/* I will recycle a segment that had been used for local space if there  */
+/* are any such available.                                               */
+    if (bindsegcur < bindsegcnt)
+    {   w = bindsegbase[--bindsegcnt];
+        if (debugging(DEBUG_STORE))
+            cc_msg("Permanent store %d from binder size %ld at %p\n",
+                    (int)globsegcnt, (long)SEGSIZE, w);
+        check_trashed((VoidStar)w, SEGSIZE);
+    }
+    else
+    {   w = (char *)cc_alloc(SEGSIZE);
+        if (debugging(DEBUG_STORE))
+            cc_msg("Permanent store alloc %d size %ld at %p (in $r)\n",
+                    (int)globsegcnt, (long)SEGSIZE, w, currentfunction.symstr);
+    }
+    permallp = w, permalltop = w + SEGSIZE;
+    return w;
+}
+
+/*
+ * The value RR here is used when rounding store allocations up - it
+ * is intended to ensure that this code runs properly when hosted on machines
+ * where sizeof(char *) == 8.  Put a pad_to_hosttype() macro in util.h?
+ */
+#define RR (sizeof(char *) - 1)
+
+VoidStar PermAlloc(int32 n)
+{   char *p = permallp;
+    n = (n + RR) & ~(int32)RR;          /* n = pad_to_hosttype(n, IPtr) */
+    if (n > SEGSIZE) syserr(syserr_overlarge_store1, (long)n);
+    if (p+n > permalltop)
+        stuse_waste += permalltop-p,
+        p = new_perm_segment();
+    else
+        check_trashed(p, n);
+    permallp = p + n;
+#ifndef ALLOC_DONT_CLEAR_MEMORY
+    memset(p, 0xbb, (size_t)n);
+#endif
+    return p;
+}
+
+static char *new_global_segment(void)
+{
+    char *w;
+    int32 size = SEGSIZE;
+/* I will recycle a segment that had been used for local space if there  */
+/* are any such available.                                               */
+    if (globsegcnt >= segmax) expand_segmax(segmax * SEGMAX_FACTOR);
+    if (globoschain != NULL)
+    {   w = (char *)globoschain;
+        size = globoschain->size;
+        globoschain = globoschain->next;
+        if (debugging(DEBUG_STORE))
+            cc_msg("Global store %d : reused size %ld at %p\n",
+                    (int)globsegcnt, (long)size, w);
+    }
+    else if (bindsegcur < bindsegcnt)
+    {   w = bindsegbase[--bindsegcnt];
+        if (debugging(DEBUG_STORE))
+            cc_msg("Global store %d from binder size %ld at %p\n",
+                    (int)globsegcnt, (long)SEGSIZE, w);
+        check_trashed((VoidStar)w, SEGSIZE);
+    }
+    else
+    {   w = (char *)cc_alloc(SEGSIZE);
+        if (debugging(DEBUG_STORE))
+            cc_msg("Global store alloc %d size %ld at %p (in $r)\n",
+                    (int)globsegcnt, (long)SEGSIZE, w, currentfunction.symstr);
+    }
+    globallp = w, globalltop = w + size;
+    globsegsize[globsegcnt] = size;
+    return globsegbase[globsegcnt++] = w;
+}
+
+VoidStar GlobAlloc(StoreUse t, int32 n)
+{   char *p = globallp;
+    n = (n + RR) & ~(int32)RR;          /* n = pad_to_hosttype(n, IPtr) */
+    if (n > SEGSIZE)
+    {   /* Big global store requests get a single oversize page.        */
+        if (globsegcnt >= segmax) expand_segmax(segmax * SEGMAX_FACTOR);
+        p = (char *)cc_alloc(n);
+        globsegsize[globsegcnt] = n;
+        globsegbase[globsegcnt++] = p;
+        if (debugging(DEBUG_STORE))
+            cc_msg("Global overlarge store alloc size %ld at %p (in $r)\n",
+                    (long)n, p, currentfunction.symstr);
+        globallxtra += n;
+    }
+    else
+    {   if (p+n > globalltop)
+            stuse_waste += globalltop-p,
+            p = new_global_segment();
+        else
+            check_trashed(p, n);
+        globallp = p + n;
+    }
+    stuse[t] += n;
+#ifndef ALLOC_DONT_CLEAR_MEMORY
+    memset(p, 0xbb, (size_t)n);
+#endif
+    return p;
 }
 
 static char *new_bindalloc_segment(void)
@@ -353,7 +443,7 @@ VoidStar BindAlloc(int32 n)
             }
             p = bindsegptr[i];                 /* hope springs eternal */
             bindalltop = bindsegbase[i] + SEGSIZE;
-            if ((n > 3*sizeof(int32)) && (p+n <= bindalltop))
+            if (((size_t)n > 3*sizeof(int32)) && (p+n <= bindalltop))
                  /* fingers crossed      */
             {   /* we have scavenged something useful - swap to current */
                 char *t = bindsegbase[i];
@@ -373,7 +463,7 @@ VoidStar BindAlloc(int32 n)
     bindallp = p + n;
     if ((bindallhwm += n) > bindallmax) bindallmax = bindallhwm;
 #ifndef ALLOC_DONT_CLEAR_MEMORY
-    memset(p, 0xcc, n);
+    memset(p, 0xcc, (size_t)n);
 #endif
     return p;
 }
@@ -395,7 +485,7 @@ VoidStar SynAlloc(int32 n)
             }
             p = synsegptr[i];                  /* hope springs eternal */
             synalltop = synsegbase[i] + SEGSIZE;
-            if ((n > 3*sizeof(int32)) && (p+n <= synalltop))
+            if (((size_t)n > 3*sizeof(int32)) && (p+n <= synalltop))
                 /* fingers crossed      */
             {   /* we have scavenged something useful - swap to current */
                 char *t = synsegbase[i];
@@ -415,7 +505,7 @@ VoidStar SynAlloc(int32 n)
     synallp = p + n;
     if ((synallhwm += n) > synallmax) synallmax = synallhwm;
 #ifndef ALLOC_DONT_CLEAR_MEMORY
-    memset(p, 0xaa, n);
+   memset(p, 0xaa, (size_t)n);
 #endif
     return p;
 }
@@ -482,8 +572,9 @@ VoidStar discard3(VoidStar p)
     FreeList *pp = (FreeList *) p;
     VoidStar q = (VoidStar) pp->next;
     int i;                   /* 0..segmax */
-    pp->rest[0] ^= 0x99990000;   /* to help with debugging */
-    pp->rest[1] ^= 0x99990000;   /* to help with debugging */
+    int32 *ppp = pp->rest;
+    ppp[0] ^= 0x99990000;   /* to help with debugging */
+    ppp[1] ^= 0x99990000;   /* to help with debugging */
     for (i = synsegcnt; i > 0;)
     {   --i;
         if (synsegbase[i] <= (char *)pp && (char *)pp < synsegbase[i]+SEGSIZE)
@@ -556,11 +647,14 @@ VoidStar xsyn_list7(IPtr a, IPtr b, IPtr c, IPtr d, IPtr e, IPtr f,
 }
 
 /* @@@ not used essentially for C but it is used for C++ */
-void alloc_mark(void)
+Mark* alloc_mark(void)
 {
     Mark *p;
     if ((p = freemarks) != NULL)
+    {
         freemarks = p->prev;
+        check_trashed(&p->syn_segno, sizeof(Mark) - offsetof(Mark, syn_segno));
+    }
     else
         p = (Mark *) GlobAlloc(SU_Other, sizeof(Mark));
 
@@ -569,41 +663,85 @@ void alloc_mark(void)
     p->syn_allp = synallp; p->syn_hwm = synallhwm;
     p->bind_segno = bindsegcur;
     p->bind_allp = bindallp; p->bind_hwm = bindallhwm;
+    p->unmarked = false;
 
     if (debugging(DEBUG_STORE))
-        cc_msg("Mark %d, %p, %lx :: %d, %p, %lx\n",
-                synsegcnt, synallp, (long)synallhwm,
+        cc_msg("Mark[%p] %d, %p, %lx :: %d, %p, %lx\n",
+                p, synsegcnt, synallp, (long)synallhwm,
                 bindsegcur, bindallp, (long)bindallhwm);
+    return p;
 }
 
 /* #ifdef PASCAL_OR_FORTRAN_OR_CPLUSPLUS -- comment out? */
-void alloc_unmark(void)
+void alloc_unmark(Mark* mark)
 {
     Mark *p = marklist;
+    for (; p->prev != NULL && p != mark; p = p->prev)
+        continue;
     if (p->prev == NULL) syserr(syserr_alloc_unmark);
-    if (synsegcnt > p->syn_segno)
-        syserr(syserr_alloc_unmark1);
-    marklist = p->prev;
-    p->prev = freemarks; freemarks = p;
-    synsegcnt = p->syn_segno; synallp = p->syn_allp;
-    synalltop = (synallp == DUFF_ADDR) ? (char *)DUFF_ADDR
-                                       : synsegbase[synsegcnt-1] + SEGSIZE;
-    synallhwm = p->syn_hwm;
-    /* NULLing out the free lists like this will lose the blocks */
-    /* that are between synallp and synalltop until the segment is */
-    /* recycled but it's considerably cheaper than scanning the free */
-    /* lists and segment array */
-    synall2 = NULL; synall3 = NULL;
-    bindsegcur = p->bind_segno; bindallp = p->bind_allp;
-    bindalltop = (bindallp == DUFF_ADDR) ? (char *)DUFF_ADDR
-                                         : bindsegbase[bindsegcur-1] + SEGSIZE;
-    bindallhwm = p->bind_hwm;
-    bindall2 = NULL; bindall3 = NULL;
+    if (mark == marklist) /* unmarking most recent */
+    {   if (synsegcnt > mark->syn_segno)
+            syserr(syserr_alloc_unmark1);
+        for (;;)
+        {   p = marklist;
+        #if STORE_TRASHING || WATCH_FOR
+            {   int i;
+                for (i = synsegcnt; p->syn_segno < i; --i)
+                {   check_watch_for(synsegbase[i-1], SEGSIZE, "syntax segment");
+                    trash_block(synsegbase[i-1], SEGSIZE);
+                }
+            }
+        #endif
+            synsegcnt = p->syn_segno; synallp = p->syn_allp;
+            if (synallp == DUFF_ADDR)
+                synalltop = (char *)DUFF_ADDR;
+            else
+            {   synalltop = synsegbase[synsegcnt-1] + SEGSIZE;
+                check_watch_for(synallp, synalltop - synallp, "syntax segment");
+                trash_block(synallp, synalltop - synallp);
+            }
+            synallhwm = p->syn_hwm;
+            /* NULLing out the free lists like this will lose the blocks */
+            /* that are between synallp and synalltop until the segment is */
+            /* recycled but it's considerably cheaper than scanning the free */
+            /* lists and segment array */
+            synall2 = NULL; synall3 = NULL;
+        #if STORE_TRASHING || WATCH_FOR
+            {   int i;
+                for (i = bindsegcur; p->bind_segno < i; --i)
+                {   check_watch_for(bindsegbase[i-1], SEGSIZE, "binder segment");
+                    trash_block(bindsegbase[i-1], SEGSIZE);
+                }
+            }
+        #endif
+            bindsegcur = p->bind_segno; bindallp = p->bind_allp;
+            if (bindallp == DUFF_ADDR)
+                bindalltop = (char *)DUFF_ADDR;
+            else
+            {   bindalltop = bindsegbase[bindsegcur-1] + SEGSIZE;
+                check_watch_for(bindallp, bindalltop - bindallp, "binder segment");
+                trash_block(bindallp, bindalltop - bindallp);
+            }
+            bindallhwm = p->bind_hwm;
+            bindall2 = NULL; bindall3 = NULL;
 
-    if (debugging(DEBUG_STORE))
-        cc_msg("Unmark %d, %p, %lx :: %d, %p, %lx\n",
-                synsegcnt, synallp, (long)synallhwm,
-                bindsegcur, bindallp, (long)bindallhwm);
+            if (debugging(DEBUG_STORE))
+                cc_msg("Unmark[%p] %d, %p, %lx :: %d, %p, %lx\n",
+                        p, synsegcnt, synallp, (long)synallhwm,
+                        bindsegcur, bindallp, (long)bindallhwm);
+            marklist = p->prev;
+            p->prev = freemarks;
+            trash_block(&p->syn_segno, sizeof(Mark) - offsetof(Mark, syn_segno)); /* can't trash p->prev */
+            freemarks = p;
+            if (!marklist->unmarked)
+                break;
+        }
+    }
+    else
+    {   p->unmarked = true;
+        if (debugging(DEBUG_STORE))
+            cc_msg("Unmark[%p] (pending)\n", p);
+    }
 }
 /* #endif */
 
@@ -612,20 +750,28 @@ void drop_local_store(void)
 /* Here the threat issued using SynAlloc or syn_xxx materialises, and a
    lot of local store is trampled upon. */
 /* N.B. drop_local_store *MUST* be called before reinit_alloc()          */
-   while (synsegcnt > marklist->syn_segno)
-    {    char *p = synsegbase[--synsegcnt];
+    while (synsegcnt > marklist->syn_segno)
+    {   char *p = synsegbase[--synsegcnt];
 #ifdef never
-         if (debugging(DEBUG_2STORE))
-             cc_msg("Re-using syntax store %p as binder %d\n",
-                     p, (int)bindsegcnt);
+        if (debugging(DEBUG_2STORE))
+            cc_msg("Re-using syntax store %p as binder %d\n",
+                   p, (int)bindsegcnt);
 #endif
+        check_watch_for(p, SEGSIZE, "syntax segment");
+        trash_block(p, SEGSIZE);
 /* we do not need to mess with limits here as set to SEGSIZE when used */
-         if (bindsegcnt >= segmax) expand_segmax(segmax * SEGMAX_FACTOR);
-         bindsegbase[bindsegcnt++] = p;
+        if (bindsegcnt >= segmax) expand_segmax(segmax * SEGMAX_FACTOR);
+        bindsegbase[bindsegcnt++] = p;
     }
     synallp = marklist->syn_allp;
-    synalltop = (synallp == DUFF_ADDR) ? (char *)DUFF_ADDR
-                                       : synsegbase[synsegcnt-1] + SEGSIZE;
+    if (synallp == DUFF_ADDR)
+        synalltop = (char *)DUFF_ADDR;
+    else
+    {   synalltop = synsegbase[synsegcnt-1] + SEGSIZE;
+        check_watch_for(synallp, synalltop - synallp, "syntax segment");
+        trash_block(synallp, synalltop - synallp);
+    }
+
     if (debugging(DEBUG_2STORE) && synallhwm==synallmax)
         cc_msg("Max SynAlloc %ld in $r\n",
                 (long)synallmax, currentfunction.symstr);
@@ -642,6 +788,14 @@ void alloc_reinit(void)
         synall3 != NULL
        )
         syserr(syserr_alloc_reinit);
+#if STORE_TRASHING || WATCH_FOR
+    {   int i;
+        for (i = bindsegcur; marklist->bind_segno < i; --i)
+        {   check_watch_for(bindsegbase[i-1], SEGSIZE, "binder segment");
+            trash_block(bindsegbase[i-1], SEGSIZE);
+        }
+    }
+#endif
     bindallhwm = marklist->bind_hwm;
     bindsegcur = marklist->bind_segno; bindallp = marklist->bind_allp;
     bindalltop = (bindallp == DUFF_ADDR) ? (char *)DUFF_ADDR
@@ -649,27 +803,57 @@ void alloc_reinit(void)
     bindall2 = NULL; bindall3 = NULL;   /* see comment in alloc_unmark */
 }
 
-void alloc_init(void)
+void alloc_initialise(void)
+{
+    /* Called once per invocation of the compiler */
+    alloc_chain = NULL;
+    bindsegcnt = 0;
+    globsegcnt = 0;
+    globoschain = NULL;
+    synsegbase = synsegptr = bindsegbase = bindsegptr = (char **)DUFF_ADDR;
+    permallp = permalltop = (char *)DUFF_ADDR;
+    segmax = 0; expand_segmax(SEGMAX_INIT);
+}
+
+void alloc_perfileinit(void)
 {
     /* reset the following vars for each one of a many file compilation */
     stuse_total = 0, stuse_waste = 0;
     memclr(stuse, sizeof(stuse));
-    if (alloc_chain != NULL) syserr("alloc_init notices there was no alloc_dispose");
     synsegcnt = 0;
     synallp = synalltop = (char *)DUFF_ADDR;
     synall2 = NULL; synall3 = NULL;
     synallhwm = 0, synallmax = 0;
-    bindsegcur = 0, bindsegcnt = 0;
+    bindsegcur = 0;
     bindallp = bindalltop = (char *)DUFF_ADDR;
     bindallhwm = 0, bindallmax = 0;
     bindall2 = NULL; bindall3 = NULL;
-    globallcnt = 0; globallxtra = 0;
+    globsegcnt = 0; globallxtra = 0;
     globallp = globalltop = (char *)DUFF_ADDR;
     marklist = NULL; freemarks = NULL;
     maxAEstore = 0;
-    synsegbase = synsegptr = bindsegbase = bindsegptr = (char **)DUFF_ADDR;
-    segmax = 0; expand_segmax(SEGMAX_INIT);
-    alloc_mark();
+    (void)alloc_mark(); /* alloc_reinit, etc. assume a mark */
+}
+
+void alloc_perfilefinalise(void)
+{
+    if (marklist == NULL || marklist->prev != NULL)
+        syserr("corrupt alloc_marklist");
+    drop_local_store();  /* for caution's sake: perhaps always already done */
+    while (globsegcnt > 0)
+    {   char *p = globsegbase[--globsegcnt];
+        int32 size = globsegsize[globsegcnt];
+        if (size == SEGSIZE)
+        {   if (bindsegcnt >= segmax) expand_segmax(segmax * SEGMAX_FACTOR);
+            bindsegbase[bindsegcnt++] = p;
+        }
+        else
+        {   OverlargeBlockHeader *h = (OverlargeBlockHeader *)p;
+            h->next = globoschain;
+            h->size = size;
+            globoschain = h;
+        }
+    }
 }
 
 void alloc_noteAEstoreuse(void)
@@ -686,8 +870,8 @@ void show_store_use(void)
         "Total store use (excluding stdio buffers/stack) %ld bytes\n",
         (long)stuse_total);
     cc_msg("Global store use %ld/%ld + %ld bytes\n",
-        (long)((int32)globallcnt*SEGSIZE - (globalltop - globallp)),
-        (long)((int32)globallcnt*SEGSIZE),
+        (long)((int32)globsegcnt*SEGSIZE - (globalltop - globallp)),
+        (long)((int32)globsegcnt*SEGSIZE),
         (long)globallxtra);
     cc_msg(
         "  thereof %ld+%ld bytes pended relocation, %ld bytes pended data\n",

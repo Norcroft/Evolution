@@ -2,12 +2,13 @@
  * drivhelp.c -- help text for Norcroft C/FORTRAN compiler, version 1b.
  * Copyright (C) Codemist Ltd., 1989.
  * Copyright (C) Acorn Computers Ltd., 1989.
+ * SPDX-Licence-Identifier: Apache-2.0
  */
 
 /*
- * RCS $Revision: 1.7 $
- * Checkin $Date: 1995/03/14 10:41:32 $
- * Revising $Author: mwilliam $
+ * RCS $Revision$
+ * Checkin $Date$
+ * Revising $Author$
  */
 
 /* The help text here is not what is wanted on non-Acorn machines, and  */
@@ -21,7 +22,6 @@ static msg_t driver_help_text[] = {
 
 #else
 #ifndef TARGET_IS_UNIX
-#ifndef TARGET_IS_HELIOS
 /* Arthur and Brazil -help text */
 
 #ifdef PASCAL /*ECN*/
@@ -99,89 +99,6 @@ static msg_t driver_help_text[] = {
 #endif /* FORTRAN */
 #endif /* PASCAL */
 
-#else /* TARGET_IS_HELIOS */
-/* Helios -help text */
-
-#ifdef PASCAL /*ECN*/
-
-    help_usage,
-    help_main_options,
-    help_blank,
-    help_list,                  /* -list */
-    help_iso,                   /* -iso */
-    help_blank,
-    help_dont_link,             /* -c */
-    help_leave_comments,        /* -C */
-    help_predefine,             /* -D<symbol> */
-    help_preprocess_pascal,     /* -E */
-    help_compiler_features,     /* -F<options> */
-    help_runtime_checks,        /* -R<options> */
-    help_debug,                 /* -g<options> */
-    help_include_I,             /* -I<directory> */
-    help_include_J,             /* -J<directory> */
-    help_libraries,             /* -L<libs> */
-    help_output,                /* -o<file> */
-    help_profile,               /* -P<options> */
-    help_output_assembler,      /* -S */
-    help_preundefine,           /* -U<symbol> */
-    help_disable_warnings,      /* -W<options> */
-
-#else
-
-#ifndef FORTRAN
-
-    help_usage,
-    help_main_options,
-    help_blank,
-    help_list,                  /* -list */
-    help_pcc,                   /* -pcc */
-    help_blank,
-    help_dont_link,             /* -c */
-    help_leave_comments,        /* -C */
-    help_predefine,             /* -D<symbol> */
-    help_preprocess_c,          /* -E */
-    help_compiler_features,     /* -F<options> */
-    help_debug,                 /* -g<options> */
-    help_include_I,             /* -I<directory> */
-    help_include_J,             /* -J<directory> */
-    help_libraries,             /* -L<libs> */
-    help_output,                /* -o<file> */
-    help_profile,               /* -P<options> */
-    help_output_assembler,      /* -S */
-    help_preundefine,           /* -U<symbol> */
-    help_disable_warnings,      /* -W<options> */
-    help_helios_libraries,      /* -Z<option> */
-
-#else /* FORTRAN */
-
-#define msg_driver_help ,
-    help_usage,
-    help_main_options,
-    help_blank,
-    help_arthur,                /* -arthur */
-    help_f66,                   /* -f66 */
-    help_list,                  /* -list */
-    help_brazil,                /* -super */
-    help_blank,
-    help_dont_link,             /* -c */
-    help_leave_comments,        /* -C */
-    help_predefine,             /* -D<symbol> */
-    help_preprocess_fortran,    /* -E */
-    help_compiler_features,     /* -F<options> */
-    help_debug,                 /* -g<options> */
-    help_include_I,             /* -I<directory> */
-    help_include_J,             /* -J<directory> */
-    help_libraries,             /* -L<libs> */
-    help_output,                /* -o<file> */
-    help_profile,               /* -P<options> */
-    help_output_assembler,      /* -S */
-    help_preundefine,           /* -U<symbol> */
-    help_disable_warnings,      /* -W<options> */
-
-#endif /* FORTRAN */
-#endif /* PASCAL */
-
-#endif /* TARGET_IS_HELIOS */
 #else /* TARGET_IS_UNIX */
 
 #ifdef PASCAL /*ECN*/

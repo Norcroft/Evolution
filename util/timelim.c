@@ -1,7 +1,7 @@
 /*
- * RCS $Revision: 1.2 $
+ * Copyright (C) Advanced Risc Machines Ltd., 1991
+ * SPDX-Licence-Identifier: Apache-2.0
  */
-
 #include <stdio.h>
 #include <time.h>
 
@@ -24,6 +24,6 @@ int main()
     printf("#define TIME_LIMIT %d\n", now);
 
     fprintf(stderr, "The software expires at %s", ctime(&now));
-    
+
     return 0;
 }

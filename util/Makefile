@@ -1,6 +1,7 @@
 # Makefile for peepgen and genhdrs and testing thereof.
 #
 # Copyright (C) Advanced RISC Machines 1991.
+# SPDX-Licence-Identifier: Apache-2.0
 #
 # This makefile is intended to be used as follows:
 #
@@ -31,33 +32,33 @@ CC=cc
 CFLAGS=-O
 
 utils: genhdrs peepgen
-	echo ""
-	echo "Don't forget to test the tools using 'make tests'"
-	echo "Tidy up using 'make tidy'"
-	echo "Start again using 'make clean'"
-	echo ""
+        echo ""
+        echo "Don't forget to test the tools using 'make tests'"
+        echo "Tidy up using 'make tidy'"
+        echo "Start again using 'make clean'"
+        echo ""
 
 sources: genhdrs.c peepgen.c mcdpriv.h jopcode.h
 
 genhdrs: genhdrs.c
-	echo "Building genhdrs..."
-	$(CC) -o genhdrs $(CFLAGS) genhdrs.c && echo "genhdrs built OK"
+        echo "Building genhdrs..."
+        $(CC) -o genhdrs $(CFLAGS) genhdrs.c && echo "genhdrs built OK"
 
 genhdrs.c: c/genhdrs
-	$(TOPCC) c/genhdrs genhdrs.c
+        $(TOPCC) c/genhdrs genhdrs.c
 
 peepgen: peepgen.c mcdpriv.h jopcode.h
-	echo "Building peepgen..."
-	$(CC) -o peepgen $(CFLAGS) peepgen.c && echo "peepgen built OK"
+        echo "Building peepgen..."
+        $(CC) -o peepgen $(CFLAGS) peepgen.c && echo "peepgen built OK"
 
 peepgen.c: c/peepgen
-	$(TOPCC) c/peepgen peepgen.c
+        $(TOPCC) c/peepgen peepgen.c
 
 mcdpriv.h: $(MCDPRIV)
-	$(TOPCC) $(MCDPRIV) mcdpriv.h
+        $(TOPCC) $(MCDPRIV) mcdpriv.h
 
 jopcode.h: $(JOPCODE)
-	$(TOPCC) $(JOPCODE) jopcode.h
+        $(TOPCC) $(JOPCODE) jopcode.h
 
 #
 # Testing the tools...
@@ -88,29 +89,29 @@ HEADERS=../ccarm/c/headers
 ERRORS=../ccarm/h/errors
 
 tests test: errors.h headers.c peeppat.c
-	echo "Comparing genhdrs output with expected values:"
-	- diff $(ERRORS) errors.h && echo " - errors.h generated OK by genhdrs"
-	tail +3 $(HEADERS) > h0
-	tail +3 headers.c  > h1
-	- diff h0 h1 && echo " - headers.c generated OK by genhdrs"
-	rm h0 h1
-	echo "Comparing peepgen output with expected value:"
-	- diff $(PEEPPAT) peeppat.c && echo " - peeppat.c generated OK by peepgen"
-	echo ""
+        echo "Comparing genhdrs output with expected values:"
+        - diff $(ERRORS) errors.h && echo " - errors.h generated OK by genhdrs"
+        tail +3 $(HEADERS) > h0
+        tail +3 headers.c  > h1
+        - diff h0 h1 && echo " - headers.c generated OK by genhdrs"
+        rm h0 h1
+        echo "Comparing peepgen output with expected value:"
+        - diff $(PEEPPAT) peeppat.c && echo " - peeppat.c generated OK by peepgen"
+        echo ""
 
 errors.h headers.c: $(ANSIHDRS) genhdrs ${PH}miperrs ${LH}feerrs ${MH}mcerrs
-	echo "Generating test outputs from genhdrs..."
-	genhdrs -oheaders.c -eerrors.h -q${PH}miperrs -q${LH}feerrs \
-	        -q${MH}mcerrs -s -I$(AH) $(HDRFILES)
+        echo "Generating test outputs from genhdrs..."
+        genhdrs -oheaders.c -eerrors.h -q${PH}miperrs -q${LH}feerrs \
+                -q${MH}mcerrs -s -I$(AH) $(HDRFILES)
 
 peeppat.c: $(PEEP)/peeppat
-	echo "Generating test output from peepgen..."
-	peepgen $(PEEP)/peeppat peeppat.c
+        echo "Generating test output from peepgen..."
+        peepgen $(PEEP)/peeppat peeppat.c
 
 tidy:
-	rm -f peepgen.c peepgen.o jopcode.h mcdpriv.h genhdrs.c genhdrs.o \
-	peeppat.c headers.c errors.h
+        rm -f peepgen.c peepgen.o jopcode.h mcdpriv.h genhdrs.c genhdrs.o \
+        peeppat.c headers.c errors.h
 
 clean:
-	rm -f peepgen.c peepgen.o jopcode.h mcdpriv.h genhdrs.c genhdrs.o \
-	peeppat.c headers.c errors.h peepgen genhdrs
+        rm -f peepgen.c peepgen.o jopcode.h mcdpriv.h genhdrs.c genhdrs.o \
+        peeppat.c headers.c errors.h peepgen genhdrs

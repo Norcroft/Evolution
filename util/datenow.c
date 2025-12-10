@@ -1,3 +1,7 @@
+/*
+ * Copyright (C) Advanced Risc Machines Ltd., 1991
+ * SPDX-Licence-Identifier: Apache-2.0
+ */
 #include <stdio.h>
 #include <time.h>
 

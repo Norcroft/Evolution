@@ -1,13 +1,14 @@
 /*
  * cse.c: Common sub-expression elimination
  * Copyright (C) Acorn Computers Ltd., 1988.
- * Copyright (C) Advanced Risc Machines Ltd., 1991
+ * Copyright 1991-1997 Advanced Risc Machines Limited. All rights reserved
+ * SPDX-Licence-Identifier: Apache-2.0
  */
 
 /*
- * RCS $Revision: 1.54 $ Codemist 133
- * Checkin $Date: 1995/11/29 11:30:21 $
- * Revising $Author: hmeeking $
+ * RCS $Revision$ Codemist 133
+ * Checkin $Date$
+ * Revising $Author$
  */
 
 #ifdef __STDC__
@@ -22,7 +23,6 @@
 
 #include "globals.h"
 #include "cse.h"
-#include "cseguts.h"
 #include "jopcode.h"
 #include "store.h"
 #include "regalloc.h"
@@ -32,6 +32,7 @@
 #include "builtin.h"   /* for te_xxx */
 #include "errors.h"
 #include "aeops.h"
+#include "cseguts.h"
 
 typedef struct CSE CSE;
 typedef struct CSERef CSERef;
@@ -46,6 +47,8 @@ struct CSERef {
 
 #define refuse_(p) ((p)->ref.ex)
 #define refblock_(p) ((p)->ref.b)
+#define mk_CSERef(a,b) ((CSERef *)CSEList2((a), (b)))
+#define CSERef_DiscardOne(p) ((CSERef *)discard2((List *)(p)))
 
 struct CSEDef {
     CSEDef *cdr;
@@ -54,25 +57,31 @@ struct CSEDef {
     CSERef *refs;
     Icode *icode;
     VRegSetP uses;
-    Binder *binder;
     CSEDef *subdefs, *nextsub;
     CSEDef *super;
-    union {
-        Binder *binder2;  /* only present for CALLK (returning 2 results) */
-                          /* (> 2 results not currently cseable) */
-        int32 mask;       /* only for compares */
-    } extra;
+    Binder *binders[1];
+    int32 mask;           /* only for compares */
 };
 
-#define CSEBind_(x) ((x)->binder)
-#define CSEBind2_(x) ((x)->extra.binder2)
-#define CSEDefMask_(x) ((x)->extra.mask)
+#define defbinder_(x,n) ((x)->binders[n])
+#define defmask_(x) ((x)->mask)
+#define defblock_(x) ((x)->block)
+#define defex_(x) ((x)->exprn)
+#define defrefs_(x) ((x)->refs)
+#define defic_(x) ((x)->icode)
+#define defuses_(x) ((x)->uses)
+#define defsub_(x) ((x)->subdefs)
+#define defsuper_(x) ((x)->super)
+#define defnextsub_(x) ((x)->nextsub)
+#define CSEDef_New(n) ((CSEDef *)CSEAlloc(offsetof(CSEDef, binders)+(n)*sizeof(Binder *)))
 
 struct CSE {
     CSE *cdr;
     Exprn *exprn;
     CSEDef *def;
 };
+#define cseex_(x) ((x)->exprn)
+#define csedef_(x) ((x)->def)
 
 static CSE *cselist;
 static CSEDef *localcsedefs;
@@ -81,17 +90,30 @@ static BindList *csespillbinders;
 
 typedef struct LoopList LoopList;
 struct LoopList
-{   struct LoopList *cdr;
+{   LoopList *cdr;
     BlockList *members;             /* list of basic blocks inside       */
     BlockHead *preheader;           /* where to put found invariants     */
     BlockHead *header;
     BlockHead *tail;
 };
+#define ll_mem_(p) ((p)->members)
+#define ll_prehdr_(p) ((p)->preheader)
+#define ll_hdr_(p) ((p)->header)
+#define ll_tail_(p) ((p)->tail)
 
 static LoopList *all_loops;
 static VRegSetP loopmembers;
 
-#define mkCSEBlockList(a, b) ((BlockList *)CSEList2((BlockList *)a, (BlockHead *)b))
+#define mk_CSEBlockList(a, b) ((BlockList *)CSEList2((BlockList *)a, (BlockHead *)b))
+
+struct CSEUseList {
+    CSEUseList *cdr;
+    CSEDef *def;
+    ExprnUse *use;
+};
+#define ul_def_(p) ((p)->def)
+#define ul_use_(p) ((p)->use)
+#define mk_CSEUseList(a,b,c) ((CSEUseList *)CSEList3((a),(b),(c)))
 
 static unsigned32 nsets, newsets, setbytes;
 static unsigned32 maxsets, maxbytes;
@@ -139,13 +161,13 @@ static J_OPCODE CSEaccessOp(VRegnum r, J_OPCODE model)
     return model == J_LDRV ? op : J_LDtoST(op);
 }
 
-static RegSort destregsort(J_OPCODE op)
+static RegSort DestRegSort(J_OPCODE op)
 {   /* Given 'op' return the 'regsort' suitable for the 'r1'            */
     /* field of 'op'.  If 'op' is a j_ischeck() (or J_CMP?) then        */
     /* 'GAP' is returned.                                               */
     /* This routine is the only user of deprecated 'floatiness_()'.     */
     /* It suggests that a new 'J_destregsort() could be in jopcode.h    */
-    if (j_is_check(op))
+    if (j_is_check(op) || is_compare(op))
         return GAP;
     else {
         J_OPCODE x = op & J_TABLE_BITS;
@@ -157,72 +179,7 @@ static RegSort destregsort(J_OPCODE op)
     }
 }
 
-#if 0
-/* It is believed on reflection that the only necessary function of
- * trytokillargs (at least in modern times) was removing the loads of fp
- * fp arguments later transferred to integer registers through PUSHD and
- * POP (regalloc is capable of killing the POP only). Since this no longer
- * happens, but MOVDIR is used instead, trytokillargs is completely
- * redundant.
- */
-
-Icode *trytokillargs(Icode *p, Icode *blockstart, bool nextinblock)
-{
-/* Mostly, when an expression is being replaced we don't bother to do
- * anything its parts: since now they're unused register allocation
- * will kill them.  This doesn't appear to be true for function arguments,
- * though (i.e. where the destination is a physical register), and
- * particularly for floating point arguments it's a good idea to kill
- * them.  We won't necessarily be able to, since the search only goes
- * back to the head of the containing basic block.
- */
-    int32 count = k_argregs_(p->r2.i);
-    VRegSetP args = NULL;
-    int32 i;
-    Icode *res = p;
-    if (nextinblock) {
-        Icode *next = p + 1;
-        if ( register_movep(next->op) &&
-             next->m.i == p->r1.i ) {
-            p->op = J_NOOP;
-            res = next;
-        }
-    }
-
-#ifdef TARGET_FP_ARGS_IN_FP_REGS
-    {   int32 intregs = k_intregs_(p->r2.i),
-              fltregs = k_fltregs_(p->r2.i);
-        for ( i = 0 ; i < intregs; i++ )
-            cseset_insert(R_A1+i, args, NULL);
-        for ( i = 0 ; i < fltregs; i++ )
-            cseset_insert(R_FA1+i, args, NULL);
-    }
-#else   /* including TARGET_FP_ARGS_CALLSTD2 */
-    for ( i = 0 ; i < count; i++ )
-        cseset_insert(k_argisfp_(p->r2.i, i) ? R_A1+i : R_FA1+i,
-                      args, NULL);
-#endif
-
-    while (count > 0 && (--p) >= blockstart) {
-        int32 op = p->op;
-        if (loads_r1(op)) {
-            VRegnum r = p->r1.r;
-            if (cseset_member(r, args)) {
-                count--;
-               /* p->op = J_NOOP;*/
-                p->r1.r = vregister(vregsort(r));
-                /* Register allocation should now manage to kill this, and
-                   this way we needn't worry about lifting CSE definitions
-                   too */
-                cseset_delete(r, args, NULL);
-            }
-        }
-    }
-    return res;
-}
-#endif
-
-static void replacewithload(Icode *target, VRegnum r1, Binder *binder)
+static void ReplaceWithLoad(Icode *target, VRegnum r1, Binder *binder)
 {
 #ifdef RANGECHECK_SUPPORTED
     if (binder == NULL)
@@ -231,55 +188,53 @@ static void replacewithload(Icode *target, VRegnum r1, Binder *binder)
 #endif
     {   target->op = CSEaccessOp(r1, J_LDRV);
         target->r2.r = GAP;
-        target->m.b  = binder;
+        target->r3.b  = binder;
     }
 }
 
-static Icode *replaceicode(ExprnUse *ref, CSEDef *def)
+static CSEUseList *ReplaceIcode(CSEUseList *deferred, ExprnUse *ref, CSEDef *def)
 {
     BlockHead *b = ref->block;
-    Icode *target = &useicode_(ref);
-    J_OPCODE op = target->op;
-    VRegnum r1 = target->r1.r;
-    if (debugging(DEBUG_CSE))  {
-        print_jopcode_1(op, target->r1, target->r2, target->m);
-        cc_msg("     %ld/%ld\n", (long)blklabname_(b), (long)icoden_(ref));
-    }
-#if 0
-    if (op == J_CALLK && (target->r2.i & K_PURE)) { /* @@@ pure OPSYSK */
-        Icode *blockend = blkcode_(b)+blklength_(b);
-        target = trytokillargs(target, blkcode_(b), (target+1) < blockend);
-    }
-#endif
-    if (def != NULL) {
-        Exprn *ex = def->exprn;
+    if (!IsRealIcode(ref))
+      blk_defs2_(b) = def;
+    else {
+      Icode *target = &useicode_(ref);
+      J_OPCODE op = target->op;
+      VRegnum r1 = target->r1.r;
+      if (debugging(DEBUG_CSE)) {
+          print_jopcode_1(target);
+          cc_msg("     %ld/%ld\n", (long)blklabname_(b), (long)icoden_(ref));
+      }
+      if (def != NULL) {
+          Exprn *ex = defex_(def);
 #ifdef TARGET_ALLOWS_COMPARE_CSES
-        if (is_compare(exop_(ex))) {
-           /* if ((target->op & Q_MASK) != CSEDefMask_(def))*/
-                CSEDefMask_(def) = Q_XXX;
-            target->op = J_NOOP;
-        } else
+          if (is_compare(exop_(ex))) {
+
+              defmask_(def) = (defmask_(def) & Q_UBIT) | Q_UKN;
+              target->op = J_NOOP;
+          } else
 #endif
-        if (pseudo_reads_r2(exop_(ex))) {
-            VRegnum r = bindxx_(CSEBind_(def));
-            if (pseudo_reads_r1(op))
-                target->r1.r = r;
-            else {
-                target->op = exop_(ex);
-                target->r2.r = r;
-                note_slave(target->r1.r, r);
-            }
-            target->m.i = e1k_(ex);
-        } else if (valno_(ref) == 0)
-            replacewithload(target, r1, CSEBind_(def));
-        else
-            replacewithload(target, r1, CSEBind2_(def));
+          if (pseudo_reads_r2(exop_(ex))) {
+              VRegnum r = bindxx_(defbinder_(def, 0));
+              if (pseudo_reads_r1(op))
+                  target->r1.r = r;
+              else {
+                  target->op = exop_(ex);
+                  target->r2.r = r;
+                  note_slave(target->r1.r, r);
+              }
+              target->r3.i = e1k_(ex);
+          } else if (nvals_(ref) == 0)
+              ReplaceWithLoad(target, r1, defbinder_(def, valno_(ref)));
+          else
+              deferred = mk_CSEUseList(deferred, def, ref);
+      }
     }
     cse_refs++;
-    return target;
+    return deferred;
 }
 
-static Binder *addcsebinder(J_OPCODE op, BindList **bl, VRegnum r)
+static Binder *AddCSEBinder(J_OPCODE op, BindList **bl, VRegnum r)
 {
     Binder *bnew;
 /* /* The following line is a hack to fix things up now that vregsort() */
@@ -305,59 +260,83 @@ static Binder *addcsebinder(J_OPCODE op, BindList **bl, VRegnum r)
     return bnew;
 }
 
-static CSEDef *mkCSEDef(Exprn *ex, BlockHead *b)
+static CSEDef *mk_CSEDef(Exprn *ex, BlockHead *b)
 {
     CSEDef *def;
-    if (is_call2(ex)
+    if (is_calln(ex))
+        def = CSEDef_New(exnres_(ex));
 #ifdef TARGET_ALLOWS_COMPARE_CSES
-        || is_compare(exop_(ex))
+    else if (is_compare(exop_(ex)))
+        def = CSENew(CSEDef);
 #endif
-       )
-        def = (CSEDef *)CSEAlloc(sizeof(CSEDef));
     else
-        def = (CSEDef *)CSEAlloc(offsetof(CSEDef, extra));
-    def->block = b; def->icode = NULL; def->exprn = ex;
-    def->refs = NULL; def->uses = NULL; CSEBind_(def) = NULL;
-    def->subdefs = def->nextsub = def->super = NULL;
+        def = CSEDef_New(1);
+    defblock_(def) = b; defic_(def) = NULL; defex_(def) = ex;
+    defrefs_(def) = NULL; defuses_(def) = NULL; defbinder_(def, 0) = NULL;
+    defsub_(def) = defnextsub_(def) = defsuper_(def) = NULL;
     return def;
 }
 
-static CSEDef *addtocselist(Exprn *ex, BlockHead *b, bool mustbenew)
+static CSEDef *AddToCSEList(Exprn *ex, BlockHead *b, bool mustbenew)
 {
     CSE *cse;
     CSEDef *def;
     for (cse = cselist ; cse != NULL ; cse = cdr_(cse))
-        if (ex == cse->exprn) break;
+        if (ex == cseex_(cse)) break;
     if (cse == NULL)
         cse = cselist = (CSE *)CSEList3(cselist, ex, NULL);
     if (!mustbenew)
-        for (def = cse->def; def != NULL; def = cdr_(def))
-            if (def->block == b) return def;
+        for (def = csedef_(cse); def != NULL; def = cdr_(def))
+            if (defblock_(def) == b) return def;
 
-    def = mkCSEDef(ex, b);
-    cdr_(def) = cse->def; cse->def = def;
+    def = mk_CSEDef(ex, b);
+    cdr_(def) = csedef_(cse); csedef_(cse) = def;
     return def;
 }
 
-static bool worthreplacement(Exprn *ex)
+static bool KillExprRef_i(CSEDef *def, Icode *ic)
+{   ptrdiff_t icoden = ic - blkcode_(cse_currentblock);
+    CSERef **refp;
+    for ( ; def != NULL; def = cdr_(def))
+        if (defblock_(def) == cse_currentblock)
+            for (refp = &defrefs_(def); *refp != NULL; refp = &cdr_(*refp))
+            {   ExprnUse *use = refuse_(*refp);
+                if (use->block == cse_currentblock && icoden_(use) == icoden)
+                {   *refp = cdr_(*refp);
+                    return YES;
+                }
+            }
+    return NO;
+}
+
+bool cse_KillExprRef(ExSet *s, Icode *ic) {
+  /* remove any local or global CSE references to the instruction ic */
+  for (; s != NULL; s = cdr_(s)) {
+    Exprn *ex = s->exprn;
+    CSE *cse;
+
+    if (KillExprRef_i(localcsedefs, ic)) return YES;
+    for (cse = cselist; cse != NULL; cse = cdr_(cse))
+        if (cseex_(cse) == ex && KillExprRef_i(csedef_(cse), ic))
+            return YES;
+  }
+  return NO;
+}
+
+
+static bool WorthReplacement(Exprn *ex)
 {
-/* Same rules for what's worth making into a CSE whether for local
-   or non-local use.
- */
-/* The following line is really unnecessary (csescan doesn't create Exprns for
-   these things).
- */
+/* Same rules for what's worth making into a CSE whether for local or   */
+/* or non-local use.                                                    */
+
+/* The following line is really unnecessary (csescan doesn't create     */
+/* Exprns for these things).                                            */
     if (exop_(ex) == J_MOVDIR ||
         exop_(ex) == J_MOVLIR ||
         exop_(ex) == J_MOVFIR) return NO;
 #ifdef TARGET_HAS_CONST_R_ZERO
 /* In this case it is SILLY to lift zero as a constant! */
-    if (exop_(ex) == J_MOVK && e1k_(ex) == 0 && R_ZERO != -1) return NO;
-#endif
-#ifdef TARGET_IS_MIPSxxxx
-    {    ExprnUse *def = exuses_(ex);
-         if (def == NULL || cdr_(def) == NULL) return NO;
-    }
+    if (exop_(ex) == J_MOVK && e1k_(ex) == 0) return NO;
 #endif
     if (extype_(ex) == E_LOAD) {
       Location *loc = exloc_(ex);
@@ -367,19 +346,24 @@ static bool worthreplacement(Exprn *ex)
       if (exop_(locbase_(loc)) == J_ADCONV) return NO;
       return YES;
     }
-    return exop_(ex) != J_STRING && exop_(ex) != J_ADCONV &&
-           exop_(ex) != J_ADCONF && exop_(ex) != J_ADCOND;
+    return exop_(ex) != J_STRING && exop_(ex) != J_ADCONV;
+    /* J_ADCONF and J_ADCOND also used to be excluded here. There seems */
+    /* no good reason - after all, CSEs for them vanish if spilt, and   */
+    /* J_ADCON (which one would have thought analogous) is included.    */
+    /* One might question the inclusion of J_ADCONV, too, but bear in   */
+    /* mind that, for local CSEs, it may be eliminated by transformation*/
+    /* of opK to opVK.                                                  */
 }
 
-bool addlocalcse(Exprn *node, int valno, BlockHead *b)
+bool cse_AddLocalCSE(Exprn *node, int valno, int nvals, BlockHead *b)
 {
     ExprnUse *def = exuses_(node);
     Icode *deficode;
     CSEDef *csedef;
     CSERef *ref;
 
-    if (!worthreplacement(node)) return NO;
-    ref = (CSERef *)CSEAlloc(sizeof(CSERef));
+    if (!WorthReplacement(node)) return NO;
+    ref = CSENew(CSERef);
 
     if (def == NULL)
         syserr(syserr_addlocalcse, exid_(node));
@@ -394,35 +378,37 @@ bool addlocalcse(Exprn *node, int valno, BlockHead *b)
        !pseudo_reads_r2() test)
      */
     deficode = &useicode_(def);
-    if (!pseudo_reads_r2(deficode->op) && !killedinblock(exid_(node))) {
-        csedef = addtocselist(node, b, NO);
-        cseset_insert(blklabname_(b), csedef->uses, NULL);
+    if (!pseudo_reads_r2(deficode->op) && !cse_KilledInBlock(exid_(node))) {
+        csedef = AddToCSEList(node, b, NO);
+        cseset_insert(blklabname_(b), defuses_(csedef), NULL);
         if (debugging(DEBUG_CSE) && CSEDebugLevel(1))
             cc_msg("(subsumable) ");
     } else {
         for (csedef = localcsedefs ; csedef != NULL ; csedef = cdr_(csedef))
-            if (csedef->icode == deficode) break;
+            if (defic_(csedef) == deficode) break;
         if (csedef == NULL) {
-            csedef = mkCSEDef(node, b);
+            csedef = mk_CSEDef(node, b);
             setflag_(def, U_LOCALCSE);
             cdr_(csedef) = localcsedefs;
             localcsedefs = csedef;
         }
     }
-    csedef->icode = deficode;
-    cdr_(ref) = csedef->refs; csedef->refs = ref;
+    defic_(csedef) = deficode;
+    cdr_(ref) = defrefs_(csedef); defrefs_(csedef) = ref;
     refuse_(ref) = ExprnUse_New(NULL, 0, valno);
+    setnvals_(refuse_(ref), nvals);
+
     if (debugging(DEBUG_CSE) && CSEDebugLevel(1))
         cc_msg("-- local CSE reference [%ld]\n", exid_(node));
     return YES;
 }
 
-static VRegSetP exprnswantedby(LabelNumber *q, bool allpaths)
+static VRegSetP ExprnsWantedBy(LabelNumber *q, bool allpaths)
 {
     if (is_exit_label(q))
         return NULL;
     else {
-        CSEBlockHead *p = q->block->cse;
+        CSEBlockHead *p = blkcse_(q->block);
         VRegSetP s = cseset_copy(allpaths ? p->wantedonallpaths :
                                             p->wantedlater);
         if (p->killedinverted)
@@ -433,30 +419,30 @@ static VRegSetP exprnswantedby(LabelNumber *q, bool allpaths)
     }
 }
 
-static void exprnsreaching(BlockHead *p)
+static void ExprnsReaching(BlockHead *p)
 {
     VRegSetP s1, s2;
     if (blkflags_(p) & BLKSWITCH) {
         LabelNumber **v = blktable_(p);
         int32 i, n = blktabsize_(p);
-        s1 = exprnswantedby(v[0], NO);
-        s2 = exprnswantedby(v[0], YES);
+        s1 = ExprnsWantedBy(v[0], NO);
+        s2 = ExprnsWantedBy(v[0], YES);
         for (i = 1 ; i < n ; i++) {
-            VRegSetP s = exprnswantedby(v[i], NO);
+            VRegSetP s = ExprnsWantedBy(v[i], NO);
             cseset_union(s1, s);
             cseset_discard(s);
-            s = exprnswantedby(v[i], YES);
+            s = ExprnsWantedBy(v[i], YES);
             cseset_intersection(s2, s);
             cseset_discard(s);
         }
     } else {
-        s1 = exprnswantedby(blknext_(p), NO);
-        s2 = exprnswantedby(blknext_(p), YES);
+        s1 = ExprnsWantedBy(blknext_(p), NO);
+        s2 = ExprnsWantedBy(blknext_(p), YES);
         if (blkflags_(p) & BLK2EXIT) {
-            VRegSetP s = exprnswantedby(blknext1_(p), NO);
+            VRegSetP s = ExprnsWantedBy(blknext1_(p), NO);
             cseset_union(s1, s);
             cseset_discard(s);
-            s = exprnswantedby(blknext1_(p), YES);
+            s = ExprnsWantedBy(blknext1_(p), YES);
             cseset_intersection(s2, s);
             cseset_discard(s);
         }
@@ -465,7 +451,7 @@ static void exprnsreaching(BlockHead *p)
     blk_wantedonallpaths_(p) = s2;
 }
 
-static bool containsloadr(Exprn *p)
+static bool ContainsLoadr(Exprn *p)
 { /* A temporary bodge.  Expressions containing a register whose value is
    * unknown are valid local CSEs, but not valid outside their block (because
    * before the LOADR was created, earlier loads to the register would have
@@ -478,20 +464,22 @@ static bool containsloadr(Exprn *p)
     switch (extype_(p)) {
     case E_LOADR:
         return YES;
+    case E_TERNARY:
+        if (ContainsLoadr(e3_(p))) return YES;
     case E_BINARY:
-        if (containsloadr(e2_(p))) return YES;
+        if (ContainsLoadr(e2_(p))) return YES;
     case E_BINARYK:
     case E_UNARY:
-        return containsloadr(e1_(p));
+        return ContainsLoadr(e1_(p));
     case E_LOAD:
         {   Location *loc = exloc_(p);
             if (loctype_(loc) & LOC_anyVAR) return NO;
-            return containsloadr(locbase_(loc));
+            return ContainsLoadr(locbase_(loc));
         }
     case E_CALL:
         {   int32 i;
             for (i = 0 ; i < exnargs_(p) ; i++)
-                if (containsloadr(exarg_(p, i))) return YES;
+                if (ContainsLoadr(exarg_(p, i))) return YES;
         }
         return NO;
     default:
@@ -499,16 +487,16 @@ static bool containsloadr(Exprn *p)
     }
 }
 
-static void addcse(int32 n, VoidStar arg)
+static void AddCSE(int32 n, void *arg)
 {
     Exprn *ex = exprn_(n);
-    if ( !containsloadr(ex) && worthreplacement(ex))
-        addtocselist(ex, (BlockHead *)arg, YES);
+    if ( !ContainsLoadr(ex) && WorthReplacement(ex))
+        AddToCSEList(ex, (BlockHead *)arg, YES);
 }
 
-static CSEBlockHead *new_CSEBlockHead(void)
+CSEBlockHead *CSEBlockHead_New(void)
 {
-    CSEBlockHead *q = (CSEBlockHead *)CSEAlloc(sizeof(CSEBlockHead));
+    CSEBlockHead *q = CSENew(CSEBlockHead);
     q->available = NULL; q->wanted = NULL;
     q->wantedlater = NULL; q->wantedonallpaths = NULL;
     q->killed = NULL;
@@ -519,12 +507,15 @@ static CSEBlockHead *new_CSEBlockHead(void)
     q->scanned = NO;
     q->locvals = NULL;
     q->cmp = NULL;
+    q->ternaryr = GAP;
+    q->defs2 = NULL;
+    q->refs = NULL;
     return q;
 }
 
 #define dominates(p, q) cseset_member(blklabname_(p), blk_dominators_(q))
 
-static bool prunesuccessors(LabelNumber *lab, VRegSetP s)
+static bool PruneSuccessors(LabelNumber *lab, VRegSetP s)
 {
     if (is_exit_label(lab)) return NO;
 
@@ -546,10 +537,16 @@ bool cse_AddPredecessor(LabelNumber *lab, BlockHead *p)
 {
     if (!is_exit_label(lab) &&
         !BlockList_Member(p, blk_pred_(lab->block))) {
-      blk_pred_(lab->block) = mkCSEBlockList(blk_pred_(lab->block), p);
+      blk_pred_(lab->block) = mk_CSEBlockList(blk_pred_(lab->block), p);
       return YES;
     } else
       return NO;
+}
+
+void cse_RemovePredecessor(LabelNumber *lab, BlockHead *b)
+{
+    if (!is_exit_label(lab))
+      blk_pred_(lab->block) = (BlockList *)generic_ndelete((IPtr)b, (List *)blk_pred_(lab->block));
 }
 
 static void PruneDominatorSets(void) {
@@ -564,11 +561,11 @@ static void PruneDominatorSets(void) {
                     LabelNumber **v = blktable_(p);
                     int32 i, n = blktabsize_(p);
                     for (i=0; i<n; i++)
-                        changed = changed | prunesuccessors(v[i], s);
+                        changed = changed | PruneSuccessors(v[i], s);
                 } else {
-                    changed = changed | prunesuccessors(blknext_(p), s);
+                    changed = changed | PruneSuccessors(blknext_(p), s);
                     if (blkflags_(p) & BLK2EXIT)
-                        changed = changed | prunesuccessors(blknext1_(p), s);
+                        changed = changed | PruneSuccessors(blknext1_(p), s);
                 }
             }
         }
@@ -611,23 +608,24 @@ static void CSEFoundLoop(BlockHead *header, BlockHead *tail, BlockList *members)
       cc_msg("fake outer loop:");
     else
       cc_msg("loop %ld<-%ld:", (long)blklabname_(header), (long)blklabname_(tail));
-    for (; members != NULL; members = members->blklstcdr)
+    for (; members != NULL; members = cdr_(members))
       cc_msg(" %ld", (long)blklabname_(members->blklstcar));
     cc_msg("\n");
   }
 }
 
-static void mkLoopList(
+static LoopList *mk_LoopList(
+    LoopList *next,
     BlockList *members, BlockHead *preheader, BlockHead *header,
-    BlockHead *tail, LoopList **insert) {
-  LoopList *l = (LoopList *)CSEAlloc(sizeof(LoopList));
-  l->members = members; l->preheader = preheader; l->header = header; l->tail = tail;
-  cdr_(l) = *insert;
-  *insert = l;
+    BlockHead *tail) {
+  LoopList *l = CSENew(LoopList);
+  ll_mem_(l) = members; ll_prehdr_(l) = preheader; ll_hdr_(l) = header; ll_tail_(l) = tail;
+  cdr_(l) = next;
+  return l;
 }
 
 static void ReplaceInBlockList(BlockList *bl, BlockHead *oldb, BlockHead *newb) {
-    for (; bl != NULL; bl = bl->blklstcdr)
+    for (; bl != NULL; bl = cdr_(bl))
         if (bl->blklstcar == oldb) {
             bl->blklstcar = newb;
             return;
@@ -635,11 +633,11 @@ static void ReplaceInBlockList(BlockList *bl, BlockHead *oldb, BlockHead *newb) 
 }
 
 static BlockHead *cse_InsertBlockBetween(BlockHead *before, BlockHead *after) {
-    BlockHead *newb = insertblockbetween(before, after);
-    newb->cse = new_CSEBlockHead();
+    BlockHead *newb = insertblockbetween(before, after, YES);
+    blkcse_(newb) = CSEBlockHead_New();
     blk_dominators_(newb) = cseset_copy(blk_dominators_(after));
     blkflags_(newb) |= BLKLOOP;
-    blk_pred_(newb) = mkCSEBlockList(NULL, before);
+    blk_pred_(newb) = mk_CSEBlockList(NULL, before);
     ReplaceInBlockList(blk_pred_(after), before, newb);
 
     {   /* Must add the new block to dominator sets now, or if it's a preheader
@@ -656,7 +654,7 @@ static BlockHead *cse_InsertBlockBetween(BlockHead *before, BlockHead *after) {
     return newb;
 }
 
-static BlockHead *makepreheader(BlockHead *pred, BlockHead *header)
+static BlockHead *MakePreheader(BlockHead *pred, BlockHead *header)
 {
     BlockHead *preheader = cse_InsertBlockBetween(pred, header);
     blkflags_(preheader) |= BLKLOOP;
@@ -712,16 +710,16 @@ static void AddLoop(BlockHead *p, LabelNumber *q)
                     if (ll->tail == p) return; /* already got this one */
                 break;
             }
-        bl = mkCSEBlockList(NULL, p);
-        members = mkCSEBlockList(NULL, header);
+        bl = mk_CSEBlockList(NULL, p);
+        members = mk_CSEBlockList(NULL, header);
         while (bl != NULL) {
             BlockHead *b = bl->blklstcar;
-            bl = bl->blklstcdr;
+            bl = cdr_(bl);
             if (!BlockList_Member(b, members)) {
                 BlockList *pred = blk_pred_(b);
-                members = mkCSEBlockList(members, b);
-                for (; pred != NULL; pred = pred->blklstcdr)
-                    bl = mkCSEBlockList(bl, pred->blklstcar);
+                members = mk_CSEBlockList(members, b);
+                for (; pred != NULL; pred = cdr_(pred))
+                    bl = mk_CSEBlockList(bl, pred->blklstcar);
             }
         }
         /* allow for possible compilation of while(a) b; as
@@ -731,7 +729,7 @@ static void AddLoop(BlockHead *p, LabelNumber *q)
         if (blk_cmp_(header) != NULL) {
             BlockList *pred = blk_pred_(header);
             BlockHead *b = NULL;
-            for (; pred != NULL; pred = pred->blklstcdr)
+            for (; pred != NULL; pred = cdr_(pred))
                 if (!BlockList_Member(pred->blklstcar, members)) {
                     if (b != NULL) {
                         b = NULL;
@@ -739,10 +737,11 @@ static void AddLoop(BlockHead *p, LabelNumber *q)
                     }
                     b = pred->blklstcar;
                 }
-            if (b != NULL && dominates(b, header) &&
-                ExSetsOverlap(blk_cmp_(b), blk_cmp_(header)) &&
-                Q_issame(blkflags_(b) & Q_MASK, Q_NEGATE(blkflags_(p) & Q_MASK)) &&
-                blknext1_(b) == blknext_(p)) {
+            if (b != NULL && dominates(b, header)
+                && ExSetsOverlap(blk_cmp_(b), blk_cmp_(header))
+                && Q_issame(blkflags_(b) & Q_MASK, Q_NEGATE(blkflags_(p) & Q_MASK))
+                && blknext1_(b) == blknext_(p)) {
+
                 LabelNumber *l1 = blknext_(b), *l2 = blknext1_(b);
                 BlockHead *newb = cse_InsertBlockBetween(b, header);
                 blknext_(newb) = l1; blknext1_(newb) = l2;
@@ -753,7 +752,7 @@ static void AddLoop(BlockHead *p, LabelNumber *q)
                 blkflags_(b) = (blkflags_(b) & ~(BLK2EXIT | Q_MASK)) | BLKREXPORTED | BLKREXPORTED2;
                 ExSet_TransferExprnsInSet(&blk_available_(b), &blk_available_(newb), blk_cmp_(b));
                 blk_cmp_(b) = NULL;
-                members = mkCSEBlockList(members, newb);
+                members = mk_CSEBlockList(members, newb);
                 if (l1 == blklab_(header)) l1 = l2;
                 if (!is_exit_label(l1))
                     ReplaceInBlockList(blk_pred_(l1->block), b, newb);
@@ -764,14 +763,14 @@ static void AddLoop(BlockHead *p, LabelNumber *q)
                         for (l = ll->loops; l != NULL; l = cdr_(l))
                             if (l->tail == b) {
                                 BlockList *bl = l->members;
-                                for (; bl != NULL; bl = bl->blklstcdr)
+                                for (; bl != NULL; bl = cdr_(bl))
                                     if (bl->blklstcar == b) {
                                         bl->blklstcar = newb;
                                         break;
                                     }
                                 l->tail = newb;
                             } else if (BlockList_Member(b, l->members))
-                                l->members = mkCSEBlockList(l->members, newb);
+                                l->members = mk_CSEBlockList(l->members, newb);
                 }
             }
         }
@@ -783,7 +782,7 @@ static void AddLoop(BlockHead *p, LabelNumber *q)
 
             if (l == NULL) *ll = l = (LoopListList *) CSEList3(NULL, header, NULL);
 
-            {   LLL_Loop *newl = (LLL_Loop *) CSEAlloc(sizeof(*newl));
+            {   LLL_Loop *newl = CSENew(LLL_Loop);
                 cdr_(newl) = l->loops; newl-> members = members; newl->tail = p;
                 newl->memberset = NULL;
                 l->loops = newl;
@@ -796,7 +795,7 @@ static BlockHead *AddBlockBeforeHeader(BlockHead *header, char *s) {
   BlockHead *b = NULL;
   BlockList *bl, *prev = NULL;
   LabelNumber *blab = NULL;
-  for (bl = blk_pred_(header); bl != NULL; prev = bl, bl = bl->blklstcdr)
+  for (bl = blk_pred_(header); bl != NULL; prev = bl, bl = cdr_(bl))
     if (!dominates(header, bl->blklstcar)) {
       BlockHead *pred = bl->blklstcar;
       if (debugging(DEBUG_CSE) && CSEDebugLevel(2)) {
@@ -806,14 +805,14 @@ static BlockHead *AddBlockBeforeHeader(BlockHead *header, char *s) {
                (long)lab_name_(blklab_(header)));
       }
       if (b == NULL) {
-        b = makepreheader(pred, header);
+        b = MakePreheader(pred, header);
         bl->blklstcar = b;
         blab = blklab_(b);
         if (debugging(DEBUG_CSE) && CSEDebugLevel(2))
           cc_msg("%s = %ld\n", s, (long)blklabname_(b));
       } else {
         changesuccessors(pred, blab, blklab_(header));
-        prev->blklstcdr = bl->blklstcdr;
+        cdr_(prev) = cdr_(bl);
         bl = prev;
       }
       cse_AddPredecessor(blab, pred);
@@ -831,9 +830,9 @@ static void AddBlockToLoopsContaining(BlockHead *b, BlockHead *newbh) {
     if (x->header != b)
       for (l = x->loops; l != NULL; l = cdr_(l)) {
         BlockList *members = l->members;
-        for (; members != NULL; members = members->blklstcdr)
+        for (; members != NULL; members = cdr_(members))
           if (members->blklstcar == b)
-            members->blklstcdr = mkCSEBlockList(members->blklstcdr, newbh);
+            cdr_(members) = mk_CSEBlockList(cdr_(members), newbh);
       }
 }
 
@@ -856,7 +855,7 @@ static void InsertPreheaders(void) {
       LoopSet *loopsets = NULL;
       for (l = ll->loops; l != NULL; l = cdr_(l)) {
         BlockList *m  = l->members;
-        for (; m != NULL; m = m->blklstcdr) {
+        for (; m != NULL; m = cdr_(m)) {
           BlockHead *b = m->blklstcar;
           if (blk_loopempty_(b) != LOOP_NONEMPTY) {
             if (LoopEmptyBlock(b)) continue;
@@ -897,7 +896,7 @@ static void InsertPreheaders(void) {
             goto nextloop;
           }
         }
-        ls = (LoopSet *) CSEAlloc(sizeof(LoopSet));
+        ls = CSENew(LoopSet);
         cdr_(ls) = *lsp; ls->loops = l; cdr_(l) = NULL;
         ls->un = cseset_copy(l->memberset);
         ls->xn = cseset_copy(l->memberset);
@@ -935,7 +934,7 @@ nextloop:;
           blkflags_(newheader) &= ~BLKLOOP;
           for (l = ls->loops; l != NULL; l = cdr_(l))
             changesuccessors(l->tail, blklab_(newheader), blklab_(header));
-          n = (LoopListList *) CSEAlloc(sizeof(*n));
+          n = CSENew(LoopListList);
           cdr_(n) = cdr_(ll);
           n->header = newheader; n->loops = ls->loops;
           cdr_(ll) = n;
@@ -950,11 +949,11 @@ nextloop:;
     BlockHead *preheader = AddBlockBeforeHeader(header, "preheader");
     AddBlockToLoopsContaining(header, preheader);
     for (l = ll->loops; l != NULL; l = cdr_(l))
-      mkLoopList(l->members, preheader, header, l->tail, &all_loops);
+      all_loops = mk_LoopList(all_loops, l->members, preheader, header, l->tail);
   }
 }
 
-static void findloops(void)
+static void FindLoops(void)
 {
     BlockHead *p;
     BlockList *allbuttop = NULL;
@@ -972,7 +971,7 @@ static void findloops(void)
     }
     InsertPreheaders();
     for (p = blkdown_(top_block); p != NULL; p = blkdown_(p))
-        allbuttop = mkCSEBlockList(allbuttop, p);
+        allbuttop = mk_CSEBlockList(allbuttop, p);
 
     {   /* Since we no longer necessarily lift expressions from the fake outer
            loop into its preheader, we need to know which blocks are inside
@@ -981,8 +980,8 @@ static void findloops(void)
         LoopList *lp;
         loopmembers = NULL;
         for (lp = all_loops; lp != NULL; lp = cdr_(lp)) {
-           BlockList *m = lp->members;
-           for (; m != NULL; m = m->blklstcdr) {
+           BlockList *m = ll_mem_(lp);
+           for (; m != NULL; m = cdr_(m)) {
                cseset_insert(blklabname_(m->blklstcar), loopmembers, NULL);
            }
         }
@@ -991,19 +990,19 @@ static void findloops(void)
                believe this no longer to be the case.
          */
         for (lp = all_loops; lp != NULL; lp = cdr_(lp))
-            if (cseset_member(blklabname_(blkup_(lp->preheader)), loopmembers))
-                cseset_insert(blklabname_(lp->preheader), loopmembers, NULL);
+            if (cseset_member(blklabname_(blkup_(ll_prehdr_(lp))), loopmembers))
+                cseset_insert(blklabname_(ll_prehdr_(lp)), loopmembers, NULL);
     }
 
     /* Add a spurious whole function loop */
-    {   BlockHead *h = makepreheader(top_block, blknext_(top_block)->block);
+    {   BlockHead *h = MakePreheader(top_block, blknext_(top_block)->block);
         CSEFoundLoop(NULL, NULL, allbuttop);
-        mkLoopList(allbuttop, h, NULL, NULL, &all_loops);
+        all_loops = mk_LoopList(all_loops, allbuttop, h, NULL, NULL);
         blkflags_(h) |= BLKOUTER;
     }
 }
 
-static bool prunereached(BlockHead *defblock, LabelNumber *lab)
+static bool PruneReached(BlockHead *defblock, LabelNumber *lab)
 {
     if (is_exit_label(lab)) return NO;
     {   BlockHead *b = lab->block;
@@ -1016,7 +1015,7 @@ static bool prunereached(BlockHead *defblock, LabelNumber *lab)
 
 static void FindRefIcodes(CSEDef *def, ExprnUse *uses)
 {
-    BlockHead *defblock = def->block;
+    BlockHead *defblock = defblock_(def);
     ExprnUse *defuse;
     CSERef *l, **prevp;
     /* There may be many occurrences of this expression in the block
@@ -1029,10 +1028,12 @@ static void FindRefIcodes(CSEDef *def, ExprnUse *uses)
         if (blklength_(defblock) != 0)
             syserr(syserr_cse_lost_def);
         else  /* must be an extracted loop invariant */
-            def->icode = NULL;
+            defic_(def) = NULL;
+    else if (!IsRealIcode(defuse))
+        defic_(def) = blkcode_(defblock)-1;
     else
-        def->icode = &useicode_(defuse);
-    for (l = def->refs, prevp = &def->refs ; l != NULL ; l = cdr_(l)) {
+        defic_(def) = &useicode_(defuse);
+    for (l = defrefs_(def), prevp = &defrefs_(def) ; l != NULL ; l = cdr_(l)) {
         /* Again, there may be many references: we want the first in the block
          * (which we come to last): for all the others, the expression will
          * have a different value.
@@ -1056,27 +1057,27 @@ static void FindRefIcodes(CSEDef *def, ExprnUse *uses)
 
 static void DiscardDef(CSEDef *discard, CSEDef *keep)
 {
-    cseset_discard(discard->uses);
-    discard->uses = NULL;
-    while (discard->refs != NULL) {
+    cseset_discard(defuses_(discard));
+    defuses_(discard) = NULL;
+    while (defrefs_(discard) != NULL) {
         CSERef *p;
-        ExprnUse *use = refuse_(discard->refs);
-        for (p = keep->refs; p != NULL; p = cdr_(p))
+        ExprnUse *use = refuse_(defrefs_(discard));
+        for (p = defrefs_(keep); p != NULL; p = cdr_(p))
             if (refuse_(p) == use) break;
         if (p == NULL)
-            keep->refs = (CSERef *)CSEList2(keep->refs, use);
-        discard->refs = (CSERef *)discard2((List *)discard->refs);
+            defrefs_(keep) = mk_CSERef(defrefs_(keep), use);
+        defrefs_(discard) = CSERef_DiscardOne(defrefs_(discard));
     }
 }
 
 static void RemoveSubRefs(CSEDef *sub, CSEDef *super) {
     CSERef *subref;
-    for (subref = sub->refs; subref != NULL; subref = cdr_(subref)) {
+    for (subref = defrefs_(sub); subref != NULL; subref = cdr_(subref)) {
         CSERef *p, **pp;
         ExprnUse *use = refuse_(subref);
-        for (pp = &super->refs; (p = *pp) != NULL; pp = &cdr_(p))
+        for (pp = &defrefs_(super); (p = *pp) != NULL; pp = &cdr_(p))
             if (refuse_(p) == use) {
-                *pp = (CSERef *)discard2((List *)p);
+                *pp = CSERef_DiscardOne(p);
                 break;
             }
     }
@@ -1088,14 +1089,14 @@ static void MakeSubdef(CSEDef *sub, CSEDef *super)
      Do not alter super->uses, or its use in ordering defs will be
      defeated (it has no other use).
    */
-    if (sub->super != NULL) {
-        CSEDef *p, **pp = &sub->super->subdefs;
-        for (; (p = *pp) != sub; pp = &p->nextsub)
+    if (defsuper_(sub) != NULL) {
+        CSEDef *p, **pp = &defsub_(defsuper_(sub));
+        for (; (p = *pp) != sub; pp = &defnextsub_(p))
             if (p == NULL) syserr(syserr_cse_makesubdef);
-        *pp = sub->nextsub;
+        *pp = defnextsub_(sub);
     }
-    sub->super = super;
-    sub->nextsub = super->subdefs; super->subdefs = sub;
+    defsuper_(sub) = super;
+    defnextsub_(sub) = defsub_(super); defsub_(super) = sub;
 
     RemoveSubRefs(sub, super);
 }
@@ -1104,15 +1105,15 @@ static void LinkRefs(CSE *cse, CSEDef *def)
 { /* For the definition  def  of  cse, find the uses of it (blocks for which
    * it is wanted) which the definition must reach.
    */
-    BlockHead *defblock = def->block;
+    BlockHead *defblock = defblock_(def);
     bool local;
-    if (def->uses != NULL) {
-    /* Non-null def->uses here means a local CSE which may be subsumed */
+    if (defuses_(def) != NULL) {
+    /* Non-null defuses here means a local CSE which may be subsumed */
         if (debugging(DEBUG_CSE))
             cc_msg("  %ld local", (long)blklabname_(defblock));
         local = YES;
     } else {
-        int32 exid = exid_(cse->exprn);
+        int32 exid = exid_(cseex_(cse));
         int32 defnest = blknest_(defblock);
         BlockHead *p;
         bool changed;
@@ -1120,7 +1121,7 @@ static void LinkRefs(CSE *cse, CSEDef *def)
             cc_msg("  %ld r", (long)blklabname_(defblock));
         for (p = top_block; p != NULL; p = blkdown_(p))
             blk_reached_(p) = dominates(defblock, p);
-        if (extype_(cse->exprn) != E_UNARYK) {
+        if (extype_(cseex_(cse)) != E_UNARYK) {
         /* Constants can't be killed, so they'll reach everything dominated
            by the block containing their definition.
          */
@@ -1135,11 +1136,11 @@ static void LinkRefs(CSE *cse, CSEDef *def)
                             LabelNumber **v = blktable_(p);
                             int32 i, n = blktabsize_(p);
                             for (i=0; i<n; i++)
-                                changed = changed | prunereached(defblock, v[i]);
+                                changed = changed | PruneReached(defblock, v[i]);
                         } else {
-                            changed = changed | prunereached(defblock, blknext_(p));
+                            changed = changed | PruneReached(defblock, blknext_(p));
                             if (blkflags_(p) & BLK2EXIT)
-                                changed = changed | prunereached(defblock, blknext1_(p));
+                                changed = changed | PruneReached(defblock, blknext1_(p));
                         }
                     }
                 }
@@ -1154,7 +1155,7 @@ static void LinkRefs(CSE *cse, CSEDef *def)
                     all loops which defblock is
                   */
                     ) {
-                    def->refs = (CSERef *) syn_cons2(def->refs, p);
+                    defrefs_(def) = mk_CSERef(defrefs_(def), p);
                     if (debugging(DEBUG_CSE))
                         cc_msg(" %ld", (long)blklabname_(p));
                 }
@@ -1163,50 +1164,50 @@ static void LinkRefs(CSE *cse, CSEDef *def)
         local = NO;
     }
 
-    if (def->refs != NULL) {
-        /* if this isn't a local def, def->refs is a list of blocks; change it
+    if (defrefs_(def) != NULL) {
+        /* if this isn't a local def, defrefs is a list of blocks; change it
            now to a list of ExprnUse.  (which it already is for local defs)
          */
         if (!local)
-            FindRefIcodes(def, exuses_(cse->exprn));
+            FindRefIcodes(def, exuses_(cseex_(cse)));
 
         if ( (blkflags_(defblock) & BLKOUTER) &&
-             ( def->refs == NULL || /* findreficodes may have discarded some */
-               cdr_(def->refs) == NULL) ) {
+             ( defrefs_(def) == NULL || /* findreficodes may have discarded some */
+               cdr_(defrefs_(def)) == NULL) ) {
             if (debugging(DEBUG_CSE)) cc_msg(": unwanted outer loop inv");
-        } else if (def->refs != NULL) {
+        } else if (defrefs_(def) != NULL) {
             CSEDef **pp, *p;
             bool discard = NO;
-            for (pp = &cse->def ; (p = *pp) != NULL ; pp = &cdr_(p)) {
-                int cf = cseset_compare(def->uses, p->uses);
+            for (pp = &csedef_(cse) ; (p = *pp) != NULL ; pp = &cdr_(p)) {
+                int cf = cseset_compare(defuses_(def), defuses_(p));
                 /* Equality can only happen here if one def is local */
                 if (cf == VR_SUBSET ||
                            (cf == VR_EQUAL && local)) {
-                    if (pseudo_reads_r2(exop_(cse->exprn))) {
+                    if (pseudo_reads_r2(exop_(cseex_(cse)))) {
                         MakeSubdef(def, p);
                         if (debugging(DEBUG_CSE))
-                            cc_msg(": subdef of %ld", (long)blklabname_(p->block));
+                            cc_msg(": subdef of %ld", (long)blklabname_(defblock_(p)));
                     } else {
                         DiscardDef(def, p);
                         if (debugging(DEBUG_CSE))
-                            cc_msg(": killed (%ld)", (long)blklabname_(p->block));
+                            cc_msg(": killed (%ld)", (long)blklabname_(defblock_(p)));
                         discard = YES;
                     }
                     break;
                 } else if (cf == VR_SUPERSET || cf == VR_EQUAL) {
-                    if (pseudo_reads_r2(exop_(cse->exprn))) {
-                        if ( p->super != NULL &&
-                             cseset_compare(def->uses, p->super->uses) == VR_SUPERSET)
+                    if (pseudo_reads_r2(exop_(cseex_(cse)))) {
+                        if ( defsuper_(p) != NULL &&
+                             cseset_compare(defuses_(def), defuses_(defsuper_(p))) == VR_SUPERSET)
                             RemoveSubRefs(p, def);
                         else {
                             MakeSubdef(p, def);
                             if (debugging(DEBUG_CSE))
-                                cc_msg(": has subdef %ld", (long)blklabname_(p->block));
+                                cc_msg(": has subdef %ld", (long)blklabname_(defblock_(p)));
                         }
                     } else {
                         DiscardDef(p, def);
                         if (debugging(DEBUG_CSE))
-                            cc_msg(": kills %ld", (long)blklabname_(p->block));
+                            cc_msg(": kills %ld", (long)blklabname_(defblock_(p)));
                     }
                 }
             }
@@ -1223,10 +1224,10 @@ static void LinkRefsToDefs(void)
 {
     CSE *cse;
     for ( cse = cselist ; cse != NULL ; cse = cdr_(cse) ) {
-        CSEDef *def = cse->def, *next;
-        cse->def = NULL;
+        CSEDef *def = csedef_(cse), *next;
+        csedef_(cse) = NULL;
         if (debugging(DEBUG_CSE))
-            cse_print_node(cse->exprn);
+            cse_print_node(cseex_(cse));
         for (; def != NULL ; def = next) {
         /* There used to be code here to discard this def if it was a ref of
            one previously encountered, (to save work, since LinkRefs() would
@@ -1240,16 +1241,16 @@ static void LinkRefsToDefs(void)
         }
         if (debugging(DEBUG_CSE)) {
             cc_msg(" sorted:\n");
-            for (def = cse->def; def != NULL ; def = cdr_(def)) {
-                CSERef *ref = def->refs;
-                cc_msg("  %ld:", blklabname_(def->block));
+            for (def = csedef_(cse); def != NULL ; def = cdr_(def)) {
+                CSERef *ref = defrefs_(def);
+                cc_msg("  %ld:", blklabname_(defblock_(def)));
                 for (; ref != NULL; ref = cdr_(ref))
                     cc_msg(" %ld", blklabname_(refuse_(ref)->block));
-                if (def->subdefs != NULL) {
-                    CSEDef *sub = def->subdefs;
+                if (defsub_(def) != NULL) {
+                    CSEDef *sub = defsub_(def);
                     char *s = " <";
-                    for (; sub != NULL; sub = sub->nextsub) {
-                        cc_msg("%s%ld", s, blklabname_(sub->block));
+                    for (; sub != NULL; sub = defnextsub_(sub)) {
+                        cc_msg("%s%ld", s, blklabname_(defblock_(sub)));
                         s = " ";
                     }
                     cc_msg(">");
@@ -1260,7 +1261,7 @@ static void LinkRefsToDefs(void)
     }
 }
 
-static bool safetolift(Exprn *ex)
+static bool SafeToLift(Exprn *ex)
 {
     J_OPCODE op = exop_(ex) & J_TABLE_BITS;
     switch (extype_(ex)) {
@@ -1276,8 +1277,11 @@ static bool safetolift(Exprn *ex)
             return NO;
     default:
             /* what about other floating pt ops ? */
-            return (safetolift(e2_(ex)) && safetolift(e1_(ex)));
+            return (SafeToLift(e2_(ex)) && SafeToLift(e1_(ex)));
         }
+
+    case E_TERNARY:
+        return (SafeToLift(e3_(ex)) && SafeToLift(e2_(ex)) && SafeToLift(e1_(ex)));
 
     case E_BINARYK:
         switch (op)
@@ -1287,7 +1291,7 @@ static bool safetolift(Exprn *ex)
         /* drop through - what about floating pt ? */
 
     case E_UNARY:
-        return safetolift(e1_(ex));
+        return SafeToLift(e1_(ex));
 
     default:
     case E_MISC:
@@ -1300,26 +1304,26 @@ static bool safetolift(Exprn *ex)
     case E_LOAD:
         {   Location *loc = exloc_(ex);
             if (loctype_(loc) & LOC_anyVAR) return YES;
-            return (adconbase(locbase_(loc), NO) != NULL);
+            return (cse_AdconBase(locbase_(loc), NO) != NULL);
         }
     }
 }
 
-static void addifsafe(int32 n, VoidStar arg)
+static void AddIfSafe(int32 n, void *arg)
 {
-    if (safetolift(exprn_(n))) addcse(n, arg);
+    if (SafeToLift(exprn_(n))) AddCSE(n, arg);
 }
 
-static void findloopinvariants(void)
+static void FindLoopInvariants(void)
 {
     LoopList *p;
     for (p = all_loops ; p != NULL ; p = cdr_(p)) {
-        BlockHead *b = p->preheader;
+        BlockHead *b = ll_prehdr_(p);
         BlockList *bl;
         VRegSetP w = cseset_copy(blk_wantedlater_(b));
         VRegSetP we = cseset_copy(blk_wantedonallpaths_(b));
         VRegSetP u = NULL;
-        for (bl = p->members ; bl != NULL ; bl = bl->blklstcdr) {
+        for (bl = p->members ; bl != NULL ; bl = cdr_(bl)) {
             BlockHead *c = bl->blklstcar;
             cseset_union(u, blk_wanted_(c));
             if (blk_killedinverted_(c)) {
@@ -1336,14 +1340,14 @@ static void findloopinvariants(void)
         cseset_discard(u);
         if (debugging(DEBUG_CSE)) {
             cc_msg("Loop L%ld:", (long)blklabname_(b));
-            for (bl = p->members ; bl != NULL ; bl = bl->blklstcdr)
+            for (bl = p->members ; bl != NULL ; bl = cdr_(bl))
                 cc_msg(" %ld", (long)blklabname_(bl->blklstcar));
             cc_msg(": safe"); cse_printset(we);
             cc_msg("; unsafe"); cse_printset(w);
             cc_msg("\n");
         }
-        cseset_map(we, addcse, (VoidStar)b);
-        cseset_map(w, addifsafe, (VoidStar)b);
+        cseset_map(we, AddCSE, (VoidStar)b);
+        cseset_map(w, AddIfSafe, (VoidStar)b);
     }
 }
 
@@ -1355,24 +1359,23 @@ static BindList *nconcbl(BindList *l, BindList *bl)
  */
     BindList *p = l;
     BindList *prev = NULL;
-    for ( ; p != NULL ; prev = p, p = p->bindlistcdr )
+    for ( ; p != NULL ; prev = p, p = cdr_(p) )
         if (p == bl) return l;
     if (prev == NULL) return bl;
-    prev->bindlistcdr = bl;
+    cdr_(prev) = bl;
     return l;
 }
 
-static Icode *storecse2(Icode *newic, VRegnum r1, Binder *binder)
+static Icode *StoreCSE2(Icode *newic, VRegnum r1, Binder *binder)
 {
     newic = newic+1;
-    newic->op = CSEaccessOp(r1, J_STRV);
+    INIT_IC(*newic, CSEaccessOp(r1, J_STRV));
     newic->r1.r = r1;
-    newic->r2.r = GAP;
-    newic->m.b = binder;
+    newic->r3.b = binder;
     return newic;
 }
 
-static Icode *storecse(Icode *newic, CSEDef *def)
+static Icode *StoreCSE(Icode *newic, CSEDef *def)
 { /*  ADCONs etc get treated specially here, in that rather than store
       into the CSE binder, we use an ADCON with the register for the CSE
       binder as r1.  This is so that, if the binder gets spilled, the ADCON
@@ -1381,34 +1384,31 @@ static Icode *storecse(Icode *newic, CSEDef *def)
       in case it isn't spilled).
    */
     VRegnum r1 = newic->r1.r;
-    if (is_call2(def->exprn)) {
-        VRegnum r2; Icode *call = newic-1;
-        if ((newic->op == J_CALLK && k_resultregs_(newic->r2.i) > 1) || /* @@@ pure OPSYSK */
-            (call->op == J_CALLK && k_resultregs_(call->r2.i) > 1))
-        /* First case for lifting out of loop; second normally */
-            r2 = R_A1+1, r1 = R_A1;
-        else
+    if (is_calln(defex_(def))) {
+        int32 i, nres = exnres_(defex_(def));
+        r1 = R_A1;
         /* Local CSE def which is a non-local ref */
         /* @@@ presumably, this should never happen now */
-            r2 = call->r1.r;
-        newic = storecse2(newic, r2, CSEBind2_(def));
+        /*   r2 = call->r1.r;*/
+        for (i = 1; i < nres; i++)
+            newic = StoreCSE2(newic, r1+i, defbinder_(def, i));
     }
 #ifdef TARGET_ALLOWS_COMPARE_CSES
-    if (is_compare(exop_(def->exprn))) {
-        newic->op = (newic->op & ~Q_MASK) | CSEDefMask_(def);
-        blkflags_(def->block) |= BLKCCEXPORTED;
+    if (is_compare(exop_(defex_(def)))) {
+        newic->op = (newic->op & ~Q_MASK) | defmask_(def);
+        blkflags_(defblock_(def)) |= BLKCCEXPORTED;
         return newic;
     }
 #endif
 
-    if (j_is_check(exop_(def->exprn)))
+    if (j_is_check(exop_(defex_(def))))
         return newic;
 
-    if (CSEBind_(def) == NULL)
-        syserr(syserr_storecse, (long)blklabname_(def->block),
-                                (long)exid_(def->exprn));
+    if (defbinder_(def, 0) == NULL)
+        syserr(syserr_storecse, (long)blklabname_(defblock_(def)),
+                                (long)exid_(defex_(def)));
     if (pseudo_reads_r2(newic->op)) {
-        VRegnum b = bindxx_(CSEBind_(def));
+        VRegnum b = bindxx_(defbinder_(def, 0));
         Icode *ic = newic+1;
         *ic = *newic;
         ic->r2.r = newic->r1.r = b;
@@ -1419,26 +1419,27 @@ static Icode *storecse(Icode *newic, CSEDef *def)
         note_slave(ic->r1.r, b);
         return ic;
     } else if (pseudo_reads_r1(newic->op)) {
-        VRegnum b = bindxx_(CSEBind_(def));
+        VRegnum b = bindxx_(defbinder_(def, 0));
         Icode *ic = newic+1;
         *ic = *newic;
-        newic->op = exop_(def->exprn);
-        newic->r2.r = GAP;
+        newic->op = exop_(defex_(def));
+        newic->r2.r = ic->r1.r;
+        if (ic->r1.r != GAP) note_slave(b, ic->r1.r);
         ic->r1.r = newic->r1.r = b;
         return ic;
     } else
-        return storecse2(newic, r1, CSEBind_(def));
+        return StoreCSE2(newic, r1, defbinder_(def, 0));
 }
 
-static int32 defsize(CSEDef *defs)
+static int32 DefsSize(CSEDef *defs)
 {
     int32 ndefs = 0;
     for (; defs != NULL; defs = cdr_(defs))
-        if (is_call2(defs->exprn))
-            ndefs += 2;
+        if (is_calln(defex_(defs)))
+            ndefs += exnres_(defex_(defs));
         else
-        if (!is_compare(exop_(defs->exprn))
-            && !j_is_check(exop_(defs->exprn)))
+        if (!is_compare(exop_(defex_(defs)))
+            && !j_is_check(exop_(defex_(defs))))
             ndefs++;
     cse_count += ndefs;
     return ndefs;
@@ -1453,13 +1454,21 @@ struct CopyList {
     Icode  icode;
     CopyCSE *cse;
     Exprn  *exprn;
+    int level;
 };
+#define cl_ic_(p) ((p)->icode)
+#define cl_cse_(p) ((p)->cse)
+#define cl_exprn_(p) ((p)->exprn)
+#define cl_level_(p) ((p)->level)
 
 struct CopyListList {
     CopyListList *cdr;
     CopyList *p;
     int resno;
 };
+#define cl_(q) ((q)->p)
+#define cll_resno_(q) ((q)->resno)
+#define mk_CopyListList(a,b,c) ((CopyListList*)CSEList3((a),(b),(c)))
 
 typedef struct CSEDefList CSEDefList;
 
@@ -1467,6 +1476,8 @@ struct CSEDefList {
     CSEDefList *cdr;
     CSEDef *def;
 };
+#define dl_def_(p) ((p)->def)
+#define mk_CSEDefList(a,b) ((CSEDefList *)CSEList2((a),(b)))
 
 struct CopyCSE {
     CopyCSE *cdr;
@@ -1477,46 +1488,73 @@ struct CopyCSE {
 
 static CopyCSE *addeddefs;
 
-static CopyList *copylist(
-    CopyList *cl, Exprn *exprn, J_OPCODE op, VRegnum r1, VRegnum r2, VRegInt m)
+static CopyList *mk_CopyList(
+    CopyList *cl, Exprn *exprn, const Icode *const ic, int level)
 {
-    CopyList *q = (CopyList *)CSEAlloc(sizeof(CopyList));
-    cdr_(q) = cl; q->cse = NULL; q->exprn = exprn;
-    q->icode.op = op; q->icode.r1.r = r1; q->icode.r2.r = r2; q->icode.m = m;
+    CopyList *q = CSENew(CopyList);
+    cdr_(q) = cl; cl_cse_(q) = NULL; cl_exprn_(q) = exprn; cl_level_(q) = level;
+    cl_ic_(q) = *ic;
     return q;
 }
 
-static CopyList *AddExprnsBelow(
-    CopyList *cl, Exprn *exprn, CopyList **clp, int32 *callcount);
+typedef struct LiftedTernaryList LiftedTernaryList;
+struct LiftedTernaryList {
+    LiftedTernaryList *cdr;
+    Exprn *ex;
+    union { CopyList *cl; Icode *ic; BlockHead *b; } e1, e2, e3;
+};
+#define lt_ex_(p) ((p)->ex)
+#define lt_mask_(p) (exmask_(lt_ex_(p)))
+#define lt_ic1_(p) ((p)->e1.ic)
+#define lt_ic2_(p) ((p)->e2.ic)
+#define lt_ic3_(p) ((p)->e3.ic)
+#define lt_cl1_(p) ((p)->e1.cl)
+#define lt_cl2_(p) ((p)->e2.cl)
+#define lt_cl3_(p) ((p)->e3.cl)
+#define lt_b1_(p) ((p)->e1.b)
+#define lt_b2_(p) ((p)->e2.b)
+#define lt_b3_(p) ((p)->e3.b)
 
-static VRegnum aeb_argumentreg(CopyList **cl, Exprn *e, int32 *callcount, int resno)
+typedef struct {
+    LiftedTernaryList *ternaries;
+    int32 callcount;
+} AEB_Res;
+
+static CopyList *AddExprnsBelow(
+    CopyList *cl, Exprn *exprn, int level, VRegnum targetr,
+    CopyList **clp, AEB_Res *resp);
+
+static VRegnum aeb_argumentreg(
+    CopyList **cl, Exprn *e, AEB_Res *resp, int resno, int level, VRegnum targetr)
 {
     CopyList *arg;
-    *cl = AddExprnsBelow(*cl, e, &arg, callcount);
-    if (arg->cse == NULL)
-        return arg->icode.r1.r;
+    *cl = AddExprnsBelow(*cl, e, level+1, targetr, &arg, resp);
+    if (cl_cse_(arg) == NULL)
+        return cl_ic_(arg).r1.r;
     else {
-        VRegnum oldr = arg->icode.r1.r,
-                newr = vregister(vregsort(oldr));
+        Icode ic;
+        VRegnum oldr = cl_ic_(arg).r1.r,
+                newr = targetr == GAP ? vregister(vregsort(oldr)) : targetr;
         if (pseudo_reads_r2(exop_(e)))
-            *cl = copylist(*cl, NULL,
-                           arg->icode.op,
-                           newr, GAP, arg->icode.m);
-        else {
-            VRegInt m;
-            m.i = 0;
-            *cl = copylist(*cl, NULL,
-                           CSEaccessOp(oldr, J_LDRV),
-                           newr, GAP, m);
+        {
+            INIT_IC(ic, cl_ic_(arg).op);
+            ic.r1.r = newr;
+            ic.r3 = cl_ic_(arg).r3;
+            *cl = mk_CopyList(*cl, NULL, &ic, level);
+        } else {
+            INIT_IC(ic, CSEaccessOp(oldr, J_LDRV));
+            ic.r1.r = newr;
+            ic.r3.i = 0;
+            *cl = mk_CopyList(*cl, NULL, &ic, level);
         }
-        arg->cse->refs = (CopyListList*)CSEList3(arg->cse->refs, *cl, resno);
+        cl_cse_(arg)->refs = mk_CopyListList(cl_cse_(arg)->refs, *cl, resno);
         return newr;
     }
 }
 
 static CopyCSE *mk_CopyCSE(CopyList *p)
 {
-    CopyCSE *q = (CopyCSE *)CSEAlloc(sizeof(CopyCSE));
+    CopyCSE *q = CSENew(CopyCSE);
     cdr_(q) = addeddefs; q->def = p;
     q->refs = NULL; q->csedefs = NULL;
     addeddefs = q;
@@ -1524,40 +1562,61 @@ static CopyCSE *mk_CopyCSE(CopyList *p)
 }
 
 static CopyList *AddExprnsBelow(
-    CopyList *cl, Exprn *exprn, CopyList **clp, int32 *callcount)
+    CopyList *cl, Exprn *exprn, int level, VRegnum targetr,
+    CopyList **clp, AEB_Res *resp)
 {
     CopyList *p;
-    for (p = cl ; p != NULL ; p = cdr_(p))
-        if (p->exprn == exprn) {
-            if (p->cse == NULL) p->cse = mk_CopyCSE(p);
-            break;
-        }
+    if (is_compare(exop_(exprn)))
+        p = NULL;
+    else
+        for (p = cl ; p != NULL ; p = cdr_(p))
+            if (cl_exprn_(p) == exprn) {
+                if (cl_cse_(p) == NULL)
+                    cl_cse_(p) = mk_CopyCSE(p);
+                break;
+            }
 
     if (p == NULL) {
-        J_OPCODE op = exop_(exprn);
-        RegSort r1sort = destregsort(op);
-        VRegnum r1 = r1sort == GAP ? GAP : vregister(r1sort);
-        VRegnum r2 = GAP;
-        VRegInt m; m.i = 0;
+        Icode ic;
+        RegSort r1sort;
+        INIT_IC(ic, exop_(exprn));
+        r1sort = DestRegSort(ic.op);
+        ic.r1.r = targetr != GAP ? targetr :
+                   r1sort == GAP ? GAP :
+                                   vregister(r1sort);
         switch (extype_(exprn)) {
         case E_UNARYK:
-            m.i = e1k_(exprn);
+            ic.r3.i = e1k_(exprn);
             break;
         case E_UNARY:
             {   int resno = 0;
-                if (op == J_RESULT2)
-                    resno = 1, op = J_MOVR;
-                m.r = aeb_argumentreg(&cl, e1_(exprn), callcount, resno);
+                if (ic.op == J_RESULT2)
+                    resno = 1, ic.op = J_MOVR;
+                ic.r3.r = aeb_argumentreg(&cl, e1_(exprn), resp, resno, level+1, GAP);
             }
             break;
         case E_BINARYK:
-            r2 = aeb_argumentreg(&cl, e1_(exprn), callcount, 0);
-            m.i = e2k_(exprn);
+            ic.r2.r = aeb_argumentreg(&cl, e1_(exprn), resp, 0, level+1, GAP);
+            ic.r3.i = e2k_(exprn);
             break;
         case E_BINARY:
-            r2 = aeb_argumentreg(&cl, e1_(exprn), callcount, 0);
-            m.r = aeb_argumentreg(&cl, e2_(exprn), callcount, 0);
+            ic.r2.r = aeb_argumentreg(&cl, e1_(exprn), resp, 0, level+1, GAP);
+            ic.r3.r = aeb_argumentreg(&cl, e2_(exprn), resp, 0, level+1, GAP);
             break;
+        case E_TERNARY:
+            {   LiftedTernaryList *p = CSENew(LiftedTernaryList);
+                ic.op = J_NOOP | exmask_(exprn);
+                aeb_argumentreg(&cl, e1_(exprn), resp, 0, level+1, GAP);
+                cdr_(p) = resp->ternaries;
+                resp->ternaries = p;
+                lt_cl1_(p) = cl;
+                ic.r1.r = aeb_argumentreg(&cl, e2_(exprn), resp, 0, level+1, GAP);
+                lt_cl2_(p) = cl;
+                aeb_argumentreg(&cl, e3_(exprn), resp, 0, level+1, ic.r1.r);
+                lt_cl3_(p) = cl;
+                lt_ex_(p) = exprn;
+                break;
+            }
         case E_LOAD:
             {   /* Loads need greater care, because they have been transformed
                    into compute address; ldrk  but transforming back is subject
@@ -1568,59 +1627,55 @@ static CopyList *AddExprnsBelow(
                    as such and must be transformed back here.
                  */
                 Location *loc = exloc_(exprn);
-                if (loctype_(loc) & LOC_anyVAR)
-                    m.b = locbind_(loc), op = J_KtoV(op);
-                else
-                {   Exprn *base = locbase_(loc);
-                        if (locrealbase_(loc)) {
-                          /* an untransformed load: must be copied as it stands */
-                            r2 = aeb_argumentreg(&cl, base, callcount, 0);
-                            m.i = locoff_(loc);
-                        } else {
-                          /* base must be one of ADDR, SUBR or ADCONV */
-                            J_OPCODE baseop = exop_(base);
+                if (loctype_(loc) & LOC_anyVAR) {
+                    ic.r3.b = locbind_(loc);
+                    ic.op = J_KtoV(ic.op);
+                } else {
+                    Exprn *base = locbase_(loc);
+                    if (locrealbase_(loc)) {
+                      /* an untransformed load: must be copied as it stands */
+                        ic.r2.r = aeb_argumentreg(&cl, base, resp, 0, level+1, GAP);
+                        ic.r3.i = locoff_(loc);
+                    } else {
+                      /* base must be one of ADDR, SUBR or ADCONV */
+                        J_OPCODE baseop = exop_(base);
+                        switch (UnshiftedOp(baseop)) {
+                        case J_SUBR:
 #ifdef TARGET_HAS_SCALED_ADDRESSING
-                            switch (baseop & ~J_SHIFTMASK) {
-                            case J_SUBR:
-                                op |= J_NEGINDEX;
-                            case J_ADDR:
-                                op |= (baseop & J_SHIFTMASK);
+                            ic.op |= J_NEGINDEX;
+                            /* and fall through to treat as ADDR */
+                        case J_ADDR:
+                            ic.op |= (baseop & J_SHIFTMASK);
 #else
-                            switch (baseop) {
-                            case J_SUBR:
-                            case J_ADDR:
+                        case J_ADDR:
 #endif
-                                op = J_KTOR(op);
-                                r2 = aeb_argumentreg(&cl, e1_(base), callcount, 0);
-                                m.r = aeb_argumentreg(&cl, e2_(base), callcount, 0);
-                                break;
-                            case J_ADCONV:
-                                m.b = e1b_(base);
-                                r2 = locoff_(loc);
-                                op = J_addvk(op);
-                                break;
-                            default:
-                                syserr(syserr_baseop, (long)baseop);
-                            }
+                            ic.op = J_KTOR(ic.op);
+                            ic.r2.r = aeb_argumentreg(&cl, e1_(base), resp, 0, level+1, GAP);
+                            ic.r3.r = aeb_argumentreg(&cl, e2_(base), resp, 0, level+1, GAP);
+                            break;
+                        case J_ADCONV:
+                            ic.r3.b = e1b_(base);
+                            ic.r2.r = locoff_(loc);
+                            ic.op = J_addvk(ic.op);
+                            break;
+                        default:
+                            syserr(syserr_baseop, (long)baseop);
                         }
+                    }
                 }
             }
             break;
         case E_CALL:
             {   int32 nargs = exnargs_(exprn), i;
                 CopyList *arglist = NULL;
-                (*callcount)++;
+                ++resp->callcount;
                 for (i = 0 ; i < nargs ; i++) {
+                    Icode ic1;
                     bool isfp = exargisfp_(exprn, i);
                     Exprn *thisarg = exarg_(exprn, i);
                     Exprn *nextarg;
                     VRegnum argreg = isfp ? R_FA1+i :
-#ifdef TARGET_FP_ARGS_IN_FP_REGS
                         R_A1+i-k_fltregs_(exargdesc_(exprn));
-#else
-                        /* including TARGET_FP_ARGS_CALLSTD2 */
-                        R_A1+i;
-#endif
 /* CSE_WORD1/2 only used if !TARGET_FP_ARGS_CALLSTD2                    */
                     if ( exop_(thisarg) == CSE_WORD1 &&
                          (i+1) < nargs &&
@@ -1628,63 +1683,72 @@ static CopyList *AddExprnsBelow(
                          exop_(nextarg = exarg_(exprn, i+1)) == CSE_WORD2 &&
                          e1_(thisarg) == e1_(nextarg) ) {
                         CopyList *arg;
-                        cl = AddExprnsBelow(cl, e1_(thisarg), &arg, callcount);
-                        arglist = copylist(arglist, NULL, J_MOVDIR,
-                                           argreg, argreg+1, arg->icode.r1);
+                        cl = AddExprnsBelow(cl, e1_(thisarg), level+1, GAP, &arg, resp);
+                        INIT_IC(ic1, J_MOVDIR);
+                        ic1.r1.r = argreg;
+                        ic1.r2.r = argreg + 1;
+                        ic1.r3 = cl_ic_(arg).r1;
+                        arglist = mk_CopyList(arglist, NULL, &ic1, level+1);
                         i++;
                     }
                     else if (exop_(thisarg) == CSE_WORD1 ||
                                exop_(thisarg) == CSE_WORD2)
                         syserr(syserr_cse_wordn);
                     else {
-                        VRegInt m1;
-                        m1.r = aeb_argumentreg(&cl, exarg_(exprn, i),
-                                               callcount, 0);
-                        arglist = copylist(arglist, NULL,
-                                           isfp ? J_MOVDR : J_MOVR,
-                                           argreg, GAP, m1);
+                        INIT_IC(ic1, isfp ? J_MOVDR : J_MOVR);
+                        ic1.r1.r = argreg;
+                        ic1.r3.r = aeb_argumentreg(&cl, exarg_(exprn, i),
+                                               resp, 0, level+1, GAP);
+                        arglist = mk_CopyList(arglist, NULL, &ic1, level+1);
                     }
                 }
                 cl = (CopyList *)nconc(dreverse((List *)arglist), (List *)cl);
                 {   RegSort restype = exfntype_(exprn);
-                    VRegInt m1;
-                    int32 argdesc = exargdesc_(exprn) | K_PURE;
-                    r1 = V_resultreg(restype);
-                    m1.b = exfn_(exprn);
-                    cl = copylist(cl, exprn, op, r1, argdesc, m1);
-                    cl->cse = mk_CopyCSE(cl);
+                    ic.r2.i = exargdesc_(exprn) | K_PURE;
+                    ic.r1.r = V_resultreg(restype);
+                    ic.r3.b = exfn_(exprn);
+                    cl = mk_CopyList(cl, exprn, &ic, level);
+                    cl_cse_(cl) = mk_CopyCSE(cl);
                     *clp = cl;
                     return cl;
                 }
             }
         }
-        cl = p = copylist(cl, exprn, op, r1, r2, m);
+        cl = p = mk_CopyList(cl, exprn, &ic, level);
     }
     *clp = p;
     return cl;
 }
 
-static CopyList *IcodeToCopy_i(CSEDef *defs, int32 *callcount)
+typedef struct {
+    CopyList *cl;
+    int32 ndefs;
+    LiftedTernaryList *ternaries;
+} IcodeToCopyRes;
+
+static CopyList *IcodeToCopy_i(CSEDef *defs, AEB_Res *resp)
 {
     CopyList *res = NULL, *p;
     addeddefs = NULL;
     for ( ; defs != NULL ; defs = cdr_(defs))
-        if (defs->icode == NULL) {
-            res = AddExprnsBelow(res, defs->exprn, &p, callcount);
-            if (p->cse == NULL) {
-                p->cse = mk_CopyCSE(p);
+        if (defic_(defs) == NULL) {
+            res = AddExprnsBelow(res, defex_(defs), 0, GAP, &p, resp);
+            if (cl_cse_(p) == NULL) {
+                cl_cse_(p) = mk_CopyCSE(p);
             }
-            p->cse->csedefs = (CSEDefList *)CSEList2(p->cse->csedefs, defs);
+            cl_cse_(p)->csedefs = mk_CSEDefList(cl_cse_(p)->csedefs, defs);
         }
     return (CopyList *)dreverse((List *)res);
 }
 
-static CopyList *IcodeToCopy(
-  BlockHead *b, CSEDef *defs, BindList *bl, int32 *ndefs) {
-    int32 callcount = 0;
-    CopyList *c = IcodeToCopy_i(defs, &callcount);
-    int32 n = length((List *) c);
-    {   BindList **bp = &bl->bindlistcdr;
+static IcodeToCopyRes IcodeToCopy(BlockHead *b, CSEDef *defs, BindList *bl) {
+    IcodeToCopyRes res;
+    AEB_Res aeb;
+    aeb.callcount = 0;
+    aeb.ternaries = NULL;
+    {   CopyList *c = IcodeToCopy_i(defs, &aeb);
+        int32 n = length((List *) c);
+        BindList **bp = &cdr_(bl);
         for (; addeddefs != NULL; addeddefs = cdr_(addeddefs))
             if (addeddefs->csedefs == NULL) {
         /* Observe that if we're doing this, bl must be non-null - so
@@ -1693,135 +1757,174 @@ static CopyList *IcodeToCopy(
          * SETSPENVs).
          */
             VRegnum r1 = addeddefs->def->icode.r1.r;
-            CSEDef *csedef = mkCSEDef(addeddefs->def->exprn, b);
+            CSEDef *csedef = mk_CSEDef(addeddefs->def->exprn, b);
             J_OPCODE op = addeddefs->def->icode.op;
-            if (is_call2(addeddefs->def->exprn)) {
-                CSEBind2_(csedef) = addcsebinder(op, bp, r1);
+            if (is_calln(addeddefs->def->exprn)) {
+                int32 i, nres = exnres_(addeddefs->def->exprn);
+                for (i = 1; i < nres; i++) {
+                    defbinder_(csedef, i) = AddCSEBinder(op, bp, r1);
+                    n++;
+                }
+            }
+            defic_(csedef) = &addeddefs->def->icode;
+            if (!j_is_check(defic_(csedef)->op)) {
+                defbinder_(csedef, 0) = AddCSEBinder(op, bp, r1);
                 n++;
             }
-            csedef->icode = &addeddefs->def->icode;
-            if (!j_is_check(csedef->icode->op)) {
-                CSEBind_(csedef) = addcsebinder(op, bp, r1);
-                n++;
-            }
-            addeddefs->csedefs = (CSEDefList *)CSEList2(NULL, csedef);
+            addeddefs->csedefs = mk_CSEDefList(NULL, csedef);
         }
+        if (aeb.callcount == 1 && !(blkflags_(b) & BLKCALL))
+            blkflags_(b) |= BLKCALL;
+        else if (aeb.callcount >= 1)
+            blkflags_(b) |= BLKCALL | BLK2CALL;
+        res.cl = c;
+        res.ndefs = n;
+        res.ternaries = (LiftedTernaryList *)dreverse((List *)aeb.ternaries);
+        return res;
     }
-    if (callcount == 1 && !(blkflags_(b) & BLKCALL))
-        blkflags_(b) |= BLKCALL;
-    else if (callcount >= 1)
-        blkflags_(b) |= BLKCALL | BLK2CALL;
-    *ndefs += n;
-    return c;
 }
 
-static Icode *CopyIcode(Icode *newic, CopyList *c) {
+static Icode *CopyIcode(Icode *newic, CopyList *c, LiftedTernaryList *tl) {
     for ( ; c != NULL ; c = cdr_(c)) {
-        *newic = c->icode;
-        if (c->cse != NULL) {
-          CopyListList *refs = c->cse->refs;
-          CSEDefList *defs = c->cse->csedefs;
-          for (; defs != NULL; defs = cdr_(defs)) {
-            CSEDef *def = defs->def;
-            Binder *b = CSEBind_(def);
-            if (def->super != NULL) {
-                VRegnum r = bindxx_(CSEBind_(def->super));
-                newic->r2.r = r;
-                note_slave(newic->r1.r, r);
+        *newic = cl_ic_(c);
+        if (cl_cse_(c) != NULL) {
+            CopyListList *refs = cl_cse_(c)->refs;
+            CSEDefList *defs = cl_cse_(c)->csedefs;
+            J_OPCODE op = newic->op;
+            for (; defs != NULL; defs = cdr_(defs)) {
+                CSEDef *def = dl_def_(defs);
+                Binder *b = defbinder_(def, 0);
+                if (def->super != NULL && defs == cl_cse_(c)->csedefs) {
+                /* Only do this when the superdef is in some other block.
+                 * (i.e. only for the first in a sequence of defs for the
+                 * same cse).
+                 */
+                    VRegnum r = bindxx_(defbinder_(defsuper_(def), 0));
+                    newic->r2.r = r;
+                    note_slave(newic->r1.r, r);
+                }
+                if (b != NULL) {
+                    if (pseudo_reads_r2(op) &&
+                        defrefs_(def) == NULL &&
+                        cl_level_(c) == 0) {
+                        VRegnum r = bindxx_(defbinder_(def, 0));
+                        if (newic->r2.r != GAP) {
+                            forget_slave(newic->r1.r, newic->r2.r);
+                            note_slave(r, newic->r2.r);
+                        }
+                        *(newic+1) = *newic;
+                        newic->op = J_NOOP;
+                        newic++;
+                        newic->r1.r = r;
+                    } else
+                        newic = StoreCSE(newic, def);
+                }
+                for (; refs != NULL; refs = cdr_(refs)) {
+                    Icode *ic = &cl_ic_(cl_(refs));
+    #ifdef RANGECHECK_SUPPORTED
+                    if (b == NULL)
+                        ic->op = J_NOOP;
+                    else
+    #endif
+                    if (pseudo_reads_r2(cl_ic_(c).op)) {
+                        ic->r2.r = bindxx_(b);
+                        note_slave(ic->r1.r, bindxx_(b));
+                    } else if (cll_resno_(refs) == 1)
+                        ic->r3.b = defbinder_(def, 1);
+                    else
+                        ic->r3.b = b;
+                }
             }
-            if (b != NULL) newic = storecse(newic, def);
-            for (; refs != NULL; refs = cdr_(refs)) {
-                Icode *ic = &refs->p->icode;
-#ifdef RANGECHECK_SUPPORTED
-                if (b == NULL)
-                    ic->op = J_NOOP;
-                else
-#endif
-                if (pseudo_reads_r2(c->icode.op)) {
-                    ic->r2.r = bindxx_(b);
-                    note_slave(ic->r1.r, bindxx_(b));
-                } else if (refs->resno == 1)
-                    ic->m.b = CSEBind2_(def);
-                else
-                    ic->m.b = b;
-            }
-          }
         }
         newic++;
+        {   LiftedTernaryList *p;
+            for (p = tl; p != NULL; p = cdr_(p)) {
+                if (lt_cl1_(p) == c) lt_ic1_(p) = newic;
+                if (lt_cl2_(p) == c) lt_ic2_(p) = newic;
+                if (lt_cl3_(p) == c) lt_ic3_(p) = newic;
+            }
+        }
     }
     return newic;
 }
 
 static CSERef *FindRealRef(CSEDef *d) {
-    for (; d != NULL; d = d->nextsub) {
-        if (d->refs != NULL)
-            return d->refs;
+    for (; d != NULL; d = defnextsub_(d)) {
+        if (defrefs_(d) != NULL)
+            return defrefs_(d);
         if (d->subdefs != NULL) {
-            CSERef *ref = FindRealRef(d->subdefs);
+            CSERef *ref = FindRealRef(defsub_(d));
             if (ref != NULL) return ref;
         }
     }
     return NULL;
 }
 
-static BindList *ReferenceCSEDefs(BindList *bl, CSEDef *def)
+static BindList *ReferenceCSEDefs(BindList *bl, CSEDef *def, CSEUseList **deferredp)
 {
+    CSEUseList *deferred = NULL;
     for ( ; def != NULL ; def = cdr_(def)) {
-        CSERef *ref = def->refs;
+        CSERef *ref = defrefs_(def);
 #ifdef TARGET_ALLOWS_COMPARE_CSES
-        if (is_compare(exop_(def->exprn)))
-            CSEDefMask_(def) = def->icode->op & Q_MASK;
+        if (is_compare(exop_(defex_(def))))
+            defmask_(def) = defic_(def)->op & Q_MASK;
 #endif
-        if (ref != NULL || def->subdefs != NULL) {
+        if (ref != NULL || defsub_(def) != NULL) {
+            bool defer = NO;
             if (
 #ifdef TARGET_ALLOWS_COMPARE_CSES
-                is_compare(exop_(def->exprn)) ||
+                is_compare(exop_(defex_(def))) ||
 #endif
-                j_is_check(exop_(def->exprn))) {
-                CSEBind_(def) = NULL;
+                j_is_check(exop_(defex_(def)))) {
+                defbinder_(def, 0) = NULL;
                 if (debugging(DEBUG_CSE))
                     cc_msg("\n: ");
             } else {
-                J_OPCODE op = exop_(def->exprn);
+                J_OPCODE op = exop_(defex_(def));
                 VRegnum r1;
                 CSERef *realref = FindRealRef(def);
                 if (realref == NULL) syserr(syserr_referencecsedefs);
-                r1 = useicode_(refuse_(realref)).r1.r;
-                CSEBind_(def) = addcsebinder(op, &bl, r1);
+                r1 = (op == CSE_COND) ? blk_ternaryr_(refuse_(realref)->block)
+                                      : useicode_(refuse_(realref)).r1.r;
+                defbinder_(def, 0) = AddCSEBinder(op, &bl, r1);
                 if (debugging(DEBUG_CSE))
                     cc_msg("\n$b [%ld]: ",
-                           CSEBind_(def), (long)bindxx_(CSEBind_(def)));
-                if (is_call2(def->exprn)) {
-                    CSEBind2_(def) = addcsebinder(op, &bl, r1);
-                    if (debugging(DEBUG_CSE))
-                        cc_msg("$b [%ld]: ",
-                               CSEBind2_(def), (long)bindxx_(CSEBind2_(def)));
+                           defbinder_(def, 0), (long)bindxx_(defbinder_(def, 0)));
+                if (is_calln(defex_(def))) {
+                    int32 i, nres = exnres_(defex_(def));
+                    for (i = 1; i < nres; i++) {
+                        Binder *b = defbinder_(def, i) = AddCSEBinder(op, &bl, r1);
+                        if (debugging(DEBUG_CSE))
+                            cc_msg("$b [%ld]: ", b, (long)bindxx_(b));
+                    }
                 }
             }
             if (debugging(DEBUG_CSE)) {
-                cc_msg("%ld/", (long)blklabname_(def->block));
-                if (blklength_(def->block) == 0)
+                cc_msg("%ld/", (long)blklabname_(defblock_(def)));
+                if (blklength_(defblock_(def)) == 0)
                     cc_msg("loop inv: ");
                 else
-                    cc_msg("%ld: ", (long)(def->icode-blkcode_(def->block)));
-                cse_print_node(def->exprn);
+                    cc_msg("%ld: ", (long)(defic_(def)-blkcode_(defblock_(def))));
+                cse_print_node(defex_(def));
             }
             for ( ; ref != NULL ; ref = cdr_(ref))
-                replaceicode(refuse_(ref), def);
+                deferred = ReplaceIcode(deferred, refuse_(ref), def);
         }
     }
+    *deferredp = deferred;
     return bl;
 }
 
 static CSERef *FindAnyRef(CSEDef *sub) {
     CSEDef *p;
-    for (p = sub; p != NULL; p = p->nextsub)
-        if (p->refs != NULL)
-            return p->refs;
-    for (p = sub; p != NULL; p = p->nextsub)
-        if (p->subdefs != NULL) {
-            CSERef *ref = FindAnyRef(p->subdefs);
-            if (ref != NULL) return ref;
+    for (p = sub; p != NULL; p = defnextsub_(p))
+        if (defrefs_(p) != NULL)
+            return defrefs_(p);
+    for (p = sub; p != NULL; p = defnextsub_(p))
+        if (defsub_(p) != NULL) {
+            CSERef *ref = FindAnyRef(defsub_(p));
+            if (ref != NULL)
+                return ref;
         }
     return NULL;  /* should never happen */
 }
@@ -1831,44 +1934,45 @@ static void AddCSEDefsToBlock(CSEDef *def)
     CSEDef *next;
     for (; def != NULL; def = next) {
         next = cdr_(def);
-        if (def->refs != NULL || def->subdefs != NULL) {
-            BlockHead *b = def->block;
+        if (defrefs_(def) != NULL || defsub_(def) != NULL) {
+            BlockHead *b = defblock_(def);
             if (blkflags_(b) & BLKOUTER) {
             /* for expressions lifted out of the fake outer "loop", we wish to
                lift them not to the loop preheader, but to the nearest block
                which dominates all references.
              */
-                CSERef *ref = def->refs,
+                CSERef *ref = defrefs_(def),
                        *anyref = ref;
-                CSEDef *sub = def->subdefs;
+                CSEDef *sub = defsub_(def);
                 VRegSetP d;
                 bool discard = NO;
                 if (ref != NULL)
                     b = refuse_(ref)->block, ref = cdr_(ref);
                 else
-                    b = sub->block, sub = sub->nextsub;
+                    b = defblock_(sub), sub = defnextsub_(sub);
                 d = cseset_copy(blk_dominators_(b));
                 cseset_difference(d, loopmembers);
                 for (; ref != NULL; ref = cdr_(ref))
                     cseset_intersection(d, blk_dominators_(refuse_(ref)->block));
                 for (; sub != NULL; sub = sub->nextsub) {
-                    cseset_intersection(d, blk_dominators_(sub->block));
-                    if (anyref == NULL) anyref = sub->refs;
+                    cseset_intersection(d, blk_dominators_(defblock_(sub)));
+                    if (anyref == NULL) anyref = defrefs_(sub);
                 }
-                if (anyref == NULL) anyref = FindAnyRef(def->subdefs);
+                if (anyref == NULL) anyref = FindAnyRef(defsub_(def));
                 for (;;) {
                     bool dummy;
                     for (b = top_block; b != NULL; b = blkdown_(b))
-                        if (cseset_member(blklabname_(b), d) &&
-                            cseset_compare(d, blk_dominators_(b)) <= VR_EQUAL)
+                        if (cseset_member(blklabname_(b), d)
+                            && cseset_compare(d, blk_dominators_(b)) <= VR_EQUAL)
                             /* (equal or subset) */
                             break;
                     if (b == NULL) syserr(syserr_addcsedefs);
                     /* Don't lift code which alters condition codes
                        into a block which relies on their setting on entry.
                      */
-                    if (!(blkflags_(b) & BLKCCLIVE) ||
-                        !alterscc(&useicode_(refuse_(anyref))))
+                    if (!(blkflags_(b) & BLKCCLIVE)
+                        || (IsRealIcode(refuse_(anyref))
+                            && !alterscc(&useicode_(refuse_(anyref)))))
                         break;
                     cseset_delete(blklabname_(b), d, &dummy);
                 }
@@ -1877,32 +1981,36 @@ static void AddCSEDefsToBlock(CSEDef *def)
                       There may be many references in the block, thanks to an
                       amalgamated local CSE.
                     */
-                    CSEDef **subp = &def->subdefs;
+                    CSEDef **subp = &defsub_(def);
                     /* First check for a lifted reference */
-                    for (; (sub = *subp) != NULL; subp = &(sub->nextsub))
-                        if (sub->block == b) {
-                            sub->super = NULL;
-                            *subp = sub->nextsub;
-                            {   CSEDef *p, *oldsubdefs = sub->subdefs;
-                                sub->subdefs = def->subdefs;
-                                subp = &(sub->subdefs);
-                                for (; (p = *subp) != NULL; subp = &(p->nextsub))
-                                    p->super = sub;
+                    for (; (sub = *subp) != NULL; subp = &defnextsub_(sub))
+                        if (defblock_(sub) == b) {
+                            defsuper_(sub) = NULL;
+                            *subp = defnextsub_(sub);
+                            {   CSEDef *p, *oldsubdefs = defsub_(sub);
+                                defsub_(sub) = defsub_(def);
+                                subp = &defsub_(sub);
+                                for (; (p = *subp) != NULL; subp = &defnextsub_(p))
+                                    defsuper_(p) = sub;
                                 *subp = oldsubdefs;
                             }
                             discard = YES; break;
                         }
                     if (!discard) {
-                        CSERef **prev = &def->refs;
+                        CSERef **prev = &defrefs_(def);
                         CSERef **defpref = NULL;
                         Icode *deficode = NULL;
                         for (; (ref = *prev) != NULL; prev = &cdr_(ref))
                             if (b == refuse_(ref)->block) {
-                                if (pseudo_reads_r2(exop_(def->exprn))) {
+                                if (pseudo_reads_r2(exop_(defex_(def)))) {
                                     discard = YES;
                                     break;
                                 } else {
-                                    Icode *reficode = &useicode_(refuse_(ref));
+                                    Icode *reficode;
+                                    if (IsRealIcode(refuse_(ref)))
+                                        reficode = &useicode_(refuse_(ref));
+                                    else
+                                        reficode = blkcode_(b)-1;
                                     if (deficode != NULL && deficode < reficode)
                                         continue;
                                     defpref = prev;
@@ -1910,7 +2018,7 @@ static void AddCSEDefsToBlock(CSEDef *def)
                                 }
                             }
                         if (deficode != NULL) {
-                            def->icode = deficode;
+                            defic_(def) = deficode;
                             *defpref = cdr_(*defpref);
                         }
                     }
@@ -1918,13 +2026,13 @@ static void AddCSEDefsToBlock(CSEDef *def)
                 if (debugging(DEBUG_CSE))
                     if (!(blkflags_(b) & BLKOUTER))
                         cc_msg("%ld %s : %ld\n",
-                               (long)exid_(def->exprn),
+                               (long)exid_(defex_(def)),
                                (discard ? "discarded" :
-                                def->icode == NULL ? "(lifted)" : "(not lifted)"),
+                                defic_(def) == NULL ? "(lifted)" : "(not lifted)"),
                                (long)blklabname_(b));
 
                 if (discard) continue;
-                def->block = b;
+                defblock_(def) = b;
             }
             {   CSEDef **prevp = &blk_defs_(b);
                 CSEDef *p = blk_defs_(b);
@@ -1934,8 +2042,8 @@ static void AddCSEDefsToBlock(CSEDef *def)
                    coming last.
                  */
                 for (; p != NULL; p = cdr_(p)) {
-                    if ( def->icode != 0 &&
-                         (p->icode == 0 || p->icode > def->icode))
+                    if ( defic_(def) != 0 &&
+                         (defic_(p) == 0 || defic_(p) > defic_(def)))
                         break;
                     prevp = &cdr_(p);
                 }
@@ -1973,10 +2081,30 @@ static bool CantMarkCCLive(LabelNumber *from, BlockHead *to) {
 }
 #endif
 
-static BindList *modifycode(void)
+static int CompPtr(void const *a, void const *b) {
+    IPtr d = (IPtr)a - (IPtr)b;
+    if (d == 0)
+        return 0;
+    else if (d < 0)
+        return -1;
+    else
+        return 1;
+}
+
+static int32 LookUpIC(Icode const *p, Icode * const *ic, int32 n) {
+    int32 i;
+    for (i = 0; i < n; i++)
+        if (p == ic[i])
+            return i;
+    syserr("LookUpIc");
+    return n;
+}
+
+static BindList *ModifyCode(void)
 {
     CSE *cse;
     BindList *bl = NULL;
+    CSEUseList *deferred = NULL;
     /* Hang CSE definitions off the heads of the blocks containing them
      * (sorted by the order of their occurrence in the block).
      */
@@ -1991,8 +2119,8 @@ static BindList *modifycode(void)
         if (is_compare(exop_(cse->exprn))) {
             CSEDef *def = cse->def;
             for (; def != NULL; def = cdr_(def)) {
-                BlockHead *defblock = def->block;
-                CSERef *ref = def->refs;
+                BlockHead *defblock = defblock_(def);
+                CSERef *ref = defrefs_(def);
                 for (; ref != NULL; ref = cdr_(ref)) {
                 /* the blocks between the defining and referencing ones must
                  * all be single-exit (other types would destroy the condition
@@ -2013,9 +2141,30 @@ static BindList *modifycode(void)
         AddCSEDefsToBlock(cse->def);
     AddCSEDefsToBlock(localcsedefs);
 
+    /* Allocate binders for referenced CSE defs, and also replace the  */
+    /* references by loads from the binders. We can't do the latter    */
+    /* yet for references using more than one result of a CSE (pure    */
+    /* functions calls returning a structure) because to do so would   */
+    /* require lengthening the block containing the reference, so      */
+    /* add these to the deferred list.                                 */
     {   BlockHead *b;
         for (b = top_block; b != NULL; b = blkdown_(b))
-             bl = ReferenceCSEDefs(bl, blk_defs_(b));
+             bl = ReferenceCSEDefs(bl, blk_defs_(b), &deferred);
+    }
+    /* Allocate members of the deferred list to the blocks containing  */
+    /* the references (sorting them by position within the block)      */
+    {   CSEUseList *next;
+        for (; deferred != NULL; deferred = next) {
+            CSEUseList **pp, *p;
+            BlockHead *b = u_block_(ul_use_(deferred));
+            ptrdiff_t icn = icoden_(ul_use_(deferred));
+            next = cdr_(deferred);
+            for (pp = &blk_refs_(b); (p = *pp) != NULL; pp = &cdr_(p))
+                if (icoden_(ul_use_(p)) > icn)
+                    break;
+            cdr_(deferred) = p;
+            *pp = deferred;
+        }
     }
     /* Now add stores into the binders created for eliminated expressions.
      * This means lengthening the code in existing blocks: we could be clever
@@ -2042,47 +2191,88 @@ static BindList *modifycode(void)
             if ( ic->op == J_SETSPENV &&
                  ( (ic+1) - blkcode_(b) != blklength_(b) ||
                    !is_exit_label(blknext_(b))))
-                ic->m.bl = nconcbl(ic->m.bl, bl);
-            else; /* J_SETSPGOTO is done */
+                ic->r3.bl = nconcbl(ic->r3.bl, bl);
+            /* J_SETSPGOTO is done */
         }
     }
     {   BlockHead *b;
         for ( b = blkdown_(top_block) ; b != NULL ; b = blkdown_(b) ) {
-/* AM: My suspicion is that this can add cycles or corrupt arglists etc.*/
-/* Moreover, AM thinks that the code consider the possible presence of  */
+/* AM thinks that the code consider the possible presence of            */
 /* double_pad_binder and integer_binder (see cg.c) means that this      */
 /* insertion (which I take to be adding to bindlists at the start of    */
-/* blocks) needs to be rather more careful.  Consider conditional       */
-/* expressions within arguments (e.g. f(x?y:z, 16bytestructval) on arm  */
-/* and more seriously on machines where double_pad_binder really pads.  */
-/* It feels like cg/flowgraf.c should export a routine to do this.      */
-/* On further reading AM is getting slighly happier about this since    */
-/* the binders get added first (and not within arglist construction     */
-/* but remains unhappy about exactly what bindlist's get smashed via    */
-/* process.                                                             */
+/* blocks) needs to be rather more careful.                             */
             CSEDef *defs = blk_defs_(b);
+            CSEDef *defs2 = blk_defs2_(b);
+            CSEUseList *refs = blk_refs_(b);
+
             blkstack_(b) = nconcbl(blkstack_(b), bl);
 
-            if (defs != NULL) {
+            if (defs != NULL || defs2 != NULL || refs != NULL) {
             /* Now we can have a block containing both real CSE defs and
                lifted ones
              */
-                int32 ndefs = defsize(defs);
-                CopyList *c = IcodeToCopy(b, defs, bl, &ndefs);
-                    /* which updates ndefs by the number of JopCodes to lift */
-                int32 oldlength = blklength_(b);
-                Icode *newic = newicodeblock(oldlength+ndefs);
-                Icode *old = blkcode_(b);
+                IcodeToCopyRes icr = IcodeToCopy(b, defs, bl);
+                int32 oldlength;
+                Icode *newic;
+                Icode *old;
                 int32 i;
+                int32 ndefs = DefsSize(defs) + icr.ndefs;
+                if (defs2 != NULL) ndefs++;
+                {   CSEUseList *up = refs;
+                    for (; up != NULL; up = cdr_(up))
+                        ndefs += nvals_(ul_use_(up));
+                }
+                oldlength = blklength_(b);
+                newic = newicodeblock(oldlength+ndefs);
+                old = blkcode_(b);
                 blkcode_(b) = newic;
+                /* CSEs for ternary expressions must be handled         */
+                /* specially, because there's no jopcode to define the  */
+                /* CSE or to be replaced by its reference. There can be */
+                /* at most one in a block (and the def if present is at */
+                /* the front of the list of defs for the block)         */
+                /* We must take care not to treat lifted ternaries as   */
+                /* ordinary defs: they are handled later.               */
+                if (defs2 != NULL) {
+                    VRegnum r1 = blk_ternaryr_(b);
+                    INIT_IC(*newic, CSEaccessOp(r1, J_LDRV));
+                    newic->r1.r = r1;
+                    newic->r3.b = defbinder_(defs2, 0);
+                    newic++;
+                }
+                if (defs != NULL
+                    && exop_(defex_(defs)) == CSE_COND
+                    && defic_(defs) != NULL) {
+                    VRegnum r1 = blk_ternaryr_(b);
+                    INIT_IC(*newic, CSEaccessOp(r1, J_STRV));
+                    newic->r1.r = r1;
+                    newic->r3.b = defbinder_(defs, 0);
+                    newic++;
+                    defs = cdr_(defs);
+                }
                 for ( i = 0 ; i != blklength_(b) ; i++ ) {
                     *newic = old[i];
-                    while (defs != NULL && (&old[i]) == defs->icode) {
+                    while (refs != NULL && i == icoden_(ul_use_(refs))) {
+                        ExprnUse *use = ul_use_(refs);
+                        int32 i,
+                              base = valno_(use),
+                              nres = nvals_(use);
+                        VRegnum r1 = newic->r1.r;
+                        --newic;
+                        for (i = 0; i <= nres; i++) {
+                            ++newic;
+                            INIT_IC(*newic, J_NOOP);
+                            ReplaceWithLoad(newic, r1, defbinder_(ul_def_(refs), base+i));
+                            newic->r1.r = base+i;
+                        }
+                        refs = cdr_(refs);
+                    }
+                    while (defs != NULL && &old[i] == defic_(defs)) {
                     /* At the moment, there may be both a non-local and
                        a local def for the same icode (if the exprn was
                        killed earlier in the block)
                      */
-                        newic = storecse(newic, defs);
+                        newic = StoreCSE(newic, defs);
                         defs = cdr_(defs);
                     }
                     newic++;
@@ -2096,19 +2286,111 @@ static BindList *modifycode(void)
                      */
                         Icode ic;
                         ic = *--newic;
-                        newic = CopyIcode(newic, c);
+                        newic = CopyIcode(newic, icr.cl, icr.ternaries);
                         *newic++ = ic;
                     } else
-                        newic = CopyIcode(newic, c);
+                        newic = CopyIcode(newic, icr.cl, icr.ternaries);
                 }
                 if (oldlength != 0) freeicodeblock(old, oldlength);
-                blklength_(b) +=ndefs;
+                blklength_(b) += ndefs;
                 if ((newic - blkcode_(b)) != blklength_(b)) {
                     Icode *ic = blkcode_(b);
                     for (; ic != newic; ic++)
-                       print_jopcode(ic->op, ic->r1, ic->r2, ic->m);
+                       print_jopcode(ic);
                     syserr(syserr_cse_modifycode, (long)blklabname_(b),
                               (long)(newic - blkcode_(b)), (long)blklength_(b));
+                }
+                /* The call to CopyIcode above copied the icodes making */
+                /* up a ternary expression, but into a single block. We */
+                /* must now break up the single block into several, and */
+                /* generate the conditional branches, to recreate the   */
+                /* real expressions.                                    */
+                if (icr.ternaries != NULL) {
+                    int32 i, n = 3 * length((List *)icr.ternaries);
+                    Icode **ic = CSENewN(Icode *, n);
+                    BlockHead **bv = CSENewN(BlockHead *, n);
+                    LiftedTernaryList *p,
+                                      *lastternary;
+                    BlockHead *prev = b, *nextb = blkdown_(b);
+                    Icode *icstart = blkcode_(b);
+                    LabelNumber *next = blknext_(b),
+                                *next1 = blknext1_(b);
+                    int32 bflags = blkflags_(b);
+                    blkflags_(b) &= ~(BLK2EXIT | BLKSWITCH | Q_MASK);
+                    for (i = 0, p = icr.ternaries; p != NULL; p = cdr_(p), i += 3) {
+                        ic[i] = lt_ic1_(p);
+                        ic[i+1] = lt_ic2_(p);
+                        ic[i+2] = lt_ic3_(p);
+                    }
+                    qsort(ic, n, sizeof(Icode const *), CompPtr);
+                    for (i = 0; i < n; i++) {
+                        BlockHead *p = insertblockbetween(prev, nextb, NO);
+                        blkcse_(p) = CSEBlockHead_New();
+                        blk_dominators_(p) = cseset_copy(blk_dominators_(nextb));
+                        blklength_(prev) = ic[i] - icstart;
+                        blkcode_(p) = ic[i];
+                        bv[i] = p;
+                        prev = p;
+                        icstart = ic[i];
+                    }
+                    blklength_(prev) = newic - icstart;
+                    for (p = icr.ternaries; p != NULL; p = cdr_(p)) {
+                        int32 i1 = LookUpIC(lt_ic1_(p), ic, n),
+                              i2 = LookUpIC(lt_ic2_(p), ic, n),
+                              i3 = LookUpIC(lt_ic3_(p), ic, n);
+                        BlockHead *next =  lt_b1_(p) = bv[i1],
+                                  *next1 = lt_b2_(p) = bv[i2],
+                                  *after = lt_b3_(p) = bv[i3];
+                        if (i1 == 0)
+                            prev = b;
+                        else
+                            prev = bv[i1-1];
+                        if (i3 == n-1)
+                            lastternary = p;
+                        blkflags_(prev) |= BLK2EXIT;
+                        blkflags_(prev) |= lt_mask_(p);
+                        blknext_(prev) = blklab_(next1);
+                        blknext1_(prev) = blklab_(next);
+                        blknext_(next) = blklab_(after);
+                        blknext_(next1) = blklab_(after);
+                        blk_pred_(next) = mk_CSEBlockList(NULL, prev);
+                        blk_pred_(next1) = mk_CSEBlockList(NULL, prev);
+                        blk_pred_(after) = mk_CSEBlockList(mk_CSEBlockList(NULL, next), next1);
+                    }
+#ifdef TARGET_ALLOWS_COMPARE_CSES
+                    prev = bv[n-1];
+                    /* If the expression setting the condition for the  */
+                    /* last lifted ternary is also the expression       */
+                    /* setting the condition for the block it's being   */
+                    /* lifted to, kill the latter                       */
+                    if (bflags & BLK2EXIT) {
+                        if (blk_cmp_(b) != NULL
+                            && ExSet_Member(e1_(lt_ex_(lastternary)), blk_cmp_(b))
+                            && !CantMarkCCLive(blklab_(lt_b1_(lastternary)), prev)
+                            && !CantMarkCCLive(blklab_(lt_b2_(lastternary)), prev)) {
+                            blkcode_(prev)[blklength_(prev)-1].op = J_NOOP;
+                        } else
+                            blk_cmp_(prev) = blk_cmp_(b);
+                        blk_cmp_(b) = NULL;
+                    }
+#endif
+                    if (bflags & BLKSWITCH) {
+                        LabelNumber **table = (LabelNumber **)next;
+                        int32 i, n = (int32)next1;
+                        blkflags_(prev) |= BLKSWITCH;
+                        blktable_(prev) = table;
+                        blktabsize_(prev) = n;
+                        for (i = 0; i < n; i++)
+                            ReplaceInBlockList(blk_pred_(lab_block_(table[i])), b, prev);
+                    } else {
+                        if (bflags & BLK2EXIT) {
+                            blkflags_(prev) |= bflags & (BLK2EXIT | Q_MASK);
+                            blknext1_(prev) = next1;
+                            ReplaceInBlockList(blk_pred_(lab_block_(next1)), b, prev);
+                        }
+                        blknext_(prev) = next;
+                        ReplaceInBlockList(blk_pred_(lab_block_(next)), b, prev);
+                    }
                 }
             }
         }
@@ -2119,10 +2401,9 @@ static BindList *modifycode(void)
         blkcode_(top_block) = newic;
         if (i != 0) memcpy(newic, old, (int) i*sizeof(Icode));
         freeicodeblock(old, i);
-        newic[i].op = J_SETSPENV;
-        newic[i].r1.r = GAP;
+        INIT_IC(newic[i], J_SETSPENV);
         newic[i].r2.bl = NULL;
-        newic[i].m.bl = bl;
+        newic[i].r3.bl = bl;
         blklength_(top_block) = i+1;
     }
     greatest_stackdepth += sizeofbinders(bl, YES);
@@ -2150,10 +2431,10 @@ static BindList *cse_eliminate_i(void)
 
     cse_setup();
     for (p = top_block; p != NULL; p = blkdown_(p))
-      p->cse = new_CSEBlockHead();
+      blkcse_(p) = CSEBlockHead_New();
 
     FindDominators();
-    if (cse_enabled && !usrdbg(DBG_LINE)) {
+    if (cse_enabled && (!usrdbg(DBG_LINE) || usrdbg(DBG_OPT_CSE))) {
 
       phasename = "CSE_Available";
       cse_scanblocks(top_block);
@@ -2176,12 +2457,13 @@ static BindList *cse_eliminate_i(void)
                   cseset_discard(blk_dominators_(p));
                   blk_dominators_(p) = NULL;
               }
-          findloops();
+          FindLoops();
 
           {   LoopList *lp;
               for (lp = all_loops; lp != NULL; lp = cdr_(lp)) {
-                  BlockList *bp = lp->members;
-                  for (; bp != NULL; bp = bp->blklstcdr) blknest_(bp->blklstcar)++;
+                  BlockList *bp = ll_mem_(lp);
+                  for (; bp != NULL; bp = cdr_(bp))
+                      blknest_(bp->blklstcar)++;
               }
           }
 
@@ -2211,7 +2493,7 @@ static BindList *cse_eliminate_i(void)
               for (p=bottom_block; p!=NULL; p = blkup_(p)) {
                   VRegSetP oldwantedlater = blk_wantedlater_(p);
                   VRegSetP oldwantedonallpaths = blk_wantedonallpaths_(p);
-                  exprnsreaching(p);
+                  ExprnsReaching(p);
                   if (!cseset_equal(oldwantedlater, blk_wantedlater_(p)) ||
                       !cseset_equal(oldwantedonallpaths,
                                     blk_wantedonallpaths_(p)))
@@ -2247,7 +2529,7 @@ static BindList *cse_eliminate_i(void)
            */
           VRegSetP cses = cseset_copy(blk_wantedlater_(p));
           cseset_intersection(cses, blk_available_(p));
-          cseset_map(cses, addcse, (VoidStar) p);
+          cseset_map(cses, AddCSE, (VoidStar) p);
           cseset_discard(cses);
           if (debugging(DEBUG_CSE) && CSEDebugLevel(3)) {
               cc_msg("L%li:", (long)blklabname_(p));
@@ -2262,7 +2544,7 @@ static BindList *cse_eliminate_i(void)
       }
       if (debugging(DEBUG_CSE | DEBUG_STORE))
           cc_msg("candidate cses found - ");
-      findloopinvariants();
+      FindLoopInvariants();
       if (debugging(DEBUG_CSE | DEBUG_STORE)) {
           clock_t now = clock();
           cc_msg("candidate loop invariants found - %d csecs\n", now-t0);
@@ -2275,7 +2557,7 @@ static BindList *cse_eliminate_i(void)
           t0 = now;
       }
       phasename = "CSEeliminate";
-      bl = modifycode();
+      bl = ModifyCode();
       if (debugging(DEBUG_CSE | DEBUG_STORE)) {
           clock_t now = clock();
           cc_msg("%ld CSEs, %ld references - %d csecs, CSE total %d\n",
@@ -2290,7 +2572,7 @@ static BindList *cse_eliminate_i(void)
     for (p = top_block; p != NULL; p = blkdown_(p)) {
         /* from syntax to binder store to survive imminent drop_local_store() */
         BlockList *b = NULL, *oldb = blk_pred_(p);
-        for (; oldb != NULL; oldb = oldb->blklstcdr)
+        for (; oldb != NULL; oldb = cdr_(oldb))
             b = mkBlockList(b, oldb->blklstcar);
         blk_pred_(p) = b;
         cseallocrec.alloctype = AT_Bind;

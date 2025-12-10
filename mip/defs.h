@@ -3,12 +3,13 @@
  * Copyright (C) Acorn Computers Ltd., 1988-1990.
  * Copyright (C) Codemist Ltd., 1987-1992.
  * Copyright (C) Advanced RISC Machines Limited, 1991-1992.
+ * SPDX-Licence-Identifier: Apache-2.0
  */
 
 /*
- * RCS $Revision: 1.72 $ Codemist 130
- * Checkin $Date: 1995/11/01 16:43:49 $
- * Revising $Author: hmeekings $
+ * RCS $Revision$ Codemist 130
+ * Checkin $Date$
+ * Revising $Author$
  */
 
 /*
@@ -36,6 +37,7 @@
 #define _defs_LOADED 1
 
 #include "ieeeflt.h"
+#include "int64.h"
 
 /* The following lines allow the precise details of C++ scope rules     */
 /* to be ignored.  Consider  'struct A { struct B *c; }'                */
@@ -55,6 +57,7 @@ typedef struct Handler Handler;
 typedef struct FormTypeList FormTypeList;
 typedef struct SynScope SynScope;
 typedef struct SynGoto SynGoto;
+typedef struct DeclRhsList DeclRhsList;
 
 /*
  * List is a generic list type of general utility.
@@ -118,18 +121,18 @@ typedef struct RealRegSet
 typedef struct TypeExprFnAux
 {  unsigned16 minargs, maxargs;
    unsigned8 variad, oldstyle;      /* notionally bool */
-   unsigned8 flags;
+   unsigned32 flags;
    int32 inlinecode;
-#ifndef NON_CODEMIST_MIDDLE_END
-   RealRegSet usedregs;
-#endif
 } TypeExprFnAux;
 
-/* flags bits are bitoffnaux_() bits (0x1F), together with ... */
+/* flags bits are bitoffnaux_() bits (0x3F), together with ... */
 typedef int FnAuxFlags;
-#define f_specialargreg 0x80
-#define f_nofpregargs 0x40
-#define f_norettype 0x20
+#define f_resultinflags   0x800
+#define f_resultinintregs 0x400
+#define f_notailcall      0x200
+#define f_specialargreg   0x100
+#define f_nofpregargs     0x080
+#define f_norettype       0x040
 
 #define fntypeisvariadic(t) (maxargs_(t)==1999) /* could do with improvement */
 
@@ -139,17 +142,10 @@ typedef int FnAuxFlags;
  * function gets defined.  Codemist + LDS agree this must be re-organised.
  */
 
-#ifdef NON_CODEMIST_MIDDLE_END
 #define packTypeExprFnAux1(s,mina,maxa,var,old,fl,il) \
   (s.minargs=mina, s.maxargs=maxa, s.variad=((var)<0 ? 0:(var)), \
-   s.oldstyle=old, s.flags=(unsigned8)fl, s.inlinecode = il, \
+   s.oldstyle=old, s.flags=fl, s.inlinecode = il, \
    &s)
-#else
-#define packTypeExprFnAux1(s,mina,maxa,var,old,fl,il) \
-  (s.minargs=mina, s.maxargs=maxa, s.variad=((var)<0 ? 0:(var)), \
-   s.oldstyle=old, s.flags=(unsigned8)fl, s.inlinecode = il, \
-   reg_setallused(&s.usedregs), &s)
-#endif
 #define packTypeExprFnAux(s,mina,maxa,var,old,fl) \
         packTypeExprFnAux1(s,mina,maxa,var,old,fl,0)
 
@@ -158,8 +154,17 @@ typedef struct Expr Expr;
 
 struct TypeExpr                 /* make into a better union type */
 { AEop h0;
-  TypeExpr *typearg;            /* or SET_BITMAP for s_typespec */
-  Binder *typespecbind;         /* or TagBinder for struct/union */
+  union {
+    TypeExpr *t;
+    SET_BITMAP m;               /* for s_typespec */
+  } typearg;
+  union {
+    Binder *b;
+    TagBinder *tb;              /* for struct / union */
+    BindList *bl;               /* ovldlist */
+    SET_BITMAP m;               /* ptrmap */
+    Expr *e;                    /* subsize */
+  } typespecbind;
   IPtr dbglanginfo;            /* dbx support requires f77 type info */
 #ifdef PASCAL /*ECN*/
   union {
@@ -167,26 +172,32 @@ struct TypeExpr                 /* make into a better union type */
     Expr *e;
   } pun;
 #endif
-  FormTypeList *fnargs;         /* only if t_fnap                */
+  union {
+    FormTypeList *ftl;
+    DeclRhsList *rhl;
+  } fnargs;         /* only if t_fnap                */
   TypeExprFnAux fnaux;          /* only if t_fnap                */
 };
+
 /*
  * TypeExpr access functions
  */
-#define typearg_(p)         ((p)->typearg)
-#define typespecmap_(p)     (*(SET_BITMAP *)&(p)->typearg)
-#define typespecbind_(p)    ((p)->typespecbind)
-#define typespectagbind_(p) ((TagBinder *)((p)->typespecbind))
-#define typefnargs_(p)      ((p)->fnargs)
-#define typefnargs1_(p)     (*(DeclRhsList **)&((p)->fnargs))
-#define typeovldlist_(p)    (*(BindList **)&((p)->typespecbind))
-#define typeptrmap_(p)      (*(SET_BITMAP *)&((p)->typespecbind))
-#define typesubsize_(p)     (*(Expr **)&((p)->typespecbind))
+
+#define typearg_(p)         ((p)->typearg.t)
+#define typespecmap_(p)     ((p)->typearg.m)
+#define typespecbind_(p)    ((p)->typespecbind.b)
+#define typespectagbind_(p) ((p)->typespecbind.tb)
+#define typefnargs_(p)      ((p)->fnargs.ftl)
+#define typefnargs1_(p)     ((p)->fnargs.rhl)
+#define typeovldlist_(p)    ((p)->typespecbind.bl)
+#define typeptrmap_(p)      ((p)->typespecbind.m)
+#define typesubsize_(p)     ((p)->typespecbind.e)
 /* And the following apply only to function TypeExprs... */
 #define typefnaux_(p)       ((p)->fnaux)
 #define typedbginfo_(p)     ((p)->dbglanginfo)
 #define minargs_(p)         ((p)->fnaux.minargs)
 #define maxargs_(p)         ((p)->fnaux.maxargs)
+#define typefnauxflags_(p)  ((p)->fnaux.flags)
 #define TypeSpec TypeExpr   /* used when known to be a s_typespec TypeExpr */
 
 /*
@@ -219,10 +230,17 @@ struct Symstr {
 #define symext_(sym)        ((sym)->symext)
 #define symfold_(sym)       ((sym)->symfold)
 /* #define symdata_(sym)       ((sym)->bindglobal)    @@@ under threat */
+#ifdef CALLABLE_COMPILER
+#define symname_(sym)       ((sym)->symname + 1)
+#else
 #define symname_(sym)       ((sym)->symname)
+#endif
 #define bind_global_(sym)   ((sym)->symbind)
 #define tag_global_(sym)    ((sym)->symtag)
 
+#if defined(CALLABLE_COMPILER)
+#define dbgbinder_(sym)     (*(Binder **)&((sym)->symext))
+#endif
 /*
  * String literals in ANSI-C are naturally segmented, so the code
  * generator is prepared to handle segmented string values.
@@ -250,6 +268,14 @@ typedef struct FloatCon {
   char floatstr[1];             /* the source representation - if there  */
 } FloatCon;                     /* is one (consider x = 1.0 + 2.0, which */
                                 /* has none) - allocated as needed.      */
+typedef struct {
+  AEop h0;
+  SET_BITMAP typespec;
+  union {
+    int64 i;
+    uint64 u;
+  } bin;
+} Int64Con;
 
 /*
  * FileLine structures are used to describe source file positions and
@@ -258,7 +284,7 @@ typedef struct FloatCon {
  * Notionally, p should be of type struct dbg_... *.
  */
 typedef struct FileLine {
-  char *f;                      /* The source file name */
+  char const *f;                /* The source file name */
   unsigned16 l;                 /* Source file line number */
   unsigned16 column;            /* position within line */
   int32 filepos;                /* source file byte offset */
@@ -270,13 +296,13 @@ typedef List ExprList;          /* a list of Exprs is a List... */
  * exprcar: ExprList -> Expr    -- extract an Expr from an Expr list element
  * mkExprList: ExprList x Expr -> ExprList -- add an Expr to an ExprList
  */
-#define exprcar_(l)         (*(Expr **)&(l)->car)
-#define mkExprList(a,b)     ((ExprList *)syn_cons2(a,b))
-#define mkExprList1(x)     ((ExprList*)mkExprList(0,x))
-#define mkExprList2(x,y)   ((ExprList*)mkExprList(mkExprList(0,y),x))
-#define mkExprList3(x,y,z) ((ExprList*)mkExprList(mkExprList(mkExprList(0,z),y),x))
-#define mkExprList4(x,y,z,a) ((ExprList*)mkExprList(mkExprList3(y,z,a),x))
-#define mkExprList5(x,y,z,a,b) ((ExprList*)mkExprList(mkExprList4(y,z,a,b),x))
+#define exprcar_(l)            (*(Expr **)&(l)->car)
+#define mkExprList(a,b)        ((ExprList *)syn_cons2(a,b))
+#define mkExprList1(x)         (mkExprList(0,x))
+#define mkExprList2(x,y)       (mkExprList(mkExprList(0,y),x))
+#define mkExprList3(x,y,z)     (mkExprList(mkExprList(mkExprList(0,z),y),x))
+#define mkExprList4(x,y,z,a)   (mkExprList(mkExprList3(y,z,a),x))
+#define mkExprList5(x,y,z,a,b) (mkExprList(mkExprList4(y,z,a,b),x))
 
 typedef List CmdList;           /* a list of commands is a List... */
 /*
@@ -288,7 +314,7 @@ typedef List CmdList;           /* a list of commands is a List... */
 
 /*
  * A node of an expression tree is an Expr...
- * (or a FloatCon or String or Binder)
+ * (or a FloatCon or Int64Con or String or Binder)
  */
 struct Expr {
   AEop h0;                      /* node type, discriminates unions */
@@ -320,23 +346,54 @@ struct Expr {
 #define type_(p)            ((p)->etype)
 #define arg1_(p)            ((p)->arg1.e)
 #define arg2_(p)            ((p)->arg2.e)
+#define arg2i_(p)           ((p)->arg2.i)
 #define arg3_(p)            ((p)->arg3.e)
+#define arg3i_(p)           ((p)->arg3.i)
 #define exprletbind_(p)     ((p)->arg1.bl)
 #define exprfnargs_(p)      ((p)->arg2.l)
 #define exprdotoff_(p)      ((p)->arg2.i)
 #define exprbsize_(p)       ((p)->arg3.i)
 #define exprmsboff_(p)      ((p)->msboff)
 #define expr1c_(p)          ((p)->arg1.c)
+#define exprfileline_(p)    ((p)->fileline)
 /* for integer constants */
 #define intval_(p)          ((p)->arg1.i)
 #define intorig_(p)         arg2_(p)
 
+#define exb_(e)             ((Binder *)(e))
+#define exs_(e)             ((String *)(e))
+#define exi64_(e)           ((Int64Con *)(e))
+#define exf_(e)             ((FloatCon *)(e))
+
+#define int64map_(e)        (exi64_(e)->typespec)
+#define int64val_(e)        (exi64_(e)->bin)
+
+#ifdef TARGET_HAS_INLINE_ASSEMBLER
+
+typedef struct AsmInstr {
+    struct AsmInstr *cdr;
+    FileLine fl;
+    IPtr opcode;
+    Expr *opnd1, *opnd2, *opnd3, *opnd4;
+} AsmInstr;
+
+#define asmopcode_(p)       ((p)->opcode)
+#define asmfl_(p)           ((p)->fl)
+#define asmopnd1_(p)        ((p)->opnd1)
+#define asmopnd2_(p)        ((p)->opnd2)
+#define asmopnd3_(p)        ((p)->opnd3)
+#define asmopnd4_(p)        ((p)->opnd4)
+
+#endif
+
+#define handcdr cdr
 struct Handler {
   Handler *handcdr;
   SynBindList *handbl;
   Cmd *handbody;
+  TypeExpr *caught_type;
 };
-#define mkHandler(a,b,c)  ((Handler *)syn_list3(a,b,c))
+#define mkHandler(a,b,c,d)  ((Handler *)syn_list4(a,b,c,d))
 
 /*
  * The other essential object the code generator recognises is a Cmd,
@@ -362,6 +419,8 @@ struct Cmd {
 #define cmd2e_(x)           ((x)->cmd2.e)
 #define cmd3e_(x)           ((x)->cmd3.e)
 #define cmd4e_(x)           ((x)->cmd4.e)
+#define cmdfileline_(x)     ((x)->fileline)
+
 /*
  * And some more convenient syntactic sugaring, which hints how other
  * structures such as case labels, labels, and blocks.
@@ -379,6 +438,7 @@ struct Cmd {
  * LabBinds describe source-level labels (e.g. 'out' in goto out;... out:...)
  * and addres the corresponding internal LabelNumber.
  */
+#define labcdr cdr
 struct LabBind {
   LabBind *labcdr;              /* rev. list of binders at this scope level */
   Symstr *labsym;               /* the label's name */
@@ -428,8 +488,9 @@ struct LabBind {
 #define A_NOLINKAGE    0x0400   /* [Tag]Binder has no linkage...        */
 #define A_INTERN       0x0800   /* Binder has internal linkage...       */
 #define A_EXTERN       0x1000   /* [Tag]Binder has external linkage...  */
-#define A_TEMPLATE     0x2000   /* Binder is a template name.           */
-#define A_REALUSE      0x4000
+#define A_PRIMARY      0x2000   /* Binder is a primary template name    */
+#define A_TEMPLATE     0x4000   /* Binder is a template name.           */
+#define A_REALUSE      0x8000
 
 #define CB_VBASE      0x10000   /* virtual base class */
 #define CB_BASE       0x20000   /* base class         */
@@ -442,7 +503,13 @@ struct LabBind {
 #define CB_TCONV     0x400000   /* type conversion fn */
 #define CB_CGEN      0x800000   /* (member) fn has compiler-generated */
                                 /* components: ctor, dtor, operator=  */
-
+#define NON_CONFORMING 0x1000000
+                                /* attribute but really to indicate a t_unknown
+                                   type is conforming only to itself.
+                                 */
+#define DEDUCED      0x2000000  /* attribute but really to indicate the non-t_unknown
+                                   type is deduced rather than by other means.
+                                 */
 #define A_LOCALSTORE  (~0x7fffffff)
 #define A_GLOBALSTORE 0x40000000
 
@@ -454,6 +521,9 @@ struct LabBind {
  * CPLUSPLUS so that in C the two structs can differ.
  */
 typedef struct SuperBinder SuperBinder; /* opaque here */
+
+#define ClassMember Binder
+typedef ClassMember *ScopeSaver;
 
 struct Binder {
   AEop h0;                      /* needed as Binder is a subtype of Expr */
@@ -469,7 +539,6 @@ struct Binder {
      /* BindVar choices: */
      IPtr i;                    /* offset in stack/dataseg etc. or enumval */
      BindList *bl;              /* stack offset as BindList (auto only) */
-     Expr *c;                   /* e.g. for a constant expression... */
      Binder *realbinder;        /* for instate_alias()... */
      SuperBinder *super;        /* for sub binders made by splitting */
                                 /* live ranges.                      */
@@ -499,6 +568,23 @@ struct Binder {
 #endif
      } bindmem;
   } var_or_mem;
+
+/* The following fields support the debugger toolbox */
+#ifdef CALLABLE_COMPILER
+  void *namedef, *dbgdata;
+#define namedef_(b)     (*(Dbg_NameDef **)&((b)->namedef))
+#define dbgdata_(b,t)   (*(t **)&((b)->dbgdata))
+#else
+  IPtr binddbg;
+#endif
+
+  ScopeSaver bindscope;         /* set only if A_PRIMARY */
+  ExprList *bindactuals;        /* set only in generic binder and temporarily */
+  ScopeSaver bindformals;       /* set only if A_PRIMARY and in specialized binder */
+  BindList *bindinstances;      /* set only if A_PRIMARY */
+  int bindtext;                 /* set only if A_PRIMARY */
+  BindList *fntmptlist;         /* set only in generic binder */
+
 /* Athough the following fields are logically part of BindVar, the code */
 /* requires less changes by leaving them here.                          */
 #define SIZEOF_NONAUTO_BINDER offsetof(Binder,bindxx)
@@ -510,7 +596,6 @@ struct Binder {
   int32 bindmcrep;              /* in flux */
 #define NOMCREPCACHE (-1L)
 };
-#define ClassMember Binder
 
 /* If s_member (or b_member soon) then memtype_() can be ACCESSADJ...   */
 #define ACCESSADJ te_void       /* flag for [ES, p245]                  */
@@ -554,6 +639,15 @@ struct Binder {
 #define bindxx_(p)          ((p)->bindxx.i)
 #define bindxxp_(b)         ((b)->bindxx.p)
 #define bindmcrep_(p)       ((p)->bindmcrep)
+#define binddbg_(p)         ((p)->binddbg)
+#define bindscope_(p)       ((p)->bindscope)
+#define bindactuals_(p)     ((p)->bindactuals)
+#define bindformals_(p)     ((p)->bindformals)
+#define bindenv_(p)         ((p)->bindformals)
+#define bindinstances_(p)   ((p)->bindinstances)
+#define bindtext_(p)        ((p)->bindtext)
+#define bindftlist_(p)      ((p)->fntmptlist)
+
 /*
  * Flag bits in bindaddr
  */
@@ -637,10 +731,17 @@ struct Binder {
 
 #define isenumconst_(b)     (bindstg_(b) & b_enumconst)
 
+/* b_enumconst isn't wanted by the back-end (no binder in the jopcode   */
+/* stream can have it: any that did has been transformed to the         */
+/* appropriate constant). So we can share it for a property wanted only */
+/* in the backend.                                                      */
+#define b_unbound         b_enumconst
+
 /* Bits additional to TYPEBITS, sharing with STGBITS:                   */
 #define BITFIELD  bitoftype_(s_lasttype+1) /* beware: a type not a stg bit */
 
 typedef struct Friend Friend;
+#define friendcdr cdr
 struct Friend {
   Friend *friendcdr;
   union {
@@ -648,6 +749,8 @@ struct Friend {
     Binder *friendfn;                  /* h0_() == s_binder  */
   } u;
 };
+
+typedef BindList TagBindList;
 
 /*
  * The type TagBinder is used for struct name bindings and is similar
@@ -673,13 +776,17 @@ struct TagBinder
   TagBinder *tagparent;         /* parent class of class or 0.          */
   int32 cachedsize;
 /* Rearrange next 2-3 lines to end so need not always be allocated?     */
-  TagBinder *taginstance;       /* used if TB_TEMPLATE                  */
-  FormTypeList *tagformals;     /* used if TB_TEMPLATE                  */
-  ClassMember *tagformaltags;   /* used if TB_TEMPLATE                  */
+  TagBindList *taginstances;       /* used if TB_TEMPLATE                  */
+  ScopeSaver tagscope;          /* used if TB_TEMPLATE                  */
+  ScopeSaver tagformals;        /* used if TB_TEMPLATE                  */
+  ScopeSaver tagactuals;        /* used if TB_TEMPLATE                  */
   int tagtext;                  /* used if TB_TEMPLATE                  */
+  TagBinder *tagprimary;
+  IPtr *tagmemfns;              /* used if TB_TEMPLATE                  */
 #ifdef TARGET_HAS_DEBUGGER
   IPtr tagbinddbg;             /* space reserved to debug-table writer */
 #endif
+  Symstr *typedefname;
 };
 
 #define tagbindcdr_(p)      ((p)->bindcdr)
@@ -688,12 +795,22 @@ struct TagBinder
 #define tagbindbits_(p)     ((p)->tagbindbits)
 #define tagbindmems_(p)     ((p)->m.tagbindmems)
 #define tagbindenums_(p)    ((p)->m.tagbindenums)
+#define tagbindparent_(p)   ((p)->tagparent)
+#define tagbinddbg_(p)      ((p)->tagbinddbg)
+#define tagscope_(p)        ((p)->tagscope)
+#define tagformals_(p)      ((p)->tagformals)
+#define tagactuals_(p)      ((p)->tagactuals)
+#define tagtext_(p)         ((p)->tagtext)
+#define taginstances_(p)    ((p)->taginstances)
+#define tagprimary_(p)      ((p)->tagprimary)
+#define tagmemfns_(p)       (*(IPtr **)&(p)->tagmemfns)
 
 /* Fields of tagbindbits...                                             */
 /* beware: bitoftype_(s_enum, s_struct, s_class, s_union) = 0x1c8       */
 #define TB_UNALIGNED        1
 #define TB_TEMPLATE         2   /* tagbinder is just a template.        */
 #define TB_TPARAM           4   /* tagbinder is just a template param.  */
+#define TB_SPECIALIZED 0x0010   /* tagbinder is an explicitly specialized template instance */
 #define TB_ABSTRACT    0x0800   /* has >=1 pure virtual fn.             */
 #define TB_BEINGDEFD   0x1000   /* police "struct d { struct d { ..."   */
 #define TB_UNDEFMSG    0x2000   /* so 'size needed' msg appears once.   */
@@ -719,6 +836,7 @@ struct TagBinder
 #define TB_CORE            0x01000000   /* tagparent points to derivation */
 #define TB_HASCMEM         0x02000000   /* has a const data member or its derivation*/
 #define TB_SIZECACHED      0x04000000
+#define TB_OPAQUE          0x08000000   /* data member access and sizeof not allowed*/
 #define TB_NEEDSCCTOR      0x00000200   /* has a user-defined copy ctor in class
                                            or in its derivation
                                          */
@@ -734,13 +852,18 @@ struct TagBinder
 #define TB_NOTPODU_(tb, a) (tagbindbits_(tb) & (TB_HASVTABLE|TB_HASVBASE|a))
 #define TB_NOTPOD_(tb)     (tagbindbits_(tb) & (TB_NEEDSOPEQ|TB_NEEDSCTOR|TB_NEEDSCCTOR))
 
+#define isclasstagbinder_(tb) (tagbindbits_(tb) & \
+            (bitoftype_(s_struct)|bitoftype_(s_class)|bitoftype_(s_union)))
+#define isenumtagbinder_(tb) (tagbindbits_(tb) & bitoftype_(s_enum))
+
 /*
  * FormTypeList is used in globalised types, and is a subtype of
  * DeclRhsList for both minimality and space reasons.
  */
 
 
-typedef struct DeclRhsList DeclRhsList;
+typedef struct TentativeDefn TentativeDefn;
+#define declcdr cdr
 struct DeclRhsList {
   DeclRhsList *declcdr;
   Symstr *declname;
@@ -757,12 +880,17 @@ struct DeclRhsList {
   SET_BITMAP declstg;
   FileLine fileline;            /* added by RCC 25-Mar-88 */
   Binder *declbind;             /* temp. working space to help ->declinit */
+  Symstr *declrealname;         /* declrealname set only for specialized template
+                                   function name
+                                */
+  TentativeDefn *tentative;
 };
 
 #define declbits_(d) ((d)->u.bits)
 #define declinit_(d) ((d)->u.init)
 #define declstgval_(d) ((d)->u.stgval)
 
+#define ftcdr cdr
 struct FormTypeList {
   FormTypeList *ftcdr;
   Symstr *ftname;
@@ -778,6 +906,7 @@ struct FormTypeList {
  * SynBindList and BindList are notionally identical, but AM wants
  * to separate concerns while re-arranging allocators.
  */
+#define bindlistcdr cdr
 struct SynBindList {
   SynBindList *bindlistcdr;
   Binder *bindlistcar;
@@ -804,6 +933,7 @@ struct BindListList {
 };
 
 typedef struct VfnList VfnList;
+#define vfcdr cdr
 struct VfnList {
   VfnList *vfcdr;
   Binder *vfmem;
@@ -821,10 +951,6 @@ typedef struct TopDecl {        /* a top-level decalration */
           SynBindList *formals; /* its formal argument list... */
           Cmd  *body;           /* its body... */
           bool ellipsis;        /* and whether the argument list ends '...' */
-#ifdef TARGET_IS_INTERPRETER
-          int32 stacksize;
-          Binder *structresult;
-#endif
         } fn;                   /* h0 = s_fndef => fn definition */
     } v_f;
 } TopDecl;
@@ -838,6 +964,7 @@ typedef struct TopDecl {        /* a top-level decalration */
  * be improved by moving save/restore_vargen_state to vargen...
  */
 typedef struct DataInit DataInit;
+#define datacdr cdr
 struct DataInit {
     DataInit *datacdr;
     IPtr rpt, sort, len, val;
@@ -861,6 +988,8 @@ typedef struct {
        set them to zero before the first call for a structure.
      */
     int32 n, bitoff;
+    int32 sizeofcontainer,
+          endofcontainer;
 } StructPos;
 
 #endif

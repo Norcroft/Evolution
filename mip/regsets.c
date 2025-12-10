@@ -1,12 +1,13 @@
 /*
  * regsets.c - space-efficient set representations, version 1a.
  * Copyright (C) Acorn Computers Ltd., 1988.
+ * SPDX-Licence-Identifier: Apache-2.0
  */
 
 /*
- * RCS $Revision: 1.9 $
- * Checkin $Date: 1995/09/13 19:45:36 $
- * Revising $Author: amycroft $
+ * RCS $Revision$
+ * Checkin $Date$
+ * Revising $Author$
  */
 
 /* Memo: @@@ someone misunderstands either the use of unsigned32 or     */
@@ -29,7 +30,7 @@
 /* Some generic list operations which should be elsewhere (e.g. with   */
 /* nconc.                                                              */
 
-bool generic_member(IPtr a, List *l)
+bool generic_member(IPtr a, List const *l)
 {
     for (; l != NULL; l = l->cdr)
         if (a == l->car) return YES;

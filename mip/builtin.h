@@ -3,12 +3,13 @@
  * Copyright (C) Acorn Computers Ltd., 1988-1990.
  * Copyright (C) Codemist Ltd., 1987-1992.
  * Copyright (C) Advanced RISC Machines Limited, 1991-1992.
+ * SPDX-Licence-Identifier: Apache-2.0
  */
 
 /*
- * RCS $Revision: 1.29 $
- * Checkin $Date: 1995/10/09 13:40:29 $
- * Revising $Author: sdouglas $
+ * RCS $Revision$
+ * Checkin $Date$
+ * Revising $Author$
  */
 
 #ifndef _builtin_h
@@ -37,10 +38,17 @@ extern FPConst fc_minusone;     /*                          -1.0  */
 extern TypeExpr *te_boolean;    /* == te_int in C */
 extern Expr *lit_false;         /* (int)0 in C    */
 extern Expr *lit_true;          /* (int)1 in C    */
+extern Expr *lit_zero;
+extern Expr *lit_one;
 
 extern TypeExpr *te_char;    /* = (global)primtype_(bitoftype_(s_char)) */
 extern TypeExpr *te_int;     /* = (global)primtype_(bitoftype_(s_int)) */
 extern TypeExpr *te_ushort, *te_uint, *te_lint, *te_ulint;  /* and friends */
+extern TypeExpr *te_llint, *te_ullint;
+extern TypeExpr *te_stringchar, *te_wstringchar, *te_wchar;
+#ifdef EXTENSION_UNSIGNED_STRINGS
+extern TypeExpr *te_ustringchar;
+#endif
 extern TypeExpr *te_double;  /* = (global)primtype_(bitoftype_(s_double)) */
 extern TypeExpr *te_float;   /* its short friend */
 extern TypeExpr *te_ldble;   /* and its long one */
@@ -61,10 +69,12 @@ extern Binder *datasegment, *codesegment, *constdatasegment, *ddtorsegment;
 #ifdef TARGET_HAS_BSS
 extern Binder *bsssegment;
 #endif
+Binder *extablesegment, *exhandlersegment;
 extern Symstr *mainsym, *setjmpsym, *assertsym, *first_arg_sym, *last_arg_sym;
 #define DUFF_SYMSTR ((Symstr*)DUFF_ADDR)
 #ifdef CPLUSPLUS
-extern Symstr *thissym, *ctorsym, *dtorsym, *assignsym, *vtabsym, *deletesym;
+extern Symstr *thissym, *ctorsym, *dtorsym, *assignsym, *vtabsym,
+              *deletesym, *dtorgenlabsym;
 #else
 #define thissym DUFF_SYMSTR
 #define ctorsym DUFF_SYMSTR
@@ -72,31 +82,11 @@ extern Symstr *thissym, *ctorsym, *dtorsym, *assignsym, *vtabsym, *deletesym;
 #define assignsym DUFF_SYMSTR
 #define vtabsym DUFF_SYMSTR
 #define deletesym DUFF_SYMSTR
+#define dtorgenlabsym DUFF_SYMSTR
 #endif
 extern Symstr *libentrypoint, *stackoverflow, *stack1overflow,
               *countroutine, *count1routine;
 
-#ifdef TARGET_IS_ACW
-extern Symstr *c_handler, *stackcheck, *heapend;
-#endif
-#ifdef TARGET_IS_KCM
-/* @@@ These should go in struct op_simulation to avoid name clutter.   */
-extern Symstr *FPArg1, *FPArg2, *FPArg1x, *FPArg2x, *cnvtdw_routine,
-  *cnvtwd_routine, *cnvtsd_routine, *cnvtds_routine,
-  *addd_routine, *subd_routine, *negd_routine, *muld_routine, *divd_routine,
-  *cmpd_routine, *divu_routine, *remu_routine;
-#endif
-#ifdef TARGET_IS_SPARC
-extern Symstr *multiply;
-extern Symstr *divide;
-extern Symstr *udivide;
-#endif
-#ifdef TARGET_IS_ALPHA
-extern Symstr *divide;
-extern Symstr *udivide;
-extern Symstr *sremainder;
-extern Symstr *uremainder;
-#endif
 extern Symstr *traproutine, *targeterrno;
 
 typedef struct op_simulation {
@@ -111,7 +101,7 @@ typedef struct op_simulation {
         *writecheck1, *writecheck2, *writecheck4;
    Expr *xprintf, *xfprintf, *xsprintf;
    Expr *realmemcpyfn, *realmemsetfn;
-   Symstr *strcpysym;
+   Symstr *strcpysym, *strlensym;
    Symstr *yprintf, *yfprintf, *ysprintf;
 #ifdef STRING_COMPRESSION
    Expr *xprintf_z, *xfprintf_z, *xsprintf_z, *yprintf_z, *yfprintf_z, *ysprintf_z;
@@ -119,7 +109,6 @@ typedef struct op_simulation {
 #ifdef RANGECHECK_SUPPORTED
    Symstr *abcfault, *valfault;
 #endif
-#ifdef SOFTWARE_FLOATING_POINT
    Expr *dadd, *dsubtract, *dmultiply, *ddivide, *dnegate,
      *dgreater, *dgeq, *dless, *dleq, *dequal, *dneq, *dfloat, *dfloatu,
      *dfix, *dfixu,
@@ -129,8 +118,20 @@ typedef struct op_simulation {
      *ffix, *ffixu,
      *frsb, *frdiv;
    Expr *fnarrow, *dwiden;
-#endif
+   Expr *llnot, *llneg;
+   Expr *lladd, *llrsb, *llsub, *llmul;
+   Expr *llurdv, *lludiv, *llsrdv, *llsdiv;
+   Expr *llurrem, *llurem, *llsrrem, *llsrem;
+   Expr *lland, *llor, *lleor;
+   Expr *llshiftl, *llushiftr, *llsshiftr;
+   Expr *llcmpeq, *llcmpne;
+   Expr *llucmpgt, *llucmplt, *llucmpge, *llucmple;
+   Expr *llscmpgt, *llscmplt, *llscmpge, *llscmple;
+   Expr *llfroml, *llfromu, *llsfromf, *llsfromd, *llufromf, *llufromd;
+   Expr *lltol, *llstof, *llstod, *llutof, *llutod;
+
    Expr *proc_entry, *proc_exit;
+   Symstr *dpow, *dfloor, *dceil, *dmod, *dabs;
 } op_simulation;
 
 extern op_simulation sim;
@@ -140,6 +141,10 @@ typedef struct cpp_op_simulation {
    Symstr *xnew, *xdel;
    Binder *xpvfn;
    Expr *xpush_ddtor;
+   Expr *x__throw;
+   Expr *x__ex_pop;
+   Expr *x__ex_push;
+   Expr *x__ex_top;
    Expr *xnewvec, *xdelvec;
    Expr *xmapvec1, *xmapvec1c, *xmapvec1ci, *xmapvec2;
 } cpp_op_simulation;

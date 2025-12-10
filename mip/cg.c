@@ -2,12 +2,14 @@
  * C compiler file cg.c
  * Copyright (C) Codemist Ltd, 1988.
  * Copyright (C) Acorn Computers Ltd., 1988.
+ * Copyright 1991-1997 Advanced Risc Machines Limited. All rights reserved
+ * SPDX-Licence-Identifier: Apache-2.0
  */
 
 /*
- * RCS $Revision: 1.144.2.1 $ Codemist 119
- * Checkin $Date: 1996/01/23 18:14:02 $
- * Revising $Author: sdouglas $
+ * RCS $Revision$ Codemist 119
+ * Checkin $Date$
+ * Revising $Author$
  */
 
 /* AM memo: remove smashes to tree for long-term safety (e.g. find s_neg)  */
@@ -62,19 +64,12 @@
 #include "aetree.h"
 #include "builtin.h"
 #include "sem.h"       /* typeofexpr */
+#include "syn.h"
 #include "simplify.h"  /* mcrepofexpr */
 #include "bind.h"
 #include "errors.h"
 #include "inline.h"
-
-#ifdef TARGET_LACKS_RR_MEMREF
-#define TARGET_LACKS_RR_STORE 1
-#define TARGET_LACKS_RR_LOAD 1
-#endif
-
-#define RsortOfMcrep_(mode, len) \
-  ((mode)==2 ? ((len)==4 ? FLTREG : DBLREG) : INTREG)
-#define jisize_(rsort) 0
+#include "inlnasm.h"
 
 /* The following lines are in flux, but are here because similar things */
 /* are wanted if TARGET_IS_ALPHA.  They also highlight the dependency   */
@@ -87,11 +82,7 @@
 #define J_memcpy(op) (op)
 #endif
 #define MOVC_ALIGN_MAX alignof_toplevel_auto
-#ifdef TARGET_IS_ALPHA
-#  define MOVC_ALIGN_MIN 4
-#else
-#  define MOVC_ALIGN_MIN alignof_int         /* most old code */
-#endif
+#define MOVC_ALIGN_MIN alignof_int         /* most old code */
 
 #ifdef NEW_J_ALIGN_CODE
 /* But this isn't quite true for TARGET_IS_ALPHA stack vars...          */
@@ -149,19 +140,17 @@ static VRegnum cg_expr1(Expr *x,bool valneeded);
 #endif
 #define IsVolatile 1
 #define IsUnaligned 2
+#define BaseIsWordAligned 4
 static VRegnum cg_stind(VRegnum r, Expr *val, Expr *x, const int32 flag, Binder *b,
                     const int32 mcmode, const int32 mclength,
                     bool address, int volatileorunaligned);
 static VRegnum cg_var(VRegnum r, Binder *b, AEop flag,
                       int32 mcmode, int32 mclength, bool address);
-static void bfreeregister(VRegnum r);
-static VRegnum fgetregister(RegSort rsort);
 static VRegnum reserveregister(RegSort precision);
 static VRegnum getreservedreg(VRegnum r);
 static void cg_bindlist(SynBindList *x,bool initflag);
 static Binder *is_local_adcon(Expr *a);
 static Expr *take_address(Expr *e);
-static Expr *neatify(Expr *e, RegSort rsort);
 static VRegnum open_compilable(Expr **xp,RegSort rsort,bool valneeded);
 static VRegnum cg_fnap(Expr *x,VRegnum resreg,bool valneeded);
 static VRegnum cg_cond
@@ -170,7 +159,7 @@ static VRegnum cg_cond
 static VRegnum cg_cast1(Expr *x1,int32 mclength,int32 mcmode);
 static VRegnum cg_cast1_(VRegnum r, int32 mclength, int32 mcmode, int32 argrep);
 static VRegnum cg_addr(Expr *sv,bool valneeded);
-static VRegnum cg_storein(VRegnum r,Expr *val,Expr *e,AEop flag);
+
 #ifdef EXTENSION_VALOF
 static void cg_cmd(Cmd *x);
 #endif
@@ -186,7 +175,6 @@ static VRegnum cg_binary_or_fn(J_OPCODE op,TypeExpr *type,Expr *fname,
 
 static int32 ispoweroftwo(Expr *x);
 static VRegnum cg_loadconst(int32 n,Expr *e);
-static int nastiness(Expr *x);
 static void cg_count(FileLine fl);
 static void cg_return(Expr *x, bool implicitinvaluefn);
 static void cg_loop(Expr *init, Expr *pretest, Expr *step, Cmd *body,
@@ -196,15 +184,11 @@ static void casebranch(VRegnum r, CasePair *v, int32 ncases,
                        LabelNumber *defaultlab);
 static void cg_case_or_default(LabelNumber *l1);
 static void cg_condjump(J_OPCODE op,Expr *a1,Expr *a2,RegSort rsort,J_OPCODE cond,LabelNumber *dest);
-#if defined TARGET_HAS_SCALED_ADDRESSING || defined TARGET_HAS_SCALED_OPS || \
-    defined TARGET_HAS_SCALED_ADD
-  static int32 is_shifted(Expr *x, int32 mclength);
-  static Expr *shift_operand(Expr *x);
-  static int32 shift_amount(Expr *x);
-#endif
 static void emituse(VRegnum r,RegSort rsort);
 static VRegnum load_integer_structure(Expr *e);
 static Binder *gentempvar(TypeExpr *t, VRegnum r);
+static void cg_cond1(Expr *e, bool valneeded, VRegnum targetreg,
+                     LabelNumber *l3, bool structload);
 
 /* result_variable is an extra first arg. for use with structure returning  */
 /* functions - private to cg_return and cg_topdecl                          */
@@ -216,6 +200,340 @@ static LabelNumber *structretlab;
 /*************************************************************************/
 /*                 Start of codegeneration proper.                       */
 /*************************************************************************/
+
+static bool ContainsUnalignedSubExpr(Expr *x)
+{
+    for (;;) switch (h0_(x))
+    {
+    case s_integer:
+    case s_floatcon:
+    case_s_any_string
+    case s_binder:
+        return NO;
+
+/* monadic things... */
+    case s_content:
+    case s_content4:
+        if (isunaligned_expr(x)) return YES;
+        x = arg1_(x);
+        continue;
+    case s_cast:
+        if (isunaligned_type(type_(x))) return YES;
+        /* fall through */
+    case s_bitnot:
+    case s_boolnot:
+    case s_monplus:
+    case s_neg:
+    case s_addrof:
+        x = arg1_(x);
+        continue;
+    case s_cond:
+        /* due to the fact that operands from s_cond are never combined */
+        /* we do not need the complexity of binary operators below.     */
+        return ContainsUnalignedSubExpr(arg1_(x)) ||
+               ContainsUnalignedSubExpr(arg2_(x)) ||
+               ContainsUnalignedSubExpr(arg3_(x));
+    case s_assign:
+    case s_displace:
+    case s_andand:
+    case s_oror:
+    case s_equalequal:
+    case s_notequal:
+    case s_greater:
+    case s_greaterequal:
+    case s_less:
+    case s_lessequal:
+    case s_comma:
+    case s_and:
+    case s_plus:
+    case s_minus:
+    case s_leftshift:
+    case s_or:
+    case s_rightshift:
+    case s_xor:
+    case s_times:
+    case s_div:
+    case s_rem:
+        return ContainsUnalignedSubExpr(arg1_(x)) ||
+               ContainsUnalignedSubExpr(arg2_(x));
+    case s_let:
+        x = arg2_(x);
+        continue;
+    case s_fnap:
+        if (ContainsUnalignedSubExpr(arg1_(x))) return YES;
+        {   ExprList *l = exprfnargs_(x);
+            for (; l != NULL; l = cdr_(l))
+                if (ContainsUnalignedSubExpr(exprcar_(l)))
+                    return YES;
+        }
+    default:
+        return NO;
+    }
+}
+
+#if defined TARGET_HAS_SCALED_ADDRESSING || defined TARGET_HAS_SCALED_OPS || \
+    defined TARGET_HAS_SCALED_ADD
+
+#ifndef target_shiftop_allowed
+#define target_shiftop_allowed(n, len, mode, op) target_scalable(n, len)
+#endif
+
+#define unsigned_expression_(x) \
+        ((mcrepofexpr(x) >> MCR_SORT_SHIFT) == 1)
+
+static Expr *ignore_ineffectual_casts(Expr *x) {
+    for (; h0_(x) == s_cast; x = arg1_(x)) {
+        int32 resrep = mcrepofexpr(x),
+              argrep = mcrepofexpr(arg1_(x));
+        int32 ressort = resrep & MCR_SORT_MASK,
+              argsort = argrep & MCR_SORT_MASK;
+        if (ressort > MCR_SORT_UNSIGNED || argsort > MCR_SORT_UNSIGNED)
+            break;
+        {   int32 ressize = resrep & MCR_SIZE_MASK,
+                  argsize = argrep & MCR_SIZE_MASK;
+            if (ressort == argsort) {
+                if (ressize < argsize)
+                    break;
+            } else if (ressize != argsize || ressize < 4)
+              break;
+        }
+    }
+    return x;
+}
+
+static Expr *shift_op1(Expr *x, int32 n)
+{
+    if (n==0) syserr(syserr_cg_shift0);
+    while ((n & 1)==0) n >>= 1;
+    if (n==1) return x;
+    return mk_expr2(s_times, te_int, x,
+                    mkintconst(te_int, n, 0));
+}
+
+static Expr *shift_operand(Expr *x)
+/* if is_shifted() returned true this can be used to extract the operand */
+{
+    int32 n;
+    Expr *arg;
+    x = ignore_ineffectual_casts(x);
+    switch (h0_(x))
+    {
+case s_rightshift:
+case s_leftshift:
+        arg = arg2_(x);
+        if (h0_(arg) == s_integer && intval_(arg)==0)
+            return shift_operand(arg1_(x));
+        return arg1_(x);
+case s_times:
+        arg = arg1_(x);
+        if (h0_(arg)==s_integer)
+        {   n = intval_(arg);
+            if ((n & 1)==0) return shift_op1(arg2_(x), n);
+        }
+        else return shift_op1(arg1_(x), intval_(arg2_(x)));
+default:
+        syserr(syserr_not_shift);
+        return x;
+    }
+}
+
+static int32 shift_amount(Expr *x)
+/* if is_shifted() returned true this can be used to extract the shift   */
+{
+    int32 n;
+    Expr *arg;
+    x = ignore_ineffectual_casts(x);
+    switch (h0_(x))
+    {
+case s_rightshift:
+        n = intval_(arg2_(x));
+        if (n == 0) return shift_amount(arg1_(x));
+/* This is a horrid packing scheme */
+        n = (n & SHIFT_MASK) | SHIFT_RIGHT;
+        if (!unsigned_expression_(arg1_(x))) n |= SHIFT_ARITH;
+        return n;
+case s_leftshift:
+        arg = arg2_(x);
+        n = intval_(arg);
+        if (n == 0) return shift_amount(arg1_(x));
+        return n & SHIFT_MASK;
+case s_times:
+        arg = arg1_(x);
+        if (h0_(arg)==s_integer)
+        {   n = intval_(arg);
+            if ((n & 1)==0) return logbase2(n) & SHIFT_MASK;
+        }
+        arg = arg2_(x);
+        if (h0_(arg)==s_integer)
+        {   n = intval_(arg);
+            if ((n & 1)==0) return logbase2(n) & SHIFT_MASK;
+        }
+        /* drop through */
+default:
+        syserr(syserr_not_shift1);
+        return 0;
+    }
+}
+
+static int32 is_shifted(Expr *x, int32 mclength, int32 signedness, int32 op)
+/* Predicate to test if an expression is of the form something shifted.  */
+/* 11-Nov-87: changed to consult target_scalable() for 32016/vax.        */
+/* Used to decide if scaled indexed addressing is wanted.                */
+/*
+ * mclength is zero for scaled-op investigation, or 1, 2, 4 or 8 for byte,
+ * short, long or double memory references.  It is -1, -2, -4 or -8 for
+ * memory references where the scaled index must be subtracted from the
+ * base value rather than added. mclength is just handed down to a
+ * target specific test for validity.
+ */
+{
+    int32 n;
+    Expr *arg;
+    x = ignore_ineffectual_casts(x);
+    switch (h0_(x))
+    {
+case s_rightshift:
+case s_leftshift:
+        arg = arg2_(x);
+        if (h0_(arg)!=s_integer) return 0;
+        n = intval_(arg);
+        if (n == 0) return is_shifted(arg1_(x), mclength, signedness, op);
+        if (n>=0 && n<=31)
+            return target_shiftop_allowed(shift_amount(x), mclength, signedness, op);
+        else return 0;
+case s_times:                   /* detect multiplication by 2, 4, 6, ...  */
+        if ((arg = arg1_(x), h0_(arg)) == s_integer ||
+            (arg = arg2_(x), h0_(arg)) == s_integer)
+        {   n = intval_(arg);
+            if (n!=0 && (n & 1)==0)
+                return target_shiftop_allowed(shift_amount(x), mclength, signedness, op);
+        }
+        return 0;
+default:
+        return 0;
+    }
+}
+
+#endif /* TARGET_HAS_SCALED_ADDRESSING or _OPS */
+
+/* The code that follows is too simplistic - I need a better estimate of */
+/* the complexity of expressions, e.g. an estimate of the number of regs */
+/* needed to evaluate something.                                         */
+
+/* values for nastiness() */
+#define ISCONST  0x100   /* assumed minimum for nastiness()              */
+#define ISXCONST 0x101   /* floating, string, (addrof one day -- ask AM) */
+#define ISBIND   0x102
+#define ISEXPR   0x103
+/* ISHARD *MUST BE* the maximum nastiness() can return:                  */
+/* such expressions have function applications in them -- allows 2^10    */
+/* terms in an expression (without fn calls) before we have to truncate  */
+/* to avoid hitting the ISHARD ceiling.   See nastiness().               */
+#define ISHARD   (ISEXPR+10)   /* assumed maximum for nastiness()        */
+
+static int nastiness(Expr *x)
+{
+/* This procedure is used to provide an heuristic that helps me decide   */
+/* what order to prepare arguments for functions in. It a value between  */
+/* ISCONST and ISHARD to show if the expression x contains any function  */
+/* calls (which clobber lots of regs) or otherwise a value estimating    */
+/* the likely number of registers the expression is liable to take.      */
+    AEop op;
+    int n1, n2, n3, nr;
+#define max_(a,b) ((a)>=(b) ? (a):(b))
+    for (;;) switch (op = h0_(x))
+    {
+case s_integer:
+        return ISCONST;
+case s_floatcon:
+case s_int64con:
+case_s_any_string
+        return ISXCONST;
+case s_binder:
+        return ISBIND;
+/* monadic things... */
+case s_content:
+case s_content4:
+#if 0
+        {   int32 m = mcrepofexpr(x);
+            if ((m >> MCR_SORT_SHIFT) == 3 && (m & MCR_SIZE_MASK) > 4)
+                return ISHARD;  /* big struct */
+        }
+#endif
+        if (memory_access_checks) return(ISHARD);
+case s_cast:
+case s_bitnot:
+case s_boolnot:
+case s_monplus:
+case s_neg:
+case s_addrof:
+        x = arg1_(x);
+        continue;
+case s_cond:
+        /* due to the fact that operands from s_cond are never combined */
+        /* we do not need the complexity of binary operators below.     */
+        nr = nastiness(arg1_(x));
+        n2 = nastiness(arg2_(x));
+        nr = max_(nr,n2);
+        n3 = nastiness(arg3_(x));
+        nr = max_(nr,n3);
+        return max_(ISEXPR, nr);
+case s_assign:
+case s_displace:
+        {   int32 m = mcrepofexpr(x);
+            if ((m >> MCR_SORT_SHIFT) == 3 && (m & MCR_SIZE_MASK) > 4)
+                return ISHARD;  /* big struct */
+        }
+        /* drop through */
+case s_andand:
+case s_oror:
+case s_equalequal:
+case s_notequal:
+case s_greater:
+case s_greaterequal:
+case s_less:
+case s_lessequal:
+case s_comma:
+case s_and:
+case s_plus:
+case s_minus:
+case s_leftshift:
+case s_or:
+case s_rightshift:
+case s_xor:
+case s_times:
+case s_div:
+case s_rem:
+        n1 = nastiness(arg1_(x));
+        n2 = nastiness(arg2_(x));
+/* A good estimate of the complexity (number of temp registers needed)  */
+/*             n1==n2 ? n1+1 : max(n1,n2),                              */
+/* but modify the middle term so that we never exceed ISHARD, nor       */
+/* even attain it unless one term is ISHARD (thus ISHARD terms are only */
+/* those containing function like things).  See cg_fnargs for why.      */
+        nr = n1==n2 ? (n1>=ISHARD-1 ? n1 : n1+1) : max_(n1,n2);
+#ifndef TARGET_HAS_MULTIPLY
+          /* See if we will need a proc. call on the ARM and similar.      */
+          /* However, this 'better' code seems to compile a slightly 0.01% */
+          /* bigger compiler than if we omit the conjuncts which check for */
+          /* (const) multiplies which do not require a function call!!!!   */
+          /* Leave in the 'notionally correct code'.                       */
+        if (op == s_times && h0_(arg1_(x)) != s_integer
+                          && h0_(arg2_(x)) != s_integer) return ISHARD;
+#endif
+#ifndef TARGET_HAS_DIVIDE
+        if ((op == s_div || op == s_rem) && h0_(arg2_(x)) != s_integer)
+            return ISHARD;
+#endif
+        return max_(ISEXPR, nr);            /* always a little bit hard. */
+case s_let:
+        x = arg2_(x);
+        continue;
+default:   /* includes s_fnap */
+        return ISHARD;
+    }
+#undef max_
+}
 
 #define unsigned_expression_(x) \
         ((mcrepofexpr(x) >> MCR_SORT_SHIFT) == 1)
@@ -237,40 +555,17 @@ static BindList *datasegbinders;
         cg_binary_or_fn(op,type,fname,a1,a2,0)
 #endif
 
-/* values for nastiness() */
-#define ISCONST  0x100   /* assumed minimum for nastiness()              */
-#define ISXCONST 0x101   /* floating, string, (addrof one day -- ask AM) */
-#define ISBIND   0x102
-#define ISEXPR   0x103
-/* ISHARD *MUST BE* the maximum nastiness() can return:                  */
-/* such expressions have function applications in them -- allows 2^10    */
-/* terms in an expression (without fn calls) before we have to truncate  */
-/* to avoid hitting the ISHARD ceiling.   See nastiness().               */
-#define ISHARD   (ISEXPR+10)   /* assumed maximum for nastiness()        */
-
 #define mkArg(x,y)        ((Expr*)mkExprList(x,y))
 #define mkArgList1(x)     ((Expr*)mkExprList(0,x))
 #define mkArgList2(x,y)   ((Expr*)mkExprList(mkExprList(0,y),x))
 #define mkArgList3(x,y,z) ((Expr*)mkExprList(mkExprList(mkExprList(0,z),y),x))
 
-static Expr *cg_content_for_dot(Expr *x)
-{
-/* Of course, mcrepofexpr(e) = 4 implies that selections from e will have */
-/* offset = 0, but simplify may produce a selection outside e (in turning */
-/* *(a+n).k into *a.(n+k)).                                               */
-    if (mcrepofexpr(arg1_(x)) == 0x0000004 && exprdotoff_(x) == 0 &&
-        !isvolatile_expr(x))
-        return arg1_(x);
-    else
-        return mk_expr1(s_content, type_(x), take_address(x));
-}
-
-static VRegnum cg_exprvoid(Expr *x)
+VRegnum cg_exprvoid(Expr *x)
 {
     return cg_expr1(x, NO);
 }
 
-static VRegnum cg_expr(Expr *x)
+VRegnum cg_expr(Expr *x)
 {
     return cg_expr1(x, YES);
 }
@@ -294,10 +589,10 @@ static VRegnum cg_unary_i(J_OPCODE op, RegSort rsort, Expr *x)
 {
     VRegnum r, r1;
 #ifdef TARGET_HAS_SCALED_OPS
-    if (op == J_NOTR && is_shifted(x, 0)) {
+    if (op == J_NOTR && is_shifted(x, 0, 0, 0)) {
         r1 = cg_expr(shift_operand(x));
         r = fgetregister(rsort);
-        emit5(op, r, GAP, r1, shift_amount(x));
+        emitshift(op, r, GAP, r1, shift_amount(x));
     } else
 #endif
     {   r1 = cg_expr(x);
@@ -325,15 +620,12 @@ static VRegnum cg_exprreg(Expr *x, VRegnum r)
 {   switch (h0_(x))
     {
 case s_integer:
-        if (usrdbg(DBG_LINE) && x->fileline != 0)
-            emitfl(J_INFOLINE, *x->fileline);
+        if (usrdbg(DBG_LINE) && exprfileline_(x) != 0)
+            emitfl(J_INFOLINE, *exprfileline_(x));
         emit(J_MOVK, r, GAP, intval_(x));
         break;
 case_s_any_string
-#ifdef TARGET_IS_MIPS_failed_experiment
-        if (mips_opt & 1 && !mips_opt_zh(8)) goto defolt;
-#endif
-        emitstring(J_STRING, r, ((String *)x)->strseg);
+        emitstring(J_STRING, r, exs_(x)->strseg);
         break;
 #ifdef EVEN_FINER_DAY
 case s_binder: ...
@@ -352,7 +644,6 @@ case s_cond:
         break;
 /* n.b. do not use with with s_addrof due to loadadcon() slaving */
 default:
-defolt:
         {   VRegnum r2 = cg_expr1(x, 1);
             RegSort rsort = vregsort(r2);
             emitreg(floatyop(rsort, J_MOVR, J_MOVFR, J_MOVDR), r, GAP, r2);
@@ -501,8 +792,8 @@ static VRegnum cg_expr2(Expr *x, bool valneeded)
     if (x == 0) { syserr(syserr_missing_expr); return GAP; }
 
     op = h0_(x);
-    if (usrdbg(DBG_LINE) && hasfileline_(op) && x->fileline != 0)
-        emitfl(J_INFOLINE, *x->fileline);
+    if (usrdbg(DBG_LINE) && hasfileline_(op) && exprfileline_(x) != 0)
+        emitfl(J_INFOLINE, *exprfileline_(x));
 
     switch (op)
     {
@@ -514,9 +805,10 @@ case s_throw:
 
 case s_binder:
             if (!valneeded && !isvolatile_expr(x)) return GAP;
-            {   Binder *b = (Binder *)x;
+            {   Binder *b = exb_(x);
                 if ((x = bindconst_(b)) != NULL)
-                {   syserr("bindconst $b got to cg.c", b);
+                {   if (LanguageIsCPlusPlus)
+                        syserr("bindconst $b got to cg.c", b);
                     return cg_expr2(x, valneeded);
                 }
                 r = ensure_regtype(cg_var(GAP, b, s_content, mcmode, mclength,
@@ -528,49 +820,30 @@ case s_binder:
 case s_integer:
             if (!valneeded) return GAP;
 #ifdef TARGET_HAS_CONST_R_ZERO
-            if (intval_(x) == 0 && R_ZERO != -1) return R_ZERO;
+            if (intval_(x) == 0) return R_ZERO;
 #endif
             emit(J_MOVK, r = fgetregister(rsort), GAP, intval_(x));
             return r;
 
 case s_floatcon:
             if (!valneeded) return GAP;
-#ifdef SOFTWARE_FLOATING_POINT
-            if (software_floating_point_enabled && rsort != DBLREG)
+            if (software_floats_enabled && rsort != DBLREG)
             /* single precision values treated as ints */
             {   emit(J_MOVK, r = fgetregister(INTREG), GAP,
-                             ((FloatCon *)x)->floatbin.irep[0]);
+                             exf_(x)->floatbin.irep[0]);
                 return r;
             }
-#endif
 #ifdef TARGET_HAS_CONST_R_FZERO
-            if (is_fpzero(x) && R_FZERO != -1) return R_FZERO;
+            if (is_fpzero(x)) return R_FZERO;
 #endif
             r = fgetregister(rsort);
-            emitfloat1(rsort==DBLREG ? J_MOVDK:J_MOVFK, r, GAP, (FloatCon *)x);
+            emitfloat1(rsort==DBLREG ? J_MOVDK:J_MOVFK, r, GAP, exf_(x));
             return r;
 
 case_s_any_string
             if (!valneeded) return GAP;
-#ifdef TARGET_IS_MIPS_failed_experiment
-            if (mips_opt & 1 && !mips_opt_zh(8))
-            {   Binder *b;
-                if (feature & FEATURE_WR_STR_LITS)
-                {   datap = &vardata;
-                    b = gendcSlit(((String *)x)->strseg);
-                    return cg_addr((Expr *)b, valneeded);
-                }
-/*      #ifdef TARGET_IS_XAP_OR_NEC    / * parameterise properly soon */
-                {   datap = &constdata;
-                    b = gendcSlit(((String *)x)->strseg);
-                    datap = &vardata;
-                    return cg_addr((Expr *)b, valneeded);
-                }
-/*      #endif */
-            }
-#endif
             emitstring(J_STRING, r=fgetregister(ADDRREG),
-                                 ((String *)x)->strseg);
+                                 exs_(x)->strseg);
             return r;
 
 #ifdef EXTENSION_VALOF
@@ -647,6 +920,11 @@ case s_fnap:
             /* (often to a temporary) which turns the s_fnap (via        */
             /* structure_assign()) into s_fnapstruct.                    */
 
+            if (resultinflags_fn(x))
+            {
+                x = mk_expr3(s_cond, te_int, x, mkintconst(te_int, 1, 0), mkintconst(te_int, 0, 0));
+                return cg_expr1(x, valneeded);
+            }
             /* drop through */
 /*
  * s_fnapstruct is an artefact introduced when a structure returning
@@ -701,10 +979,7 @@ case s_boolnot:
 
 case s_andand:
 case s_oror:
-            x = mk_expr3(s_cond, te_int,
-                                 x,
-                                 mkintconst(te_int, 1, 0),
-                                 mkintconst(te_int, 0, 0));
+            x = mk_expr3(s_cond, te_int, x, lit_one, lit_zero);
             return cg_expr(x);
 
 case s_comma:
@@ -715,10 +990,10 @@ case s_init:
 #ifdef NARROW_FORMALS_REUSE_ARG_BINDER
             if ( (h0_(arg2_(x)) == s_binder && arg2_(x) == arg1_(x)) ||
                  (h0_(arg2_(x)) == s_cast && h0_(arg1_(x)) == s_binder && arg1_(arg2_(x)) == arg1_(x))) {
-              TypeExpr *wt = widen_formaltype(bindtype_((Binder *)arg1_(x)));
+              TypeExpr *wt = widen_formaltype(bindtype_(exb_(arg1_(x))));
               int32 mcr = mcrepoftype(wt);
               int32 mcr1 = mcrepofexpr(arg2_(x));
-              return cg_storein(cg_cast1_(cg_var(GAP, (Binder *)arg1_(x), s_content, mcr >> MCR_SORT_SHIFT, mcr & MCR_SIZE_MASK, NO),
+              return cg_storein(cg_cast1_(cg_var(GAP, exb_(arg1_(x)), s_content, mcr >> MCR_SORT_SHIFT, mcr & MCR_SIZE_MASK, NO),
                                           mcr1 & MCR_SIZE_MASK, mcr1 >> MCR_SORT_SHIFT, mcr),
                                 NULL, arg1_(x), s_assign);
             }
@@ -757,19 +1032,12 @@ ass_disp:
               return cg_storein(cg_expr(arg2_(x)), NULL, arg1_(x),
                                 valneeded ? op : s_assign);
 
-case s_dot:
-        {   Expr *arg1 = arg1_(x);
-            x = cg_content_for_dot(x);
-            IGNORE(arg1);
-/* Assert: x == arg1 => integerlikestruct. cg_content_for_dot () generates  */
-/*         the correct code either way.                                     */
-            return cg_expr1(x, valneeded);
-        }
-
 case s_content:
+case s_content4:
         {   bool volatileorunaligned = isvolatile_expr(x) | (isunaligned_expr(x) << 1);
             if (!valneeded && !(volatileorunaligned & IsVolatile))
                 return cg_exprvoid(arg1_(x));
+            if (op == s_content4) volatileorunaligned |= BaseIsWordAligned;
             x = arg1_(x);
             verify_integer(x);
             if (memory_access_checks)
@@ -847,7 +1115,7 @@ case s_div:
 /* that can save me some effort.                                         */
         if (!valneeded)
         {   cg_exprvoid(arg1_(x));
-            x = mk_expr2(s_div, type_(x), mkintconst(te_int, 1, 0), arg2_(x));
+            x = mk_expr2(s_div, type_(x), lit_one, arg2_(x));
         }
         if (!isintregtype_(rsort))
 /* @@@ AM: tests like the following can probably be hit with a feature  */
@@ -885,7 +1153,7 @@ case s_div:
                 r = cg_expr(arg1_(x));
 #ifdef TARGET_HAS_SCALED_OPS         /* even more cunning trick for n/2 ... */
                 if (p == 1)
-                    emit5(J_ADDR, r, r, r, SHIFT_RIGHT | 31);   /* unsigned */
+                    emitshift(J_ADDR, r, r, r, SHIFT_RIGHT | 31);   /* unsigned */
                 else
 #endif
                 {   LabelNumber *l = nextlabel();
@@ -895,7 +1163,10 @@ case s_div:
                     emit(J_ADDK, r, r, lowerbits(p));
                     start_new_basic_block(l);
                 }
-                emit(J_SHRK+J_SIGNED, r, r, p);
+                if (p != 31)
+                    emit(J_SHRK+J_SIGNED, r, r, p);
+                else
+                    emit(J_SHRK+J_UNSIGNED, r, r, p);
             }
             else
 #endif
@@ -1044,6 +1315,15 @@ static RegList *rl_discard(RegList *x)
 {   return (RegList *)discard2((List *)x);
 }
 
+#define toplevel_alignment(b) \
+  ((bindstg_(b) & bitofstg_(s_auto)) ? alignof_toplevel_auto :\
+                                       alignof_toplevel_static)
+
+#define expr_alignment(e) \
+  ((h0_(e) == s_binder) ? toplevel_alignment((Binder *)e) : 1)
+
+#define AddUsedReg(r) (usedregs = mkRegList(usedregs, (r)), ++nusedregs)
+
 /* The effect of calling flush_arg_usedregs is to set usedregs to 0     */
 /* and either dispose of its pointed to list or to pass it on to        */
 /* someone else who will.   @@@ REVIEW?                                 */
@@ -1055,24 +1335,10 @@ static void flush_arg_usedregs(int32 argaddr)
              usedregs != NULL;
              usedregs = rl_discard(usedregs))
     {   VRegnum r = usedregs->rlcar;
-        if
-#if (NARGREGS==0)
-#  if 1         /* #ifdef EXPERIMENTAL_68000  <<<<<<<<<<<<<< experiment */
-                (usedregs->rlcdr != NULL)
-#  else
-                (r != R_A1)               /* hmm.         */
-#  endif
-#else
-                (!((unsigned32)((r)-R_A1) < (unsigned32)NARGREGS))
-#endif
-                syserr(syserr_bad_reg, (long)r);
-#ifdef TARGET_IS_ALPHA
+        if (!((unsigned32)((r)-R_A1) < (unsigned32)NARGREGS))
+            syserr(syserr_bad_reg, (long)r);
 /* @@@ perhaps J_PUSHR should mean "push alignof_toplevel size binder.  */
-/* @@@ merge this in properly.                                          */
-        emit(J_PUSHL, r, GAP, argaddr -= alignof_toplevel_auto);
-#else
         emit(J_PUSHR, r, GAP, argaddr -= alignof_toplevel_auto);
-#endif
         active_binders = mkBindList(active_binders, integer_binder);
         current_stackdepth += alignof_toplevel_auto;
     }
@@ -1098,7 +1364,7 @@ static void flush_fparg(VRegnum r, int32 rep, int32 argaddr)
 }
 
 /* ECN: Handle case where R_IP is defined to be an arg register */
-#if R_A1 <= R_IP && R_IP < R_A1+NARGREGS 
+#if R_IP < NARGREGS
 #if R_IP != NARGREGS-1
 #error "Can't handle this definition of R_IP"
 #else
@@ -1108,24 +1374,54 @@ static void flush_fparg(VRegnum r, int32 rep, int32 argaddr)
 #define NARGREGS1 (NARGREGS==0 ? 1 : NARGREGS)
 #endif
 
-/* The following typedef is local to cg_fnargs() and cg_fnap() */
-typedef struct ArgInfo { Expr *expr; int info;
-                         int32 regoff, rep, addr; } ArgInfo;
-
-static void cg_fnargs_stack(ArgInfo arg[], int32 regargs, int32 n)
 #ifdef TARGET_HAS_RISING_STACK
-/* Now compile last arguments onto the stack, starting with the bottom one,
-   and leaving a gap for those that are passed in registers. */
+#  define FlushPrevArgRegs(arg, n) flush_arg_usedregs((arg)[(n)-1].addr);
 #else
-/* Now compile last arguments onto the stack, starting with the top one. */
+#  define FlushPrevArgRegs(arg, n) flush_arg_usedregs((arg)[(n)+1].addr);
 #endif
+
+/* The following typedef is local to cg_fnargs() and cg_fnap() */
+typedef struct ArgInfo {
+    Expr *expr;
+    int info;       /* nastiness(expr) */
+    uint8 regoff,   /* offset of first argument register from R_A1 */
+          nreg;     /* number of integer argument registers */
+    int32 rep,      /* mcrepof(expr) */
+          addr;     /* stack offset from base of argument list */
+} ArgInfo;
+
+static void cg_fnargs_stack(ArgInfo arg[], int32 regargs, int32 n, bool firstsplit)
+/* Evaluate arguments described by arg[regargs] up to arg[n-1] and place */
+/* them on the stack. If TARGET_HAS_RISING_STACK, the order is ascending */
+/* and a gap is left for those passed in registers. Otherwise, the order */
+/* is descending.                                                        */
 /* However, ensure the stack is always correctly aligned if necessary.   */
+
+/* The arguments handled by this function are not necessarily intended   */
+/* to be passed on the stack - they (or some part of them) may be popped */
+/* into integer registers before the call.                               */
+/* This behaviour is BROKEN if STACK_MOVES_ONCE.                         */
 {   int32 narg;
+    int32 nargregs1 = NARGREGS1;
+    int32 stackargs = firstsplit ? regargs-1 : regargs;
+#ifdef TARGET_IS_ARM_OR_THUMB
+/* this really means "TARGET_IMPLEMENTS_UnalignedLoadMayUse" */
+    bool unaligned_arg = NO;
+    for (narg = stackargs; narg != n; narg++)
+        if (ContainsUnalignedSubExpr(arg[narg].expr)) {
+            unaligned_arg = YES;
+            break;
+        }
+    if (unaligned_arg)
+      for (; ; nargregs1--)
+        if (!UnalignedLoadMayUse(R_A1+nargregs1-1))
+          break;
+#endif
 #ifdef TARGET_HAS_RISING_STACK
-    for (narg = regargs; narg!=n; narg++ )
+    for (narg = stackargs; narg != n; narg++ )
     {   int32 rep = arg[narg].rep;
 #else
-    for (narg = n; narg!=regargs; )
+    for (narg = n; narg != stackargs; )
     {   int32 rep = arg[--narg].rep;
 #if (alignof_double > alignof_toplevel_auto)
 /* pad beyond last int arg --- hmm think */
@@ -1142,78 +1438,55 @@ static void cg_fnargs_stack(ArgInfo arg[], int32 regargs, int32 n)
 #endif /* TARGET_HAS_RISING_STACK */
 /* Major fun is called for here in case an actual argument is something  */
 /* other than a 32-bit integer-like quantity.                            */
-        switch (rep)
+        switch (rep & MCR_SORT_MASK)
         {
-    case 0x00000001: case 0x00000002:   /* @@@ no longer needed?         */
-    case 0x00000004: case 0x00000008:
-    case 0x01000001: case 0x01000002:   /* @@@ no longer needed?         */
-    case 0x01000004: case 0x01000008:
-/* Integer-like values of all sensible lengths : signed and unsigned.    */
+        default:
+          syserr(syserr_cg_fnarg, (long)rep);
+          break;
+        case MCR_SORT_SIGNED:
+        case MCR_SORT_UNSIGNED:
 /* Maybe the next use of 'nusedregs' is nasty.                           */
-          if (nusedregs == NARGREGS1 || arg[narg].info == ISHARD)
+          if (nusedregs == nargregs1 || arg[narg].info == ISHARD)
               /* The following line avoids silly (n**2) code on fn call. */
-#ifdef TARGET_HAS_RISING_STACK
-              flush_arg_usedregs(arg[narg-1].addr);
-#else
-              flush_arg_usedregs(arg[narg+1].addr);
-#endif
-#if (NARGREGS==0)   /* #ifdef EXPERIMENTAL_68000 <<<<<<<<<<<<<< experiment */
-          {   Expr *a = arg[narg].expr;
-              TypeExpr *t = princtype(typeofexpr(a));
-              VRegnum argr = reserveregister(
-#  ifdef ADDRESS_REG_STUFF
-                                h0_(t) == t_content || h0_(t) == t_subscript ?
-                                    ADDRREG :
-#  endif
-                                    INTREG);
-              (void)cg_exprreg(a, argr);
-              getreservedreg(argr);
-          }
-/* cg_expr1(arg[narg].expr, 1); should work, but compiles wrong code (why?) */
-#else
+              FlushPrevArgRegs(arg, narg);
+
           {   Expr *a = arg[narg].expr;
 #ifdef TARGET_HAS_RISING_STACK
               VRegnum argr = R_A1 + nusedregs;
 #else
-              VRegnum argr = R_A1 + NARGREGS1-1 - nusedregs;
+              VRegnum argr = R_A1 + nargregs1-1 - nusedregs;
 #endif
               (void)cg_exprreg(a, argr);
-              usedregs = mkRegList(usedregs, argr);
-              nusedregs++;
-          }
-#endif
-          break;
-    case 0x02000004:    /* n.b. single float only occur with fn prototypes */
-    case 0x02000008:    /* double floating */
-    case 0x02000008+MCR_ALIGN_DOUBLE:         /* nasty temp hack. */
-#ifdef TARGET_HAS_RISING_STACK
-          flush_arg_usedregs(arg[narg-1].addr);
-#else
-          flush_arg_usedregs(arg[narg+1].addr);
-#endif
-          { VRegnum r = cg_expr(arg[narg].expr);
-            int32 argaddr = arg[narg].addr;
-            flush_fparg(r, rep, argaddr);
-            bfreeregister(r);
+              AddUsedReg(argr);
           }
           break;
-    default:
-/* Structure valued arguments come here (except maybe the one-word case  */
-/* which went through the integer code.                                  */
-          if ((rep & (0xff000000+alignof_struct-1)) != 0x03000000)
-              /* @@@ will this line trip up acorn's APRM etc?            */
-              /* Before you change this, note the need to round up       */
-              /* structsize to a word below, and to cope with MOVC in    */
-              /* case the arg. is non-aligned.                           */
-              syserr(syserr_cg_fnarg, (long)rep);
-          if (nusedregs == NARGREGS1 || arg[narg].info == ISHARD
+        case MCR_SORT_FLOATING:
+          FlushPrevArgRegs(arg, narg);
+          if (!firstsplit || narg != stackargs)
+          {   VRegnum r = cg_expr(arg[narg].expr);
+              int32 argaddr = arg[narg].addr;
+              flush_fparg(r, rep, argaddr);
+              bfreeregister(r);
+              break;
+          }
+          /* Otherwise (fp argument split between stack and registers)   */
+          /* fall through to handle as though struct. The argument is    */
+          /* guaranteed by cg_fnargs() to be store-like.                 */
+        case MCR_SORT_STRUCT:
+          /* There used to be a check here that the size of the struct   */
+          /* is a multiple of align_of_struct. It's been retired as      */
+          /* inadequate (alignof_struct may be less than sizeof_int);    */
+          /* moreover, we need to handle packed structs                  */
+          /* The code guarded by !defined(TARGET_HAS_BLOCKMOVE) below    */
+          /* must take care not to try to handle cases which aren't      */
+          /* adequately aligned.                                         */
+          if (nusedregs == nargregs1 || arg[narg].info == ISHARD
                                      || MEMCPYREG == DBLREG)
-#ifdef TARGET_HAS_RISING_STACK
-              flush_arg_usedregs(arg[narg-1].addr);
-#else
-              flush_arg_usedregs(arg[narg+1].addr);
-#endif
-          { int32 structsize = rep & MCR_SIZE_MASK;
+              FlushPrevArgRegs(arg, narg);
+          { int32 start = 0,
+                  structsize = rep & MCR_SIZE_MASK;
+            if (firstsplit && narg == stackargs)
+                start = arg[narg].nreg * alignof_toplevel_auto;
 /*
  * We now pretend that the ARM has a BLOCKMOVE instruction because that
  * makes it possible for gen.c to expand blockmoves into sequences of
@@ -1226,7 +1499,8 @@ static void cg_fnargs_stack(ArgInfo arg[], int32 regargs, int32 n)
  */
 #if !defined(TARGET_HAS_BLOCKMOVE) || defined(TARGET_IS_THUMB)
 /* The following code needs to know struct alignment as well as size:    */
-            if (alignof_struct >= MEMCPYQUANTUM && structsize < 5*MEMCPYQUANTUM)
+            if (alignoftype(typeofexpr(arg[narg].expr)) >= MEMCPYQUANTUM
+                && structsize < 5*MEMCPYQUANTUM)
 /* The case of a (small) structure argument (now guaranteed by simplify  */
 /* not to involve a function call) can be compiled using a sequence of   */
 /* PUSH (or PUSHD) operations.                                           */
@@ -1236,7 +1510,7 @@ static void cg_fnargs_stack(ArgInfo arg[], int32 regargs, int32 n)
             {   Expr *e = take_address(arg[narg].expr);
                 Binder *b = is_local_adcon(e);
                 VRegnum r = GAP;
-                if (!b)
+                if (b == NULL)
                 {   r = cg_expr(e);
 /* Hmm: I have to do a bfreeregister on r before any flush_arg_usedregs() */
 /* This is not dangerous as flow analysis will regard r as alive up to    */
@@ -1244,31 +1518,33 @@ static void cg_fnargs_stack(ArgInfo arg[], int32 regargs, int32 n)
                     bfreeregister(r);
                 }
 #ifdef TARGET_HAS_RISING_STACK
-                structsize = 0;
+                structsize = start;
                 while (structsize != (rep & MCR_SIZE_MASK))
 #else
-                while (structsize != 0)
+                while (structsize != start)
 #endif
                 {   VRegnum argr;
-                    if (nusedregs == NARGREGS1)
+                    if (nusedregs == nargregs1)
                         flush_arg_usedregs(arg[narg].addr + structsize);
 #ifdef TARGET_HAS_RISING_STACK
                     argr = R_A1 + nusedregs;
 #else
                     argr = MEMCPYREG==DBLREG ? R_FA1
-                                             : R_A1 + NARGREGS1-1 - nusedregs;
+                                             : R_A1 + nargregs1-1 - nusedregs;
                     structsize -= MEMCPYQUANTUM;
 #endif
-                    if (b) emitvk(J_memcpy(J_LDRVK|J_ALIGN4), argr, structsize, b);
-                    else emit(J_memcpy(J_LDRK|J_ALIGN4), argr, r, structsize);
+                    if (b != NULL)
+                        emitvk(J_memcpy(J_LDRVK|J_ALIGN4), argr, structsize, b);
+                    else
+                        emit(J_memcpy(J_LDRK|J_ALIGN4), argr, r, structsize);
 #ifdef TARGET_HAS_RISING_STACK
                     structsize += MEMCPYQUANTUM;
 #endif
                     if (MEMCPYREG==DBLREG)
-                        flush_fparg(argr, 0x02000008,
+                        flush_fparg(argr, MCR_SORT_FLOATING+sizeof_double,
                                     arg[narg].addr+structsize);
                     else
-                        usedregs = mkRegList(usedregs, argr), nusedregs++;
+                        AddUsedReg(argr);
                 }
 /* The bfreeregister(r) above notionally belongs here.                   */
             }
@@ -1277,12 +1553,8 @@ static void cg_fnargs_stack(ArgInfo arg[], int32 regargs, int32 n)
 /* The general case of an argument that can involve a function call      */
 /* returning a structure is dealt with here... (Oct 92: fn can't happen) */
             {
-#ifdef TARGET_HAS_RISING_STACK
-              flush_arg_usedregs(arg[narg-1].addr);
-#else
-              flush_arg_usedregs(arg[narg+1].addr);
-#endif
-              { TypeExpr *t = typeofexpr(arg[narg].expr);
+              FlushPrevArgRegs(arg, narg);
+              { TypeExpr *t;
 #ifdef NEVER
 /* The following preferable code is beaten by cg_fnargs.                */
 /*  (in the case when a struct spans the reg/memory boundary.).         */
@@ -1292,33 +1564,46 @@ static void cg_fnargs_stack(ArgInfo arg[], int32 regargs, int32 n)
 /* usual position for the actual parameter.                             */
                 cg_bindlist(mkSynBindList(0, gen), 0);
 #else /* ALWAYS */
-                Binder *gen = gentempvar(t, GAP);
+/* We add a number of integer binders to the stack, whose total size is */
+/* the same as that of the argument object. But we assign to a          */
+/* temporary binder of the correct type (not added to the stack). The   */
+/* address of this binder is made correct by forging its bindbl_()      */
+/* field to be the same as if it had been added to the stack rather     */
+/* than the integers. b_unbound in bindstg_() is used to mark precisely */
+/* this disgusting situation, so that later dataflow analysis has some  */
+/* chance.                                                              */
+                Binder *gen;
                 BindList *nb = active_binders;
-                int32 i = padsize(structsize, alignof_toplevel_auto);
-                current_stackdepth += i;
-                for (; i != 0; i -= alignof_toplevel_auto)
+                int32 i, size = padsize(structsize-start, alignof_toplevel_auto);
+                current_stackdepth += size;
+                for (i = size; i != 0; i -= alignof_toplevel_auto)
                     nb = mkBindList(nb, integer_binder);
+                t = (start == 0) ? typeofexpr(arg[narg].expr)
+                                 : mk_typeexpr1(t_subscript, te_char,
+                                                mkintconst(te_int, size, 0));
+                gen = gentempvar(t, GAP);
                 if (target_stack_moves_once) {
-                    bindstg_(gen) |= b_spilt;
+                    bindstg_(gen) |= b_spilt|b_unbound;
 /* BEWARE: the next line is in flux (Nov89) and is only OK because      */
 /* 'gen' never gets to be part of 'active_binders'.                     */
-                    bindaddr_(gen) = arg[narg].addr | BINDADDR_NEWARG;
+                    bindaddr_(gen) = (arg[narg].addr + start) | BINDADDR_NEWARG;
                 } else {
-                    bindstg_(gen) |= b_spilt|b_bindaddrlist;
-#ifdef TARGET_IS_SPARC
-/* The following line is an extra hack to make the structure_assign()   */
-/* code work on the SPARC (there is an implicit aligning INT hole       */
-/* at the end of an arg list).  Re-work this code.                      */
-                    bindbl_(gen) = mkBindList(nb, integer_binder);
-#else
+                    bindstg_(gen) |= b_spilt|b_bindaddrlist|b_unbound;
                     bindbl_(gen) = nb;
-#endif
                 }
                 emitsetsp(J_SETSPENV, nb);
-/* I hope that fools things into believing that the stack is in the      */
-/* state that I have just put it in.                                     */
 #endif
-                structure_assign((Expr *)gen, arg[narg].expr, structsize);
+                if (start == 0)
+                    structure_assign((Expr *)gen, arg[narg].expr, structsize);
+                else
+                {   Expr *e = mk_expr2(s_plus, ptrtotype_(te_int),
+                                               take_address(arg[narg].expr),
+                                               mkintconst(te_int, start, 0));
+                    e = mk_expr2(s_fnap, te_void, sim.memcpyfn,
+                            mkArgList3(take_address((Expr *)gen), e,
+                                       mkintconst(te_int,size,0)));
+                    cg_exprvoid(e);
+                }
                 if (usedregs != 0) syserr(syserr_fnarg_struct);
               }
             }
@@ -1345,6 +1630,13 @@ static void cg_fnargs_stack(ArgInfo arg[], int32 regargs, int32 n)
  * calculated the function address (in the case of a fn pointer) as calculating
  * this address may in itself use R_IP
  */
+/* HCM: On reflection, it appears always to be at least no worse to    */
+/* evaluate all arguments to virtual registers, then to move them to   */
+/* the correct argument registers (rather than having a number of      */
+/* (evaluate to virtual register; move to argument register) pairs.    */
+#define ArgDeferred(r, fn) ((r) < R_FA1)
+
+#if 0
 #ifdef TARGET_IS_ARM_OR_THUMB
 /* this really means "TARGET_IMPLEMENTS_UnalignedLoadMayUse" */
 #  define ArgDeferred(r, fn) \
@@ -1353,18 +1645,33 @@ static void cg_fnargs_stack(ArgInfo arg[], int32 regargs, int32 n)
 #else
 #    define ArgDeferred(r, fn) 0
 #endif
+#endif
+
+/* Structure representing the value of a register argument which has   */
+/* not been fully evaluated by cg_fnargs_regs(): either it has been    */
+/* evaluated into a virtual register, not into the physical argument   */
+/* register (r != GAP), or it has not been evaluated at all (e != NULL)*/
+/* : constants only!.                                                  */
+/* Only one of r and e may be set, of course.                          */
+typedef struct {
+  VRegnum r;
+  Expr *e;
+} DeferredArg;
 
 typedef struct {
   int32 resultregs;
   VRegnum specialarg;
   Expr *fn;
-  /* out ... */
+  uint32 resultrep;
+  uint16 auxflags;
+  /* out ... (of cg_fnargs) */
   VRegnum fnreg;
-  VRegnum deferred[NARGREGS];
+  SynBindList *fnsave;
+  DeferredArg deferred[NINTREGS-R_A1];
 } FnargStruct;
 
 static void cg_fnargs_regs(ArgInfo arg[], int32 intregargs, int32 fltregargs,
-                           FnargStruct *argstruct)
+                           FnargStruct *argstruct, int splitarg)
 /* Finally do the first NARGREGS (or less) 'int' args to registers:    */
 /* Do the hardest first to avoid moving easier things around.          */
 /* Also, save and restore explicitly all function results except the   */
@@ -1385,9 +1692,10 @@ static void cg_fnargs_regs(ArgInfo arg[], int32 intregargs, int32 fltregargs,
     int hardness;
     int32 firsthard = -1;
     {   int32 i;
-        for (i = NARGREGS; --i >= 0;)
-            argstruct->deferred[i] = GAP;
-
+        for (i = NARGREGS; --i >= 0;) {
+            argstruct->deferred[i].r = GAP;
+            argstruct->deferred[i].e = NULL;
+        }
         for (i = regargs; --i >= 0; )
         {   if (arg[i].info == ISHARD) firsthard = i;
             argsaves[i] = (SynBindList *) DUFF_ADDR, argregs[i] = GAP;
@@ -1395,15 +1703,13 @@ static void cg_fnargs_regs(ArgInfo arg[], int32 intregargs, int32 fltregargs,
     }
     for (hardness = ISHARD; hardness >= ISCONST; hardness--)
     {   int32 i;
-/* There are currently not any FLTREG args, only double...              */
 #ifdef TARGET_FP_ARGS_IN_FP_REGS
-#define callregsort(n, f) ((n)<(f) ? DBLREG : INTREG)
+#define callregsort(n, f) \
+  ((n)<(f) ? ((arg[n].rep & MCR_SIZE_MASK)==sizeof_float ? FLTREG : DBLREG)\
+           : INTREG)
 #define callreg(n, f) ((n)<(f) ? R_FA1+(n) : \
                         argstruct->specialarg != GAP && (n)==(f) ? argstruct->specialarg : \
                         R_A1+arg[n].regoff)
-#elif defined(TARGET_FP_ARGS_CALLSTD2)
-#define callregsort(n, f) ((arg[n].rep>>MCR_SORT_SHIFT)==2 ? DBLREG : INTREG)
-#define callreg(n, f) ((arg[n].rep>>MCR_SORT_SHIFT)==2 ? R_FA1+(n) : R_A1+(n))
 #else
 #define callregsort(n, f) INTREG
 #define callreg(n, f) (R_A1+arg[n].regoff)
@@ -1412,36 +1718,52 @@ static void cg_fnargs_regs(ArgInfo arg[], int32 intregargs, int32 fltregargs,
             if (arg[i].info == hardness)
             {   Expr *a = arg[i].expr;
                 int32 repsort = arg[i].rep & MCR_SORT_MASK;
+                if (hardness == ISHARD && i != firsthard
+                    && argstruct->fnreg != GAP && argstruct->fnsave == NULL)
+                {   SynBindList *b = bindlist_for_temps(usedregs, usedfpregs);
+                    /* b should have at most 1 elt */
+                    cg_bindlist(b, 1);
+                    if (b->bindlistcdr != NULL)
+                        syserr(syserr_cg_fnarg1);
+                    emitbinder(J_STRV|J_ALIGN4V, argstruct->fnreg, b->bindlistcar);
+                    usedregs = 0; nusedregs = 0;
+                    usedfpregs = 0; nusedfpregs = 0;
+                    argstruct->fnsave = b;
+                }
                 if (hardness == ISCONST) {
                     VRegnum argr = callreg(i, fltregargs);
                     if (ArgDeferred(argr, argstruct->fn))
-                      argstruct->deferred[argr - R_A1] = cg_expr(a);
+                      argstruct->deferred[argr - R_A1].e = a;
                     else
                       (void)cg_exprreg(a, argr);
                 }
-                else if (repsort == MCR_SORT_STRUCT &&
-                         alignoftype(typeofexpr(a)) >= MEMCPYQUANTUM) {
-                    Expr *fnap = a;
-                    if (h0_(a) != s_fnap &&
-                        (h0_(a) != s_let || h0_(fnap = arg2_(a)) != s_fnap))
+                else if (i == splitarg
+                         || (repsort == MCR_SORT_STRUCT
+                             && (alignoftype(typeofexpr(a)) >= MEMCPYQUANTUM
+                                 || expr_alignment(a) >= MEMCPYQUANTUM)))
+                {   if (h0_(a) != s_fnap && h0_(a) != s_let)
                         argregs[i] = cg_expr(take_address(a));
                     else {
                         TypeExpr *t = typeofexpr(a);
                         Binder *gen = gentempbinder(t);
-                        if (!returnsstructinregs(arg1_(fnap)))
+                        Expr *fnap = NULL;
+                        if (h0_(a) == s_fnap)
+                          fnap = a;
+                        else if (h0_(arg2_(a)) == s_fnap)
+                          fnap = arg2_(a);
+                        if (fnap == NULL || !returnsstructinregs(arg1_(fnap)))
                             bindstg_(gen) |= b_spilt;
 /* Forge an address-taken struct variable to fit on the stack in the    */
 /* usual position for the actual parameter.                             */
                         cg_bindlist(mkSynBindList(0, gen), 0);
-                        a = mk_expr2(s_assign, t, (Expr*)gen, a);
-                        t = ptrtotype_(t);
-                        argregs[i] = cg_expr(
-                             mk_expr2(s_comma, t, a,
-                                      mk_expr1(s_addrof, t, (Expr*)gen)));
+                        cg_exprvoid(mk_expr2(s_assign, t, (Expr*)gen, a));
+                        arg[i].expr = (Expr *)gen;
+                        arg[i].info = ISBIND;
                     }
                 }
                 else /* (we'll get a syserr for structs) */
                     argregs[i] = cg_expr(a);
+
                 if (hardness == ISHARD)
                 {   SynBindList *b = i == firsthard ? 0 : /* first is easy */
                                   bindlist_for_temps(usedregs, usedfpregs);
@@ -1450,6 +1772,7 @@ static void cg_fnargs_regs(ArgInfo arg[], int32 intregargs, int32 fltregargs,
                     if (b != 0)
                     {   J_OPCODE j_saveop =
                               (repsort == MCR_SORT_STRUCT) ? J_STRV|J_ALIGN4V :
+                   (callregsort(i, fltregargs) == FLTREG)  ? J_STRFV|J_ALIGN4V :
                    (callregsort(i, fltregargs) == DBLREG ||
                              repsort == MCR_SORT_FLOATING) ? J_STRDV|J_ALIGN8 :
                                                              J_STRV|J_ALIGN4V;
@@ -1467,14 +1790,24 @@ static void cg_fnargs_regs(ArgInfo arg[], int32 intregargs, int32 fltregargs,
         for (i = 0; i < regargs; i++)
         {   SynBindList *b;
             bool done = arg[i].info == ISCONST; /* we did these above.  */
-            int32 repsort = arg[i].rep >> MCR_SORT_SHIFT;
-            VRegnum argr = callreg(i, fltregargs);
-            if (!done && ArgDeferred(argr, argstruct->fn))
-              argr = argstruct->deferred[argr - R_A1] = vregister(INTREG);
+            int32 repsort = arg[i].rep & MCR_SORT_MASK;
+            VRegnum realargr = callreg(i, fltregargs);
+            VRegnum argr = realargr;
+            if (!done && ArgDeferred(argr, argstruct->fn)) {
+                VRegnum ar = argregs[i];
+                if (isany_realreg_(ar) || ar == GAP || vregsort(ar) != INTREG)
+                    ar = vregister(INTREG);
+                argr = argstruct->deferred[argr - R_A1].r = ar;
+            }
+            if (repsort == MCR_SORT_STRUCT) {
+                int32 j, limit = arg[i].nreg;
+                for (j = 0; j<limit; j++)
+                    if (ArgDeferred(realargr+j, argstruct->fn))
+                        argstruct->deferred[realargr + j - R_A1].r = vregister(INTREG);
+            }
 /* @@@ This can be usedfpregs?    Yes, fix!!!                           */
 /* Unclear the nusedregs/fregs do anything at all here.                 */
-            usedregs = mkRegList(usedregs, argr);
-            nusedregs++;
+            AddUsedReg(argr);
             if (arg[i].info == ISHARD && (b = argsaves[i]) != 0)
             {   if (b->bindlistcdr != NULL)
                     syserr(syserr_cg_fnarg1);
@@ -1482,12 +1815,15 @@ static void cg_fnargs_regs(ArgInfo arg[], int32 intregargs, int32 fltregargs,
 /* try to reload from spill directly to arg regs: OK for int->intreg    */
 /* dble->dblereg, but dble/struct->intreg needs careful code...         */
 /* The order of tests below follows that in the (!done) case.           */
-                if (repsort == 3)
+                if (repsort == MCR_SORT_STRUCT)
                     emitbinder(J_LDRV|J_ALIGN4V, argregs[i], b->bindlistcar);
+                else if (callregsort(i, fltregargs) == FLTREG)
+                    emitbinder(J_LDRFV|J_ALIGN4V, argr, b->bindlistcar),
+                    done = 1;
                 else if (callregsort(i, fltregargs) == DBLREG)
                     emitbinder(J_LDRDV|J_ALIGN8, argr, b->bindlistcar),
                     done = 1;
-                else if (repsort == 2)
+                else if (repsort == MCR_SORT_FLOATING)
                     emitbinder(J_LDRDV|J_ALIGN8, argregs[i], b->bindlistcar);
                 else
                 {   emitbinder(J_LDRV|J_ALIGN4V, argr, b->bindlistcar);
@@ -1495,10 +1831,14 @@ static void cg_fnargs_regs(ArgInfo arg[], int32 intregargs, int32 fltregargs,
                 }
                 (void)freeSynBindList(b);
             }
-            if (!done)
-            {   VRegnum r = argregs[i];
-                if (repsort == 3)       /* [am] */
-                {   int32 j, limit = ((arg[i].rep & MCR_SIZE_MASK) + 3)/4;
+            if (!done && argregs[i] != GAP
+                && (argregs[i] != argr || repsort > MCR_SORT_UNSIGNED))
+            {   /* argregs[i] will be GAP when the actual argument is  */
+                /* a call to an inlined function returning a structure */
+                /* result in registers                                 */
+                VRegnum r = argregs[i];
+                if (repsort == MCR_SORT_STRUCT || i == splitarg)
+                {   int32 j, limit = arg[i].nreg;
 /* The usedregs/nusedregs code needs a better interface!               */
                     int32 load = isunaligned_type(typeofexpr(arg[i].expr)) ?
                                    J_LDRK|J_ALIGN1 :
@@ -1506,72 +1846,72 @@ static void cg_fnargs_regs(ArgInfo arg[], int32 intregargs, int32 fltregargs,
                     usedregs = usedregs->rlcdr; nusedregs--;
                     for (j = 0; j<limit; j++)
                     {
-                        if (ArgDeferred(argr + j, argstruct->fn)) {
-                            VRegnum lastreg = argstruct->deferred[argr + j - R_A1];
-                            if (lastreg == GAP)
-                              lastreg = argstruct->deferred[argr + j - R_A1] = vregister(INTREG);
-                            usedregs = mkRegList(usedregs, lastreg);
-                            emit(load, lastreg, r, 4*j);
-                        } else {
-                            usedregs = mkRegList(usedregs, argr + j);
-                            emit(load, argr + j, r, 4*j);
-                        }
-                        nusedregs++;
+                        VRegnum thisr = realargr + j;
+                        if (ArgDeferred(thisr, argstruct->fn))
+                            thisr = argstruct->deferred[thisr - R_A1].r;
+                        AddUsedReg(thisr);
+                        emit(load, thisr, r, 4*j);
                     }
                 }
-#ifdef TARGET_FP_ARGS_CALLSTD2
-                else if (repsort == 2)
-                    emitreg(J_MOVDR, argr, GAP, r);
-#else
+                else if (callregsort(i, fltregargs) == FLTREG)
+                    emitreg(J_MOVFR, argr, GAP, r);
                 else if (callregsort(i, fltregargs) == DBLREG)
                     emitreg(J_MOVDR, argr, GAP, r);
 #ifdef TARGET_SHARES_INTEGER_AND_FP_REGISTERS
-                else if (repsort == 2)   /* [am] */
+                else if (repsort == MCR_SORT_FLOATING)   /* [am] */
                     emitreg(vregsort(r) == DBLREG ? J_MOVDR : J_MOVFR,
                             argr, GAP, r);
 #else
-                else if (repsort == 2)   /* [am] */
-                {   usedregs = mkRegList(usedregs, argr+1);
-                    nusedregs++;
-                    emitreg(J_MOVDIR, argr, argr+1, r);
+                else if (arg[i].rep == MCR_SORT_FLOATING + sizeof_float)
+                    emitreg(J_MOVFIR, argr, GAP, r);
+                else if (repsort == MCR_SORT_FLOATING)   /* [am] */
+                {   VRegnum argr2 = realargr+1;
+                    /* We can't defer the loads of the real argunent    */
+                    /* registers here (for ARM), because the expansion  */
+                    /* of MOVDIR requires r2 > r1, and we have no way   */
+                    /* to constrain the result of register allocation.  */
+                    argstruct->deferred[realargr - R_A1].r = GAP;
+                    argstruct->deferred[argr2 - R_A1].r = GAP;
+                    AddUsedReg(argr2);
+                    emitreg(J_MOVDIR, realargr, argr2, r);
                 }
-#endif
 #endif
                 else
                     emitreg(J_MOVR, argr, GAP, r);
                 bfreeregister(r);
             }
         }
+        if (argstruct->fnsave != NULL) {
+            argstruct->fnreg = fgetregister(ADDRREG);
+            emitbinder(J_LDRV|J_ALIGN4V, argstruct->fnreg, argstruct->fnsave->bindlistcar);
+        }
         emitsetsp(J_SETSPENV, save_binders);
         current_stackdepth = d;
     }
 }
 
-#ifdef TARGET_IS_ADENART
-/* some type of proc. calling std TARGET_FP_ARGS_CALLSTD */
-#  define intregable(rep, t) (((rep) >> MCR_SORT_SHIFT) < 2)
-#else
-#  define intregable(rep, t) \
-     (alignof_struct >= alignof_int || \
-     ((rep) & MCR_SORT_MASK) != MCR_SORT_STRUCT || \
-     alignoftype(t) >= alignof_int)
-#endif
+#define intregable(rep, e) \
+     (((rep) & MCR_SORT_MASK) != MCR_SORT_STRUCT \
+      || alignoftype(typeofexpr(e)) >= alignof_int \
+      || expr_alignment(e) >= alignof_int)
 
 static int32 cg_fnargs(ExprList *a, ArgInfo arg[], int32 n,
-                       FnargStruct *argstruct, int32 fnflags)
+                       FnargStruct *argstruct)
 /* specialarg is non-GAP if there is an implicit extra (first,integer)  */
 /* arg (e.g. for swi_indirect or 88000 struct return value pointer).    */
 {
     int32 intargwords, intregargs = 0, intregwords = 0, fltregargs = 0;
-    unsigned32 argfpmask = 0;
+    int32 splitarg = -1;
 #ifdef TARGET_HAS_RISING_STACK
     Binder *arg0;
 #endif
     {   int32 argoff = 0, narg = 0;
+        SynBindList *newtemps = NULL;
+        Expr *tempinits = NULL;
 #ifdef TARGET_FP_ARGS_IN_FP_REGS
         if ((config & CONFIG_FPREGARGS) &&
-            !(fnflags & f_nofpregargs))
-        {   ExprList *p, *q = 0;
+            !(argstruct->auxflags & f_nofpregargs))
+        {   ExprList *p, *q = NULL;
 /* Reorder the argument list, by destructively extracting the first     */
 /* up to NFLTARGREGS float args, and then dropping through to handle    */
 /* int args.  This code needs better TARGET parameterisation.           */
@@ -1580,19 +1920,16 @@ static int32 cg_fnargs(ExprList *a, ArgInfo arg[], int32 n,
             for (p = a; p != NULL; p = cdr_(p))
             {   Expr *ae = exprcar_(p);
                 int32 repsort = mcrepofexpr(ae) >> MCR_SORT_SHIFT;
-                if (repsort == 2 && narg < NFLTARGREGS
-#ifdef TARGET_IS_MIPS           /* only LEADING flt args in flt regs.   */
-                                 && q == NULL
-#endif
-                   )
+                if (repsort == 2 && narg < NFLTARGREGS)
                 {   arg[narg++].expr = ae;
-#ifdef TARGET_IS_MIPS
-                    intregwords += 2;   /* i.e. two int junk regs       */
-#endif
                     fltregargs++;
-                    if (q == 0) a = cdr_(p); else cdr_(q) = cdr_(p);
+                    if (q == NULL)
+                        a = cdr_(p);
+                    else
+                        cdr_(q) = cdr_(p);
                 }
-                else q = p;
+                else
+                    q = p;
             }
         }
 #endif
@@ -1612,14 +1949,51 @@ static int32 cg_fnargs(ExprList *a, ArgInfo arg[], int32 n,
 #else
             int32 rbase = intregwords;
 #endif
-            int32 rlimit = rbase + padsize((rep & MCR_SIZE_MASK),
-                                      alignof_toplevel_auto)/alignof_toplevel_auto;
+            int32 nreg = padsize((rep & MCR_SIZE_MASK), alignof_toplevel_auto)
+                         / alignof_toplevel_auto;
+            int32 rlimit = rbase + nreg;
             arg[narg].expr = ae;
-            if (rlimit <= NARGREGS && intregable(rep, typeofexpr(ae)))
-                intregargs++, intregwords = rlimit, arg[narg].regoff = rbase;
-            else break;
+            arg[narg].nreg = (uint8)nreg;
+            if (rbase < NARGREGS)
+            {   /* Some of the argument can be passed in registers       */
+                bool loadable = intregable(rep, ae);
+                if (rlimit > NARGREGS || !loadable)
+                {   Binder *gen;
+                    Expr *thisinit;
+                    if (!target_stack_moves_once)
+                        break;
+                    /* if !loadable, ae is a struct with alignment <     */
+                    /* alignof_int. Any object on the stack has          */
+                    /* alignment >= alignof_int Thus, copying to a temp  */
+                    /* is sufficient to allow this argument to be        */
+                    /* directly loaded into argument registers.          */
+                    /* If loadable, the argument is wider than an intreg */
+                    /* and is to be passed partly in registers and partly*/
+                    /* on the stack.                                     */
+                    if (!loadable
+                        || (h0_(ae) != s_binder
+                            && nastiness(ae) != ISXCONST))
+                    {
+                        gen = gentempbinder(typeofexpr(ae));
+                        newtemps = mkSynBindList(newtemps, gen);
+                        thisinit = mk_expr2(s_assign, bindtype_(gen), (Expr *)gen, ae);
+                        if (tempinits == NULL)
+                            tempinits = thisinit;
+                        else
+                            tempinits = mk_expr2(s_comma, te_void, thisinit, tempinits);
+                        arg[narg].expr = (Expr *)gen;
+                    }
+                    if (rlimit > NARGREGS)
+                    {   arg[narg].nreg = (uint8)(NARGREGS - rbase);
+                        splitarg = narg;
+                    }
+                }
+                intregargs++; intregwords = rlimit;
+                arg[narg].regoff = (uint8)rbase;
+            } else
+                break;
         }
-        arg[narg].regoff = intregwords;   /* useful sentinel below?     */
+        arg[narg].regoff = (uint8)intregwords;   /* useful sentinel below?     */
         for (; a != NULL; a = cdr_(a), narg++)
             arg[narg].expr = exprcar_(a);
         if (narg != n) syserr(syserr_cg_argcount);
@@ -1627,21 +2001,12 @@ static int32 cg_fnargs(ExprList *a, ArgInfo arg[], int32 n,
         for (narg = 0; narg < n; narg++)
         {   Expr *ae = arg[narg].expr;
             int32 rep = mcrepofexpr(ae);
-#ifdef TARGET_FP_ARGS_CALLSTD2
-            if ((rep & MCR_SORT_MASK) == MCR_SORT_FLOATING &&
-                    narg < (NARGREGS<32 ? NARGREGS : 32))
-                argfpmask |= (unsigned32)1 << narg;
-#else
-            IGNORE(argfpmask);
-#endif
-#if defined TARGET_IS_SPARC || defined TARGET_IS_ALPHA
-/* The (de facto, but poorly documented) SPARC calling standard         */
-/* requires double args to be stored on the stack (or in int regs) in   */
-/* a possibly unaligned manner by avoiding leaving gaps...              */
-            argoff = padtomcrep(argoff, rep & ~MCR_ALIGN_DOUBLE);
-#else
+            if (h0_(ae) == s_binder && bindconst_(exb_(ae)) != NULL)
+            {   if (LanguageIsCPlusPlus)
+                    syserr("bindconst $b got to cg.c", exb_(ae));
+                ae = arg[narg].expr = bindconst_(exb_(ae));
+            }
             argoff = padtomcrep(argoff, rep);
-#endif
             arg[narg].info = nastiness(ae);
             arg[narg].rep = rep;
             arg[narg].addr = argoff;
@@ -1649,6 +2014,11 @@ static int32 cg_fnargs(ExprList *a, ArgInfo arg[], int32 n,
             if (!(narg == fltregargs && argstruct->specialarg != GAP))
                 argoff += padsize(rep & MCR_SIZE_MASK, alignof_toplevel_auto);
         }
+        if (newtemps != NULL) {
+            cg_bindlist(newtemps, 0);
+            cg_exprvoid(tempinits);
+        }
+
 #if !defined(TARGET_HAS_RISING_STACK) && (alignof_double > alignof_toplevel_auto)
 /* The next line pads the offset of the last arg exactly in the case    */
 /* it will be handled by cg_fnargs_stack.  If all the args are int-like */
@@ -1695,38 +2065,27 @@ static int32 cg_fnargs(ExprList *a, ArgInfo arg[], int32 n,
           else
               bindaddr_(arg0) = (current_stackdepth + arg[0].addr) | BINDADDR_LOC;
         }
-        else nb = mkBindList(nb, integer_binder);
+        else
+            nb = mkBindList(nb, integer_binder);
       }
       emitsetsp(J_SETSPENV, nb);
     }
 #endif
-#ifdef TARGET_IS_88000
-/*
- * For the 88000 structure args must go on the stack in the place where they
- * would have been if ALL args were stacked.  To achieve this I pad the
- * stack before preparing args. Only needed if some struct args present.
- * Something like this needs to be done if TARGET_IS_SPARC for Sun's
- * proc. call std. as opposed to gnu's.
- */
-/* /* probably inadequate wrt fltargregs */
-    {   BindList *save_binders = active_binders;
-        int32 d = current_stackdepth;
-        int32 padcount = NARGREGS - intargwords;
-        if (n == intregargs) padcount = 0;
-        if (padcount > 0)
-        {   int32 j;
-            BindList *nb = active_binders;
-            for (j=0; j<padcount; j++)
-            {   nb = mkBindList(nb, integer_binder);
-                current_stackdepth += alignof_toplevel_auto;
-            }
-            emitsetsp(J_SETSPENV, nb);
-        }
+    cg_fnargs_stack(arg, intregargs+fltregargs, n, splitarg >= 0);
+    if (nastiness(argstruct->fn) == ISHARD)
+        argstruct->fnreg = cg_expr(argstruct->fn);
+#ifdef TARGET_IS_ARM_OR_THUMB
+/* this really means "TARGET_IMPLEMENTS_UnalignedLoadMayUse" */
+    else if (ContainsUnalignedSubExpr(argstruct->fn)) {
+        int i;
+        for (i = 0; i < intregwords; i++)
+          if (UnalignedLoadMayUse(R_A1+i)) {
+            argstruct->fnreg = cg_expr(argstruct->fn);
+            break;
+          }
+    }
 #endif
-
-    cg_fnargs_stack(arg, intregargs+fltregargs, n);
-    if (nastiness(argstruct->fn) == ISHARD) argstruct->fnreg = cg_expr(argstruct->fn);
-    cg_fnargs_regs(arg, intregargs, fltregargs, argstruct);
+    cg_fnargs_regs(arg, intregargs, fltregargs, argstruct, splitarg);
 
 #if (alignof_double > alignof_toplevel_auto)
 /* The next few lines deal with the trickiness of handling a call like  */
@@ -1757,16 +2116,14 @@ static int32 cg_fnargs(ExprList *a, ArgInfo arg[], int32 n,
 
 /* Now if some of the first few args were floating there are values on   */
 /* the stack that I want to have in registers. Ditto structure values.   */
-/* [am] this code is now dying, as POP is about to be removed...         */
 
     {   RegList *q = NULL;
         int32 i;
         BindList *nb = active_binders;
-#ifndef TARGET_IS_ADENART
         for (i=intregwords; i<intargwords && i<NARGREGS; i++) {
             VRegnum r = R_A1+i;
             if (ArgDeferred(r, argstruct->fn))
-              argstruct->deferred[i] = r = vregister(INTREG);
+              argstruct->deferred[i].r = r = vregister(INTREG);
 #ifdef TARGET_HAS_RISING_STACK
           if (intargwords > NARGREGS)
             emitvk(J_LDRVK|J_ALIGN4, r, 4*i, arg0);
@@ -1783,22 +2140,12 @@ static int32 cg_fnargs(ExprList *a, ArgInfo arg[], int32 n,
           if (nb == NULL) syserr(syserr_null_nb);
           nb = nb->bindlistcdr;
         }
-        if (q!=NULL)
+        if (q != NULL)
         {   int32 i = 0;
             Binder *b = gentempbinder(te_void);         /* @@@ hack     */
             bindstg_(b) |= b_spilt;
             cg_bindlist(mkSynBindList(0, b), 0);
-#ifdef TARGET_IS_SPARC
-/* The following line is an extra hack to make the re-load              */
-/* code work on the SPARC (there is an implicit aligning INT hole       */
-/* at the end of an arg list).  Re-work this code.                      */
-                bindbl_(b) = mkBindList(bindbl_(b), integer_binder);
-#endif
-#ifdef TARGET_IS_ALPHA
-#define J_LDRLVKxx (J_LDRLVK+J_UNSIGNED)        /* @@@ temp hack        */
-#else
 #define J_LDRLVKxx J_LDRLVK
-#endif
             for (q = (RegList *)dreverse((List *)q);
                     q != NULL; q = rl_discard(q))
             {   emitvk(alignof_toplevel_auto==8 ? J_LDRLVKxx|J_ALIGN8 :
@@ -1809,100 +2156,81 @@ static int32 cg_fnargs(ExprList *a, ArgInfo arg[], int32 n,
             emitsetsp(J_SETSPENV, nb);
             current_stackdepth -= i;
         }
-#endif /* !TARGET_IS_ADENART */
         /* Recreate the list of used registers to keep life safe */
         /* @@@ Redo soon? */
         while (usedregs) usedregs = rl_discard(usedregs);
         while (usedfpregs) usedfpregs = rl_discard(usedfpregs);
         nusedregs = nusedfpregs = 0;
 
-        if (argstruct->specialarg != GAP) usedregs = mkRegList(usedregs, argstruct->specialarg);
+        if (argstruct->specialarg != GAP)
+            usedregs = mkRegList(usedregs, argstruct->specialarg);
+
         for (i=0; i<intregwords; i++)
         {   VRegnum r = R_A1+i;
-            if (ArgDeferred(r, argstruct->fn) && argstruct->deferred[i] != GAP)
-              r = argstruct->deferred[i];
-            usedregs = mkRegList(usedregs, r);
-            nusedregs++;
+            if (ArgDeferred(r, argstruct->fn) && argstruct->deferred[i].r != GAP)
+              r = argstruct->deferred[i].r;
+            AddUsedReg(r);
         }
 #ifdef TARGET_FP_ARGS_IN_FP_REGS
         for (i=0; i<fltregargs; i++)
-        {   usedregs = mkRegList(usedregs, R_FA1+i);
+            AddUsedReg(R_FA1+i);
 /* @@@ AM: why on earth does this code not use 'usedfpregs?'.           */
 /* answer: only one call of cg_expr for odd machine before discarded.   */
-            nusedregs++;
-        }
 #endif
     }
-#ifdef TARGET_IS_88000
-        emitsetsp(J_SETSPENV, save_binders);
-        current_stackdepth = d;
-    }
-#endif
 /* Marker in argwords if a special register was used for a struct result */
     return k_argdesc_(arg[n].addr/alignof_toplevel_auto, argfpmask,
                       intregwords, fltregargs, argstruct->resultregs,
                       argstruct->specialarg != GAP ? K_SPECIAL_ARG : 0L);
 }
 
-#ifdef TARGET_IS_ADENART
-#include <string.h>
-                                /* Matsushita standard requires adetran_caller_
-                                 * or adetran_callee_ but we cannot see how it
-                                 * matters much, as once a function uses that
-                                 * argument passing mechanism it must be used
-                                 * internally in the C the same way.  Hence
-                                 * here we check all three formats! */
-#define FIRST_ADETRAN_ARG 0x101
-static bool isadetran(Symstr *sv)
-{   return (strncmp(symname_(sv), "adetran_caller_", 15) == 0 ||
-            strncmp(symname_(sv), "adetran_callee_", 15) == 0 ||
-            strncmp(symname_(sv), "adetran_", 8) == 0);
+static void LoadDeferredArgReg(FnargStruct const *argstruct, int32 i)
+{   VRegnum r = argstruct->deferred[i].r;
+    if (r != GAP) {
+        emitreg(J_MOVR, R_A1+i, GAP, r);
+        bfreeregister(r);
+    } else if (argstruct->deferred[i].e != NULL)
+        (void)cg_exprreg(argstruct->deferred[i].e, R_A1+i);
 }
-#endif
 
 static void LoadDeferredArgRegs(FnargStruct const *argstruct)
 {   int32 i = NARGREGS;
-    while (--i >= 0) {
-        VRegnum r = argstruct->deferred[i];
-        if (r != GAP) {
-            emitreg(J_MOVR, R_A1+i, GAP, r);
-            bfreeregister(r);
-        }
-    }
+    while (--i >= 0)
+        LoadDeferredArgReg(argstruct, i);
+
+    if (argstruct->specialarg != GAP)
+        LoadDeferredArgReg(argstruct, argstruct->specialarg-R_A1);
 }
 
 /* For functions of 10 args or less, C stack is used, not SynAlloc space: */
 #define STACKFNARGS 10  /* n.b. this is *not* a hard limit on no. of args */
 /* NB also that I need STACKFNARGS to be at least as large as the no of   */
 /* registers for passing args if I have an 88000 as target.               */
-static void cg_fnap_1(AEop op, Expr *fn, ExprList *a, VRegnum resreg)
+static void cg_fnap_1(AEop op, Expr *fn, TypeExpr *fnt,
+                      ExprList *a, VRegnum resreg, FnargStruct *argstruct)
 {
     int32 argdesc;
-    FnargStruct argstruct;
     VRegnum structresultp = GAP;
     Expr *structresult = NULL;
     Binder *structresultbinder = NULL;
     int32 resultwords = 0;
-    TypeExpr *t = princtype(typeofexpr(fn));
-    int32 fnflags;
-    argstruct.resultregs = 0;
+    uint16 fnflags;
+    argstruct->resultregs = 0;
 
-    if (!(h0_(t) == t_content &&
-           (h0_(t = princtype(typearg_(t))) == t_fnap ||
-             (h0_(t) == t_coloncolon &&         /* C++ ptr-to-mem fns */
-              h0_(t = princtype(typearg_(t))) == t_fnap))))
-    {   pr_expr(fn); cc_msg(" of type ");
-        pr_typeexpr(princtype(typeofexpr(fn)), 0);
-        syserr(syserr_cg_fnap);
-    }
-    fnflags = typefnaux_(t).flags;
+    argstruct->auxflags = fnflags = typefnaux_(fnt).flags;
+    argstruct->resultrep = mcrepoftype(typearg_(fnt));
 
     if ((op == s_fnapstruct || op == s_fnapstructvoid) &&
-        returnsstructinregs_t(t))
-    {   resultwords = sizeoftype(typearg_(t)) / MEMCPYQUANTUM;
+        returnsstructinregs_t(fnt))
+    {   resultwords = sizeoftype(typearg_(fnt)) / MEMCPYQUANTUM;
         structresult = exprcar_(a);
         a = cdr_(a);
-        argstruct.resultregs = resultwords;
+        /* The +resreg term below accounts for the built-in             */
+        /* divide+remainder functions, which are lyingly described as   */
+        /* returning a single result (because that's easier for the     */
+        /* front end to handle). resreg is always 0 for user-defined    */
+        /* functions.                                                   */
+        argstruct->resultregs = resultwords + resreg;
     }
 
     {   ArgInfo v[STACKFNARGS];
@@ -1910,7 +2238,7 @@ static void cg_fnap_1(AEop op, Expr *fn, ExprList *a, VRegnum resreg)
 /* The n+1 on the next line gives a sentinel to cg_fnargs.              */
         ArgInfo *p = (n+1) > STACKFNARGS ?
                        (ArgInfo *)SynAlloc((n+1)*sizeof(ArgInfo)) : v;
-        argstruct.specialarg =
+        argstruct->specialarg =
 #ifdef TARGET_SPECIAL_ARG_REG
                             (fnflags & f_specialargreg
 #  ifdef TARGET_STRUCT_RESULT_REGISTER
@@ -1920,8 +2248,8 @@ static void cg_fnap_1(AEop op, Expr *fn, ExprList *a, VRegnum resreg)
                              ) ? TARGET_SPECIAL_ARG_REG :
 #endif
                             GAP;
-        argstruct.fn = fn; argstruct.fnreg = GAP;
-        argdesc = cg_fnargs(a, p, n, &argstruct, fnflags);
+        argstruct->fn = fn; argstruct->fnreg = GAP; argstruct->fnsave = NULL;
+        argdesc = cg_fnargs(a, p, n, argstruct);
     }
 
 /* Now the arguments are all in the right places - call the function     */
@@ -1929,54 +2257,64 @@ static void cg_fnap_1(AEop op, Expr *fn, ExprList *a, VRegnum resreg)
     if (structresult != NULL && op != s_fnapstructvoid)
     {   if (h0_(structresult) == s_addrof &&
             h0_(arg1_(structresult)) == s_binder)
-            structresultbinder = (Binder *)arg1_(structresult);
+            structresultbinder = exb_(arg1_(structresult));
         else
             structresultp = cg_expr(structresult);
 /* /* this call to cg_expr() is wrong if specialarg or there may be a fn? */
 /* it should probably go via the specialreg-like interface?               */
     }
 
-#ifdef TARGET_FLAGS_VA_CALLS
-/* We only put the K_VACALL flag on if TARGET_FLAGS_VA_CALLS as it      */
-/* suppresses tail-recursion optimisation.                              */
-    if (fntypeisvariadic(t)) argdesc |= K_VACALL;
+    if (fntypeisvariadic(fnt)) argdesc |= K_VACALL;
+#if TARGET_SUPPRESS_VARIADIC_TAILCALL || TARGET_FLAGS_VA_CALLS
+    /* WD: TARGET_FLAGS_VA_CALLS obsolete now: original meaning was not to use
+       tailcalls on variadic function calls by 'faking' a normal function call.
+       TARGET_SUPPRESS_VARIADIC_TAILCALL now does exactly that - without cheating */
+    if (fntypeisvariadic(fnt)) argdesc |= K_NOTAILCALL;
 #endif
 
     {   Expr *temp;
+        if (vregsort(resreg) == DBLREG && (fnflags & f_resultinintregs))
+        {   /* returning fp result in integer registers (using hardfp) */
+            resreg = R_A1;
+            argdesc = k_setresultregs_(argdesc, (argstruct->resultrep & MCR_SIZE_MASK) >> 2);
+        }
         if (h0_(fn) == s_addrof && h0_(temp=arg1_(fn)) == s_binder)
-        {   TypeExpr *tt = princtype(bindtype_((Binder *)temp));
+        {   TypeExpr *tt = princtype(bindtype_(exb_(temp)));
 /* The next next few lines represent an enthusiastic sanity check.      */
 /* We want to check that the Binder fn-type, esp. its typefnaux_()      */
 /* (which includes details of inline/reg-use/side-effectness) matches   */
 /* that in the s_addrof node (which is used above for struct-return-    */
-/* reg-use etc).  Pointer equality (t==tt) used to work, but this is    */
+/* reg-use etc).  Pointer equality (fnt==tt) used to work, but this is  */
 /* thwarted by globalize_expr() for C++ static initialisation.          */
 /* Note also that simplify.c:optimise_cast(isfntype) conspires too.     */
-            LoadDeferredArgRegs(&argstruct);
-            if (t != tt)
+            LoadDeferredArgRegs(argstruct);
+            if (fnt != tt)
               /* this memcmp is dubious, but the 'holes' should match.  */
               if (h0_(tt) != t_fnap ||
-                  memcmp(&typefnaux_(t), &typefnaux_(tt),
-                         offsetof(TypeExprFnAux,usedregs)) != 0)
+                  memcmp(&typefnaux_(fnt), &typefnaux_(tt),
+                         sizeof(TypeExprFnAux)) != 0)
                 syserr(syserr_cg_fnap_1);
             if (fnflags & bitoffnaux_(s_pure)) argdesc |= K_PURE;
+            if (fnflags & bitoffnaux_(s_commutative)) argdesc |= K_COMMUTATIVE;
+            if (fnflags & f_resultinflags) argdesc |= K_RESULTINFLAGS;
 /* We could imagine code which emits several jopcodes here (saved in    */
-/* in-linable form in typefnaux_(t)) for in-line JOP expansion.         */
+/* in-linable form in typefnaux_(fnt)) for in-line JOP expansion.       */
             if (fnflags & bitoffnaux_(s_swi))
                 emitcall(J_OPSYSK, resreg, argdesc,
-                          (Binder *)(IPtr)(typefnaux_(t).inlinecode));
+                          (Binder *)(IPtr)(typefnaux_(fnt).inlinecode));
             else {
-                Inline_RealUse((Binder *)temp);
-                emitcall(J_CALLK, resreg, argdesc, (Binder *)temp);
+                emitcall(J_CALLK, resreg,
+                         argdesc | ((fnflags & f_notailcall) ? K_NOTAILCALL : 0),
+                         exb_(temp));
             }
         }
         else switch (mcrepofexpr(fn))
         {
         case 0x00000004: case 0x01000004:
         case 0x00000008: case 0x01000008:
-            {   VRegnum r = argstruct.fnreg;
+            {   VRegnum r = argstruct->fnreg;
                 if (r == GAP) r = cg_expr(fn);
-                LoadDeferredArgRegs(&argstruct);
+                LoadDeferredArgRegs(argstruct);
                 emitcallreg(J_CALLR, resreg, argdesc, r);
                 bfreeregister(r);
                 break;
@@ -1992,10 +2330,10 @@ static void cg_fnap_1(AEop op, Expr *fn, ExprList *a, VRegnum resreg)
             structresultp = cg_expr(structresult);
         for (i = 0; i < resultwords; i++) {
             if (structresultp != GAP)
-                emit(J_memcpy(J_STRK|J_ALIGN4), R_A1result+i,
+                emit(J_memcpy(J_STRK|J_ALIGN4), resreg+i,
                      structresultp, i * MEMCPYQUANTUM);
             else
-                emitvk(J_memcpy(J_STRVK|J_ALIGN4), R_A1result+i,
+                emitvk(J_memcpy(J_STRVK|J_ALIGN4), resreg+i,
                        i * MEMCPYQUANTUM, structresultbinder);
         }
         bfreeregister(structresultp);
@@ -2004,37 +2342,8 @@ static void cg_fnap_1(AEop op, Expr *fn, ExprList *a, VRegnum resreg)
 
 static VRegnum cg_fnap(Expr *x, VRegnum resreg, bool valneeded)
 {
-#ifdef TARGET_IS_ADENART
-  { ExprList *a = exprfnargs_(x);
-    Expr *fna = arg1_(x), *fn;
-/* A call to adetran has args in 0x101,0x102... with pointers           */
-/* encoded as WORD pointers.  Convert from C byte pointers.             */
-    if (a && h0_(fna) == s_addrof && h0_(fn = arg1_(fna)) == s_binder
-          && isadetran(bindsym_((Binder *)fn)))
-    {   /* At least one arg in a call to adetran_xxx(...).              */
-        /* We should really put ALL the args in temps before storing    */
-        /* them in low memory, but for now this is fine...              */
-        int32 n = FIRST_ADETRAN_ARG;
-        exprfnargs_(x) = 0;             /* modify the parse tree(!!)    */
-#define te_ullint primtype_(bitoftype_(s_int)|bitoftype_(s_unsigned)| \
-                            bitoftype_(s_long)|bitoftype_(s_short))
-        for (; a != NULL; a = a->cdr)
-        {   Expr *ae = exprcar_(a);
-            TypeExpr *at = typeofexpr(ae);
-            cg_exprvoid(
-              mkbinary(s_assign,
-                mkunary(s_content,
-                  mkintconst(ptrtotype_(at), 8*n++, 0)),
-                h0_(princtype(at)) == t_content ?
-                  mk_expr1(s_cast, at,
-                    mk_expr2(s_rightshift, te_ullint,   /* hack to unsigned */
-                             ae, mkintconst(te_int,3,0))) :
-                  ae));
-        }
-    }
-  }
-#endif
-
+  SynBindList *sm1temps = NULL;
+  Expr *sm1ass = NULL;
   if (target_stack_moves_once)
 /* If TARGET_STACK_MOVES_ONCE then we have to put all arglists in the   */
 /* same place.  To avoid overwriting in f(g(1,2),g(3,4)) we transform   */
@@ -2047,22 +2356,22 @@ static VRegnum cg_fnap(Expr *x, VRegnum resreg, bool valneeded)
 /* it being a structure returning function, and thus overlap occurring. */
 /* Note that this code destructively updates the aetree.                */
   { ExprList *a = exprfnargs_(x);
-    SynBindList *bl = 0;
     for (; a != NULL; a = cdr_(a))
       {   Expr *ae = exprcar_(a);
-          if (nastiness(ae) == ISHARD)
-          {   TypeExpr *t = typeofexpr(ae);
+          if (ae != NULL && nastiness(ae) == ISHARD)
+          {   /* ae == NULL for the return pointer for struct-in-regs   */
+              /* functions                                              */
+              TypeExpr *t = typeofexpr(ae);
               Binder *gen = gentempbinder(t);
+              Expr *ass = mk_expr2(s_assign, t, (Expr *)gen, ae);
               exprcar_(a) = (Expr *)gen;
-              bl = mkSynBindList(bl, gen);
-              x = mk_expr2(s_comma, type_(x),     /* === typeofexpr(x)    */
-                           mk_expr2(s_assign, t, (Expr *)gen, ae),
-                           x);
+              sm1temps = mkSynBindList(sm1temps, gen);
+              if (sm1ass == NULL)
+                  sm1ass = ass;
+              else
+                  sm1ass = mk_expr2(s_comma, te_void, ass, sm1ass);
           }
       }
-    if (bl)
-          /* We had fn call(s) inside fn args, so remove and retry.        */
-          return cg_expr2(mk_exprlet(s_let, type_(x), bl, x), valneeded);
   }
   {
 /* Compile a call to a function - being tidied!                          */
@@ -2073,6 +2382,9 @@ static VRegnum cg_fnap(Expr *x, VRegnum resreg, bool valneeded)
     BindList *save_binders = active_binders;
     int32 d = current_stackdepth;
     SynBindList *things_to_bind = bindlist_for_temps(regstosave, fpregstosave);
+    Expr *fn = arg1_(x);
+    TypeExpr *fnt = princtype(typeofexpr(fn));
+    FnargStruct argstruct;
 /* Calling a function must preserve all registers - here I push any that */
 /* are in use onto the stack.                                            */
     cg_bindlist(things_to_bind, 1);
@@ -2082,8 +2394,43 @@ static VRegnum cg_fnap(Expr *x, VRegnum resreg, bool valneeded)
     nusedregs = nusedfpregs = 0;        /* new 20-6-87 */
     usedregs = usedfpregs = NULL;
     spareregs = sparefpregs = 0;
-    cg_fnap_1(h0_(x), arg1_(x), exprfnargs_(x), resreg);
 
+    if (!((h0_(fnt) == t_content || h0_(fnt) == t_ref) &&
+           (h0_(fnt = princtype(typearg_(fnt))) == t_fnap ||
+             (h0_(fnt) == t_coloncolon &&         /* C++ ptr-to-mem fns */
+              h0_(fnt = princtype(typearg_(fnt))) == t_fnap))))
+    {   pr_expr(fn); cc_msg(" of type ");
+        pr_typeexpr(princtype(typeofexpr(fn)), 0);
+        syserr(syserr_cg_fnap);
+    }
+
+    if (sm1temps != NULL) {
+        cg_bindlist(sm1temps, 0);
+        cg_exprvoid(sm1ass);
+    }
+    cg_fnap_1(h0_(x), fn, fnt, exprfnargs_(x), resreg, &argstruct);
+
+    if (LanguageIsCPlusPlus)
+      { /* need to know if we are inside a try{} block, but note
+           that auto variables with destructors are also stored
+           on currentExceptionEnv. */
+        ExceptionEnv* exenv = currentExceptionEnv;
+        while (exenv!=NULL)
+          {
+            if (exenv->type == ex_handlerblock)
+              {
+                /* would be better to fiddle with the block flags so as to avoid having to fool the optimiser with bogus code*/
+                emit(J_CMPR , GAP, 0, 0);/*compare always true*/
+                emitbranch(J_B + Q_NE, exenv->handlers.henv.handlerblock);
+                start_new_basic_block(nextlabel());
+                break;
+              }
+            exenv=exenv->cdr;
+          }
+      }
+
+    if (rsort == DBLREG && (argstruct.resultrep & MCR_SIZE_MASK) == sizeof_float)
+        rsort = FLTREG;
 /* All registers are now free - work out what the args to the fn are      */
 /* Switch back to the outer context of registers.                        */
     while (usedregs) usedregs = rl_discard(usedregs);
@@ -2092,10 +2439,24 @@ static VRegnum cg_fnap(Expr *x, VRegnum resreg, bool valneeded)
     nusedregs = savebits,  nusedfpregs = savefpbits;
     spareregs = spint, sparefpregs = spfp;
     {   VRegnum resultr = GAP;
-        if (valneeded)
-        {   resultr = fgetregister(rsort);
-            emitreg(floatyop(rsort, J_MOVR, J_MOVFR, J_MOVDR),
-                    resultr, GAP, resreg);
+        if (valneeded) {
+            if (returnsstructinregs_t(fnt) && argstruct.resultregs > 1)
+                resultr = resreg;
+            else {
+                resultr = fgetregister(rsort);
+                if (rsort == FLTREG) {
+                    if (argstruct.auxflags & f_resultinintregs)
+                        emitreg(J_MOVIFR, resultr, GAP, R_A1);
+                    else
+                        emitreg(J_MOVFR, resultr, GAP, resreg);
+                } else if (rsort == DBLREG) {
+                    if (argstruct.auxflags & f_resultinintregs)
+                        emitreg(J_MOVIDR, resultr, R_A1, R_A1+1);
+                    else
+                        emitreg(J_MOVDR, resultr, GAP, resreg);
+                } else
+                    emitreg(J_MOVR, resultr, GAP, resreg);
+            }
         }
         stash_temps(regstosave, fpregstosave, things_to_bind,
                     J_LDRV|J_ALIGN4V, J_LDRFV|J_ALIGN4V, J_LDRDV|J_ALIGN8);
@@ -2108,6 +2469,27 @@ static VRegnum cg_fnap(Expr *x, VRegnum resreg, bool valneeded)
   }
 }
 
+static ExceptionEnv *mkExceptionEnv(ExceptionEnv* cdr, ex_enum type, void* destructee)
+{
+  ExceptionEnv* ExEnv =  (ExceptionEnv *) BindAlloc (sizeof (ExceptionEnv));
+  ExEnv->cdr = cdr;
+  ExEnv->type = type;
+  if (type==ex_destructor)
+    ExEnv->handlers.destructee = (Binder*) destructee;
+  else /*type==ex_handlerblock*/
+    ExEnv->handlers.henv.handlerblock = (LabelNumber*) destructee;
+  return ExEnv;
+}
+
+static HandlerList *mkHandlerList(HandlerList *cdr, int type, LabelNumber *handler)
+{
+  HandlerList *h = BindAlloc(sizeof(HandlerList));
+  h->cdr =  cdr;
+  h->type = type;
+  h->handler = handler;
+  return h;
+}
+
 /* jopcode generation for commands ...                                      */
 
 static void cg_cmd(Cmd *x)
@@ -2117,17 +2499,17 @@ static void cg_cmd(Cmd *x)
     while (x != 0)
     {
         cg_current_cmd = x;
-        if (x->fileline.f != 0)
+        if (cmdfileline_(x).f != 0)
         {   /* This (outer) 'if' block could be a proc as appears below too */
             if (!cg_infobodyflag)
             {
 #ifdef TARGET_HAS_PROFILE
-                if (profile_option) emitfl(J_COUNT, x->fileline);
+                if (profile_option) emitfl(J_COUNT, cmdfileline_(x));
 #endif
                 if (usrdbg(DBG_PROC)) emit(J_INFOBODY, GAP, GAP, 0);
                 cg_infobodyflag = 1;
             }
-            if (usrdbg(DBG_LINE)) emitfl(J_INFOLINE, x->fileline);
+            if (usrdbg(DBG_LINE)) emitfl(J_INFOLINE, cmdfileline_(x));
         }
         switch (op = h0_(x))
         {
@@ -2175,7 +2557,7 @@ case s_resultis:
 #endif
 
 case s_return:
-            cg_count(x->fileline);
+            cg_count(cmdfileline_(x));
             cg_return(cmd1e_(x), NO);
             break;
 
@@ -2194,7 +2576,7 @@ case s_if:  {   LabelNumber *l1 = nextlabel();
 /* This mess is because we can properly have a null consequence for a */
 /* condition, but then it does not have a count field to pass down to */
 /* cg_count!                                                          */
-                {   cg_count(cc->fileline);
+                {   cg_count(cmdfileline_(cc));
                     cg_cmd(cc);
                 }
                 if ((x = cmd3c_(x))==0) start_new_basic_block(l1);
@@ -2204,7 +2586,7 @@ case s_if:  {   LabelNumber *l1 = nextlabel();
                     start_new_basic_block(l1);
                     cg_cmd(x);
                     start_new_basic_block(l2);
-                    cg_count(x->fileline);
+                    cg_count(cmdfileline_(x));
                 }
             }
             break;
@@ -2212,7 +2594,7 @@ case s_if:  {   LabelNumber *l1 = nextlabel();
 case s_switch:
             if ((mcrepofexpr(cmd1e_(x)) >> MCR_SORT_SHIFT) > 1)
                 syserr(syserr_cg_switch);
-            cg_count(x->fileline);
+            cg_count(cmdfileline_(x));
             {   VRegnum r = cg_expr(cmd1e_(x));
                 struct SwitchInfo oswitchinfo;
                 int32 ncases = 0, i;
@@ -2246,6 +2628,61 @@ case s_switch:
                 switchinfo = oswitchinfo;
             }
             break;
+
+case s_try:
+        {
+          LabelNumber *l, *handler_exit_label, *handlerblock_label;
+          ExceptionEnv* ExEnv = currentExceptionEnv;/* remember ExceptionEnv*/
+          Handler* handler_list = (Handler*) cmd2e_ (x);
+          List* hl;
+          currentExceptionEnv = mkExceptionEnv(currentExceptionEnv, ex_handlerblock, 0);
+          hl = (List*) handler_list;
+          for(currentExceptionEnv->handlers.henv.handlercount=0;hl!=NULL;hl=hl->cdr)
+            {
+              currentExceptionEnv->handlers.henv.handlerlist =
+                mkHandlerList(currentExceptionEnv->handlers.henv.handlerlist,
+                              0, /*should be handler type*/
+                              nextlabel());
+              currentExceptionEnv->handlers.henv.handlercount++;
+            }
+          handlerblock_label = nextlabel();
+          currentExceptionEnv->handlers.henv.handlerblock = handlerblock_label;
+          cg_cmd(cmd1c_(x)); /* body of 'try' */
+          ExEnv = currentExceptionEnv;
+          currentExceptionEnv = currentExceptionEnv->cdr;
+          l = nextlabel();
+          emitbranch(J_B, l);
+          if (cmd3c_(x)!=NULL) /* cmd3c is handler_exit */
+            handler_exit_label = nextlabel();
+          else handler_exit_label = l;
+
+          {       /* set blk_table from HandlerEnv*/
+            int i = ExEnv->handlers.henv.handlercount;
+            LabelNumber** ll = BindAlloc (sizeof (LabelNumber*) * i);
+
+            start_new_basic_block(handlerblock_label);
+            emitcasebranch(J_TYPECASE, GAP, ll, i);
+            i = 0;
+            for (;handler_list!=NULL; handler_list=handler_list->handcdr)
+            /* if (h0_(handler_list->handbody) != s_throw) this is wrong; there is currently no easy way to distinguish a handler which just does throw;*/
+              { ll[i]=nextlabel();
+                start_new_basic_block(ll[i++]);
+                cg_cmd(handler_list->handbody);
+                emitbranch(J_B, handler_exit_label);
+              }
+          }
+         if (cmd3c_(x)!=NULL)
+           {
+             start_new_basic_block(handler_exit_label);
+             cg_cmd(cmd3c_(x));
+             emitbranch(J_B, l);
+           }
+         else if (debugging(DEBUG_CG))
+           printf("this try has no handler_exit block\n");
+
+         start_new_basic_block(l);
+        }
+        break;
 
 case s_catch:
             {   Handler *unused_handler = cmdhand_(x);
@@ -2308,7 +2745,7 @@ case s_colon:
                 if (ln == NULL) ln = labbinder->labinternlab = nextlabel();
                 start_new_basic_block(ln);
             }
-            cg_count(x->fileline);
+            cg_count(cmdfileline_(x));
             x = cmd2c_(x);
             continue;
 
@@ -2333,7 +2770,20 @@ case s_block:
                 int32 d = current_stackdepth;
                 CmdList *cl = cmdblk_cl_(x);
                 SynBindList *bl = cmdblk_bl_(x);
+                bool destructee = false;
                 cg_bindlist(bl, 0);
+
+                if (bl != NULL)
+                  {
+                  Binder* e =  bl->bindlistcar ;
+                  if (isclasstype_(princtype(typeofexpr((Expr*)e))))
+                    {
+                    destructee = true;
+                    currentExceptionEnv = mkExceptionEnv
+                      (currentExceptionEnv, ex_destructor, e);
+                    start_new_basic_block(nextlabel());
+                    }
+                  }
                 if (usrdbg(DBG_VAR))
                 {   current_env = (BindListList *)
                           binder_cons2(current_env, binderise(bl));
@@ -2346,13 +2796,22 @@ case s_block:
                     cg_cmd(cmdcar_(cl));
 
                 if (usrdbg(DBG_VAR))
-                {   current_env = current_env -> bllcdr;
+                {   current_env = current_env->bllcdr;
                     (void)start_new_basic_block(nextlabel());
                 }
+                if (destructee)
+                  {  currentExceptionEnv = currentExceptionEnv->cdr;
+                    (void)start_new_basic_block(nextlabel());
+                  }
                 emitsetsp(J_SETSPENV, sl);
                 current_stackdepth = d;
             }
             break;     /* from switch */
+#ifdef TARGET_HAS_INLINE_ASSEMBLER
+case s_asm:
+            cg_asm (x);
+            break;
+#endif
         }
         break;         /* from loop */
     }
@@ -2365,8 +2824,8 @@ static void cg_test1(Expr *x, bool branchtrue, LabelNumber *dest)
     int32 bc, bcl;
     if (x == 0) { syserr(syserr_missing_expr); return; }
     verify_integer(x);
-    if (usrdbg(DBG_LINE) && hasfileline_(h0_(x)) && x->fileline != 0)
-        emitfl(J_INFOLINE, *x->fileline);
+    if (usrdbg(DBG_LINE) && hasfileline_(h0_(x)) && exprfileline_(x) != 0)
+        emitfl(J_INFOLINE, *exprfileline_(x));
     if (integer_constant(x))
     {   if ((result2==0 && !branchtrue) ||
             (result2!=0 && branchtrue)) emitbranch(J_B, dest);
@@ -2374,8 +2833,39 @@ static void cg_test1(Expr *x, bool branchtrue, LabelNumber *dest)
     }
     else switch (h0_(x))
     {
+case s_let:
+        {   BindList *sl = active_binders;
+            int32 d = current_stackdepth;
+            LabelNumber *ltrue = nextlabel();
+            LabelNumber *lfalse = nextlabel();
+            cg_bindlist(exprletbind_(x), 0);
+            cg_test1(arg2_(x), !branchtrue, lfalse);
 
-default:    r = cg_expr(x);
+            {   int32 d1 = current_stackdepth;
+                BindList *sl1 = active_binders;
+                start_new_basic_block(ltrue);
+                emitsetsp(J_SETSPENV, sl);
+                current_stackdepth = d;
+                emitbranch(J_B, dest);
+
+                active_binders = sl1;
+                current_stackdepth = d1;
+                start_new_basic_block(lfalse);
+                emitsetsp(J_SETSPENV, sl);
+                current_stackdepth = d;
+                return;
+            }
+        }
+
+default:    if (resultinflags_fn(x))
+            {
+                uint32 cond = typefnauxflags_(princtype(typearg_(princtype(typeofexpr(arg1_(x)))))) & Q_MASK;
+                r = cg_fnap(x, V_resultreg(INTREG), NO);
+                bfreeregister(r);
+                emitbranch(J_B + (branchtrue ? cond : Q_NEGATE(cond)), dest);
+                return;
+            }
+            r = cg_expr(x);
             emit(J_CMPK+ (branchtrue ? Q_NE : Q_EQ), GAP, r, 0);
             bfreeregister(r);
             emitbranch(J_B+ (branchtrue ? Q_NE : Q_EQ), dest);
@@ -2389,14 +2879,14 @@ case s_andand:
             if (branchtrue)
             {   LabelNumber *l = nextlabel();
                 cg_test1(arg1_(x), 0, l);
-                cg_count(cg_current_cmd->fileline);
+                cg_count(cmdfileline_(cg_current_cmd));
                 cg_test1(arg2_(x), 1, dest);
                 start_new_basic_block(l);
                 return;
             }
             else
             {   cg_test1(arg1_(x), 0, dest);
-                cg_count(cg_current_cmd->fileline);
+                cg_count(cmdfileline_(cg_current_cmd));
                 cg_test1(arg2_(x), 0, dest);
                 return;
             }
@@ -2405,14 +2895,14 @@ case s_oror:
             if (!branchtrue)
             {   LabelNumber *l = nextlabel();
                 cg_test1(arg1_(x), 1, l);
-                cg_count(cg_current_cmd->fileline);
+                cg_count(cmdfileline_(cg_current_cmd));
                 cg_test1(arg2_(x), 0, dest);
                 start_new_basic_block(l);
                 return;
             }
             else
             {   cg_test1(arg1_(x), 1, dest);
-                cg_count(cg_current_cmd->fileline);
+                cg_count(cmdfileline_(cg_current_cmd));
                 cg_test1(arg2_(x), 1, dest);
                 return;
             }
@@ -2460,20 +2950,28 @@ case s_lessequal:
             break;
 
     }
-    {   int32 rep = mcrepofexpr(arg1_(x));
+    {
+        Expr *e1 = arg1_(x), *e2 = arg2_(x);
+        int32 rep;
+
+        if (resultinflags_fn(e1))
+            e1 = mk_expr3(s_cond, te_int, e1, mkintconst(te_int, 1, 0), mkintconst(te_int, 0, 0));
+        if (resultinflags_fn(e2))
+            e2 = mk_expr3(s_cond, te_int, e2, mkintconst(te_int, 1, 0), mkintconst(te_int, 0, 0));
+        rep = mcrepofexpr(e1);
         if (rep == MCR_SORT_FLOATING+8 ||
             rep == MCR_SORT_FLOATING+8+MCR_ALIGN_DOUBLE)
-            cg_condjump(J_CMPDR, arg1_(x), arg2_(x), DBLREG,
+            cg_condjump(J_CMPDR, e1, e2, DBLREG,
                         (branchtrue ? Q_NEGATE(bc) : bc), dest);
         else if (rep == MCR_SORT_FLOATING+4)
-            cg_condjump(J_CMPFR, arg1_(x), arg2_(x), FLTREG,
+            cg_condjump(J_CMPFR, e1, e2, FLTREG,
                         (branchtrue ? Q_NEGATE(bc) : bc), dest);
         else if ((rep & MCR_SORT_MASK) == MCR_SORT_UNSIGNED ||
                   rep == MCR_SORT_PLAIN+1)          /* plain char */
-            cg_condjump(J_CMPR, arg1_(x), arg2_(x), INTREG,
+            cg_condjump(J_CMPR, e1, e2, INTREG,
                         (branchtrue ? Q_NEGATE(bcl) : bcl), dest);
         else if ((rep & MCR_SORT_MASK) == MCR_SORT_SIGNED)
-            cg_condjump(J_CMPR, arg1_(x), arg2_(x), INTREG,
+            cg_condjump(J_CMPR, e1, e2, INTREG,
                         (branchtrue ? Q_NEGATE(bc) : bc), dest);
         else syserr(syserr_cg_badrep, (long)rep);
     }
@@ -2582,56 +3080,33 @@ default:
 /* (unsigned short)(int)(double)x.                                       */
         if (mcmode != 0 && mclength == 4)
         {
-/* Fixing to an unsigned result is HORRIBLE, and is done using lots of   */
-/* instructions here. The idea is to subtract 2**31 and fix, and then    */
-/* to add back 2**31 to the resulting integer. Rounding toward 0 means   */
-/* that we must test the sign first and calculate:                       */
-/*     fixu(x) = x<2^31 ? fixs(x) : fixs(x-2^31) + 2^31                  */
-/* If you want an overflow check then change the condition to            */
-/*     0<=x<2^31.                                                        */
-/* The trick only works if I use double precision, so for                */
-/* float I start off by widening the input.                              */
-/* THIS MUST BE DONE BY THE BACK-END SOON                                */
-            {   VRegnum r2;
-                LabelNumber *l1, *l2;
-                if (arglength==4)
-                {   VRegnum rx = fgetregister(DBLREG);
-                    emitreg(J_MOVFDR, rx, GAP, r);
-                    bfreeregister(r);
-                    r = rx;             /* Now treat as double case      */
-                }
-                blkflags_(bottom_block) |= BLKREXPORTED;
-                emitfloat1(J_MOVDK, r2 = fgetregister(DBLREG), GAP, fc_two_31);
-                emitreg(J_CMPDR + Q_GE, GAP, r, r2);
-                emitbranch(J_B + Q_GE, l1 = nextlabel());
-                emitreg(J_FIXDR+J_SIGNED, r1 = fgetregister(INTREG), GAP, r);
-                emitbranch(J_B, l2 = nextlabel());
-                start_new_basic_block(l1);
-                emitreg(J_SUBDR, r, r, r2);   /* use 3-addr arm op one day? */
-                emitreg(J_FIXDR+J_SIGNED, r1, GAP, r);
-                emit(J_EORK, r1, r1, 0x80000000);
-                start_new_basic_block(l2);
-                bfreeregister(r2);
+            VRegnum r2, r3;
+/* Fixing to an unsigned result is done by subtracting 2^31, so that the
+ * range is signed, and a signed FIX can be used with rounding to minus
+ * infinite. After this, adding 2^31 again gives the correct result,
+ * including positive/negative overflow.
+ */
+            if (arglength == 4)
+            {
+                /* cast to double, since float doesn't have enough precision */
+                emitreg(J_MOVFDR, r3 = fgetregister(DBLREG), GAP, r);
+                bfreeregister(r);
+                r = r3;
             }
+            emitfloat1(J_MOVDK, r2 = fgetregister(DBLREG), GAP, fc_two_31);
+            emitreg(J_SUBDR, r, r, r2);   /* use 3-addr arm op one day? */
+            emitreg(J_FIXDRM+J_SIGNED, r1 = fgetregister(INTREG), GAP, r);
+            emit(J_EORK, r1, r1, 0x80000000);
+            bfreeregister(r2);
         }
         else
             emitreg((arglength==4 ? J_FIXFR : J_FIXDR) + J_SIGNED,
                     r1 = fgetregister(INTREG), GAP, r);  /* see N.B. above */
 #else  /* TARGET_LACKS_UNSIGNED_FIX */
-#ifdef TARGET_IS_370          /* rationalise soon */
-        {   VRegnum rx = fgetregister(DBLREG);
-            /* move to new register as J_FIX corrupts its f.p. arg   */
-            emitreg(arglength==4 ? J_MOVFDR : J_MOVDR, rx, GAP, r);
-            emitreg(J_FIXDR + (mcmode==0 ? J_SIGNED : J_UNSIGNED),
-                    r1 = fgetregister(INTREG), GAP, rx);
-            bfreeregister(rx);
-        }
-#else  /* TARGET_IS_370 */
         {   int32 w = (mcmode == 0) ? J_SIGNED : J_UNSIGNED;
             emitreg((arglength==4 ? J_FIXFR : J_FIXDR) + w,
                     r1 = fgetregister(INTREG), GAP, r);
         }
-#endif /* TARGET_IS_370 */
 #endif /* TARGET_LACKS_UNSIGNED_FIX */
 /* If I do something like (short)<some floating expression> I need to    */
 /* squash the result down to 16 bits.                                    */
@@ -2660,53 +3135,19 @@ static VRegnum cg_cast1(Expr *x1, int32 mclength, int32 mcmode)
     return cg_cast1_(cg_expr(x1), mclength, mcmode, mcrepofexpr(x1));
 }
 
-#ifdef TARGET_LDRK_MAX          /* not all machines have */
 /* At some point we might be willing for a xxx/target.h to specify a    */
 /* macro/fn for (a renamed) cg_limit_displacement to exploit machines   */
 /* like ARM which do not have a proper notion of quantum/min/max.       */
-static int32 cg_limit_displacement(int32 n, J_OPCODE op, int32 mclength,
-                                   int32 flag)    /* nasty arg!         */
+static int32 cg_limit_displacement(int32 n, J_OPCODE op, int32 ld_align,
+                                   int32 mclength, int32 flag) /* nasty arg! */
 {
-        int32 mink, maxk, span;
-        int32 type = j_memsize(op);
-        /* @@@ sadly this code misses the later determined ldrvk's!!!  */
-        /* **MAYBE** these are alright?                                */
-        int32 quantum = target_ldrk_quantum(mclength, type==MEM_F || type==MEM_D);
+    int32 mink, maxk, span, w, offset;
+    IGNORE(mclength);
+    IGNORE(flag);
 
-        IGNORE(mclength);
-        switch (type) {
-        case MEM_D: mink = TARGET_LDRDK_MIN, maxk = TARGET_LDRDK_MAX; break;
-        case MEM_F: mink = TARGET_LDRFK_MIN, maxk = TARGET_LDRFK_MAX; break;
-        case MEM_B: mink = TARGET_LDRBK_MIN, maxk = TARGET_LDRBK_MAX; break;
-        case MEM_W: mink = TARGET_LDRWK_MIN, maxk = TARGET_LDRWK_MAX; break;
-        case MEM_LL:mink = TARGET_LDRLK_MIN, maxk = TARGET_LDRLK_MAX; break;
-        default:    mink = TARGET_LDRK_MIN,  maxk = TARGET_LDRK_MAX;  break;
-        }
-        if (debugging(DEBUG_CG))
-                cc_msg("limitdisp1(0x%x %d) %d %d %d; ",
-                        op, type, n, mink, maxk);
-#ifndef REL193_HACK    /* dataseg+n J_LDRK here lacks a J_ALIGN4.  Why?  */
-        /* ECN: Treat anything with J_ALIGN1 as a potential byte access  */
-        /*      This may occur when we do eg LDRK from a nonaligned addr */
-        /*      However, be careful to chose the lesser of mink, maxk &  */
-        /*      LDRBK_MIN, LDRBK_MAX. This may happen on the ARM as      */
-        /*      LDRWK_MAX < LDRBK_MAX                                    */
-        if ((op & J_ALIGNMENT) == J_ALIGN1) {
-            if (TARGET_LDRBK_MIN > mink) mink = TARGET_LDRBK_MIN;
-            if (TARGET_LDRBK_MAX < maxk) maxk = TARGET_LDRBK_MAX;
-        }
-#endif
-        if (debugging(DEBUG_CG))
-                cc_msg("limitdisp2 %d %d %d; ",
-                        n, mink, maxk);
-
-#ifdef TARGET_LACKS_HALFWORD_STORE
-/* The prohibition on n=maxk when a store is to take place is to allow */
-/* STRW r1,r2,n to map onto STRB r1,r2,n; STRB r1,r2,n+1.              */
-        if (target_lacks_halfword_store)
-            if (flag != s_content && type == MEM_W) maxk--;
-#endif
-        span = maxk - mink + 1;
+    mink = MinMemOffset(op + ld_align);
+    maxk = MaxMemOffset(op + ld_align);
+    span = maxk - mink + 1;
 
 /* I insist that span be a power of two, so that the inserted offset   */
 /* in the code given below has a neat machine representation.  On many */
@@ -2714,49 +3155,42 @@ static int32 cg_limit_displacement(int32 n, J_OPCODE op, int32 mclength,
 /* one less than a power of two.  Fix it up...                         */
 /* AM: I think 'neat' above means 'ARM-neat(8 bits)'.                  */
 
-        {   int32 w = 0;
-            do
-            {   span -= w;
-                w = span & (-span);   /* least significant bit */
-            } while (span != w);      /* stop when span has just 1 bit */
-        }
+    w = 0;
+    do
+    {   span -= w;
+        w = span & (-span);   /* least significant bit */
+    } while (span != w);      /* stop when span has just 1 bit */
 
 /* If n is between mink and maxk (and quantum accessible) we want to    */
 /* return it directly, else generate a 'least bits' additive fixup.     */
 /* The following expression is believed algebraically equivalent to     */
 /* ACN's in the case quantum=1.  @@@ Unify with take_neat_address.      */
 /* Note the assumption that (mink & -quantum) == mink!                  */
-        {   int32 offset = n;
-            if (!(mink <= n && n <= maxk)) {
-            /* Otherwise, n will do as it is */
-                offset = (unsigned32)n % span;
-            /* If this will do, it is bound to leave a remainder that   */
-            /* is easier to handle (fewer bits) than n was, whereas the */
-            /* numbers below have no such guarrantee                    */
-                if (!(mink <= offset && offset <= maxk))
-                    offset = (n - mink > 0) ? mink + (n - mink) % span :
-                             (maxk - n > 0) ? maxk - (maxk - n) % span :
-                                              maxk + (maxk - n) % span;
-            }
-            if (debugging(DEBUG_CG))
-                cc_msg("limitdisp %d %d %d %d => %d & %d\n",
-                        n, mink, maxk, span, -quantum, offset);
-            return (-quantum) & offset;
-        }
-}
-#endif /* TARGET_LDRK_MAX */
 
-#define toplevel_alignment(b) \
-  ((bindstg_(b) & bitofstg_(s_auto)) ? alignof_toplevel_auto :\
-                                       alignof_toplevel_static)
+    offset = n;
+    if (offset < mink || offset > maxk)
+    {
+        offset = (unsigned32)n % span;
+        /* If this will do, it is bound to leave a remainder that   */
+        /* is easier to handle (fewer bits) than n was, whereas the */
+        /* numbers below have no such guarrantee                    */
+        if (offset < mink || offset > maxk)
+            offset = (n - mink > 0) ? mink + (n - mink) % span :
+                     (maxk - n > 0) ? maxk - (maxk - n) % span :
+                                      maxk + (maxk - n) % span;
+    }
+    return offset & (-MemQuantum(op + ld_align));
+}
 
 static VRegnum cg_stind(VRegnum r, Expr *val, Expr *x, const int32 flag, Binder *b,
                         const int32 mcmode, const int32 mclength,
                         bool address, int volatileorunaligned)
 /* now combines effect of old cg_content.                                */
 /* calculates:   *x       if flag==s_content                             */
-/*               *x = r   if flag==s_assign                               */
+/*               *x = r   if flag==s_assign                              */
 /*      prog1(*x,*x = r)  if flag==s_displace                            */
+/* In the latter two cases, if r==GAP the value to be stored is given by */
+/* val (not yet given to cg_expr)                                        */
 /* The above values are the ONLY valid values for flag                   */
 {   J_OPCODE ld_op;
     int32 ld_align;
@@ -2765,14 +3199,68 @@ static VRegnum cg_stind(VRegnum r, Expr *val, Expr *x, const int32 flag, Binder 
     /* n.b. could add down to addrmode sometime */
     enum Addr_Mode { AD_RD, AD_RR, AD_VD } addrmode = AD_RD;
     RegSort rsort = mcmode!=2 ? INTREG : (mclength==4 ? FLTREG : DBLREG);
+    int32 signedness = mclength >= 4 ? 0 :
+                         mcmode == 0 ? J_SIGNED : J_UNSIGNED;
+
+    switch (mcmode)
+    {
+case 0: /* signed */
+case 1: /* unsigned */
+        switch (mclength)
+        {
+    case 1: ld_op = J_LDRBK; ld_align = J_ALIGN1; break;
+    case 2: ld_op = J_LDRWK; ld_align = J_ALIGN2; break;
+    case 4: ld_op = J_LDRK; ld_align = J_ALIGN4; break;
+    case 8: ld_op = J_LDRLK; ld_align = J_ALIGN8; break;
+    default: syserr(syserr_cg_bad_width, (long)mclength); ld_op = J_NOOP; ld_align = J_ALIGN1;
+        }
+        break;
+case 2: if (rsort==FLTREG)
+          ld_op = J_LDRFK, ld_align = J_ALIGN4;
+        else
+          ld_op = J_LDRDK, ld_align = J_ALIGN8;
+        break;
+default:
+        syserr(syserr_cg_bad_mode, (long)mcmode); ld_op = J_NOOP; ld_align = J_ALIGN1;
+        break;
+    }
+    if (volatileorunaligned & IsUnaligned)
+        ld_align = J_ALIGN1;
+
+#ifdef NEW_J_ALIGN_CODE             /* was TARGET_IS_ADENART */
+/* Although this code is just for a special machine (which encourages   */
+/* all 64-bit aligned loads to be done with J_LDRLK), the idea should   */
+/* be generalisable (e.g. to improve the TARGET_LACKS_HALFWORD_STORE    */
+/* code below).                                                         */
+/* We convert ld/st 8/16/32 bits into 64-bit rd/wr, sign-/zero-         */
+/* extending on load 8/16 bits and write beyond the item into           */
+/* space which alignof_toplevel guarantees is junk.                     */
+/* Note: the only reason we don't always enable this code is that it    */
+/* might harm cross-jumping optimisation.                               */
+    if (b != NULL)
+    {   int32 newalign = toplevel_alignment(b);
+        int32 new_j_align = newalign == 8 ? J_ALIGN8 :
+                            newalign == 4 ? J_ALIGN4 :
+                            newalign == 2 ? J_ALIGN2 :
+                                            J_ALIGN1;
+        if (new_j_align > ld_align)
+            ld_align = new_j_align;
+    }
+#endif
+
 #ifdef ADDRESS_REG_STUFF
     if (rsort==INTREG && address) rsort = ADDRREG;
 #else
     IGNORE(address);
 #endif
-#ifdef TARGET_IS_MIPS
-    if (mips_opt & 1) x = neatify(x, rsort);
-#endif
+    while (h0_(x) == s_cast) {
+        int32 rep = mcrepofexpr(arg1_(x));
+        if (rep >= MCR_SORT_FLOATING
+            || (rep & MCR_SIZE_MASK) != sizeof_ptr)
+            break;
+        x = arg1_(x);
+    }
+
     switch (h0_(x))
     {
 case s_plus:
@@ -2783,14 +3271,14 @@ case s_plus:
 /* can never have both on an indirection.  E.g.  *(int *)(3 + (x<<7)).   */
 /* Moreover, if the machine cannot support all these modes then some are */
 /* killed below.                                                         */
-        if (is_shifted(x1, mclength))
+        if (is_shifted(x1, mclength, signedness, ld_op | ld_align))
         {   Expr *x3 = x1;
             x1 = x2;
             x2 = shift_operand(x3);
             shift = shift_amount(x3);
             addrmode = AD_RR;
         }
-        else if (is_shifted(x2, mclength))
+        else if (is_shifted(x2, mclength, signedness, ld_op | ld_align))
         {   shift = shift_amount(x2);
             x2 = shift_operand(x2);
             addrmode = AD_RR;
@@ -2804,7 +3292,7 @@ case s_plus:
 case s_minus:
         x1 = arg1_(x), x2 = arg2_(x);
 #ifdef TARGET_HAS_SCALED_ADDRESSING
-        if (is_shifted(x1, mclength))
+        if (is_shifted(x1, mclength, signedness, ld_op | ld_align))
         {   Expr *x3 = x1;
             x1 = mk_expr1(s_neg, type_(x), x2);
             x2 = shift_operand(x3);
@@ -2814,7 +3302,8 @@ case s_minus:
 /* /* why on earth is it interesting if x2 is shifted if we don't have */
 /* negative-indexing?                                                  */
 /* ACN to check and move is_shifted test into conditional code?        */
-        else if (is_shifted(x2, -mclength))  /* Mark operand as subtracted */
+        else if (is_shifted(x2, -mclength, signedness, ld_op | ld_align))
+                      /* Negative mclength marks operand as subtracted */
 #ifdef TARGET_HAS_NEGATIVE_INDEXING
         {   shift = shift_amount(x2);
             if ((shift & (SHIFT_RIGHT|SHIFT_ARITH)) == (SHIFT_RIGHT|SHIFT_ARITH))
@@ -2854,63 +3343,25 @@ default:
 /* This code was, and may be better a procedure.                            */
 /* Sample observations: x2 is valid only if addrmode == AD_RR (2 reg addr)  */
 
-    switch (mcmode)
-    {
-case 0: /* signed */
-case 1: /* unsigned */
-        switch (mclength)
-        {
-    case 1: ld_op = J_LDRBK; ld_align = J_ALIGN1; break;
-    case 2: ld_op = J_LDRWK; ld_align = J_ALIGN2; break;
-    case 4: ld_op = J_LDRK; ld_align = J_ALIGN4; break;
-#ifdef TARGET_IS_ADENART
-    case 8: ld_op = J_LDRK; ld_align = J_ALIGN8; break;
-#else
-    case 8: ld_op = J_LDRLK; ld_align = J_ALIGN8; break;
-#endif
-    default: syserr(syserr_cg_bad_width, (long)mclength); ld_op = J_NOOP; ld_align = J_ALIGN1;
-        }
-        break;
-case 2: if (rsort==FLTREG)
-          ld_op = J_LDRFK, ld_align = J_ALIGN4;
-        else
-          ld_op = J_LDRDK, ld_align = J_ALIGN8;
-        break;
-default:
-        syserr(syserr_cg_bad_mode, (long)mcmode); ld_op = J_NOOP; ld_align = J_ALIGN1;
-        break;
-    }
-    if (volatileorunaligned & IsUnaligned)
-        ld_align = J_ALIGN1;
-
 /* Now make allowance for the limited offsets available with LDRK/STRK      */
-#ifdef TARGET_LDRK_MAX
     if (addrmode == AD_RD)
     {   int32 n1;
         if (h0_(x1) == s_integer) {
             n += intval_(x1);
-            n1 = cg_limit_displacement(n, ld_op, mclength, flag);
-#ifdef TARGET_IS_MIPS
-            /* ignore above value for n1 for a while...                 */
-            n1 = n & 31;            /* u5/byte -- could do more         */
-#endif
+            n1 = cg_limit_displacement(n, ld_op, ld_align, mclength, flag);
             x1 = mkintconst(type_(x), n - n1, 0);
         } else {
-            n1 = cg_limit_displacement(n, ld_op, mclength, flag);
+            n1 = cg_limit_displacement(n, ld_op, ld_align, mclength, flag);
             if (n1 != n)
                 x1 = mk_expr2(s_plus, type_(x), x1, mkintconst(te_int, n-n1, 0));
         }
         n = n1;
     }
-#endif /* TARGET_LDRK_MAX */
 
 /* The following line needs regularising w.r.t. machines, like ARM       */
 /* where fp/halfword addressing differs from int/byte.                   */
     if (addrmode == AD_RR &&
         (0
-#ifdef TARGET_LACKS_RR_MEMREF
-         || 1
-#endif
 #ifdef TARGET_LACKS_RR_STORE
          || (flag != s_content && mcmode != 2)
 #endif
@@ -2943,7 +3394,7 @@ default:
                 n = intval_(x4);
                 if (shift != 0) n = n << (shift & SHIFT_MASK);
                 if (d) n = -n;
-                n1 = cg_limit_displacement(n, ld_op, mclength, flag);
+                n1 = cg_limit_displacement(n, ld_op, ld_align, mclength, flag);
                 if (n1 == n) {
                     addrmode = AD_RD;
                     x1 = mk_expr2((down != 0 ? s_minus : s_plus), type_(x), x1,
@@ -2984,38 +3435,14 @@ default:
     }
     else r1 = r2 = GAP; /* To avoid dataflow anomalies */
     r99 = (flag == s_assign) ? GAP : fgetregister(rsort);
-#ifdef TARGET_IS_SPARC
-    /* Wretched SPARC allows unaligned pointers to doubles (e.g. args). */
-    if (ld_op == J_LDRDK && b == NULL) ld_align = J_ALIGN4;
-#endif
-#ifdef NEW_J_ALIGN_CODE             /* was TARGET_IS_ADENART */
-/* Although this code is just for a special machine (which encourages   */
-/* all 64-bit aligned loads to be done with J_LDRLK), the idea should   */
-/* be generalisable (e.g. to improve the TARGET_LACKS_HALFWORD_STORE    */
-/* code below).                                                         */
-/* We convert ld/st 8/16/32 bits into 64-bit rd/wr, sign-/zero-         */
-/* extending on load 8/16 bits and write beyond the item into           */
-/* space which alignof_toplevel guarantees is junk.                     */
-/* Note: the only reason we don't always enable this code is that it    */
-/* might harm cross-jumping optimisation.                               */
-    if (b != NULL)
-    {   int32 newalign = toplevel_alignment(b);
-        int32 new_j_align = newalign == 8 ? J_ALIGN8 :
-                            newalign == 4 ? J_ALIGN4 :
-                            newalign == 2 ? J_ALIGN2 :
-                                            J_ALIGN1;
-        if (new_j_align > ld_align)
-            ld_align = new_j_align;
-    }
-#endif
     ld_op |= ld_align;
+    if (volatileorunaligned & BaseIsWordAligned) ld_op |= J_BASEALIGN4;
     if (val != NULL) r = cg_expr(val);
     if (flag != s_assign)
-    {   int32 ld_op_su = mclength >= 4 ? ld_op :
-                         mcmode == 0 ? ld_op+J_SIGNED : ld_op+J_UNSIGNED;
+    {   int32 ld_op_su = ld_op | signedness;
         if (addrmode == AD_RD) emit(ld_op_su, r99, r1, n);
         else if (addrmode == AD_VD) emitvk(J_addvk(ld_op_su), r99, n, x1b);
-        else emit5(J_KTOR(ld_op_su) + down, r99, r1, r2, shift);
+        else emitshift(J_KTOR(ld_op_su) + down, r99, r1, r2, shift);
     }
     if (flag != s_content)
     {
@@ -3030,7 +3457,8 @@ default:
             goto elsecase;
           }
           else
-          { VRegnum rx = fgetregister(INTREG);
+          { int32 basealign = ld_op & J_BASEALIGN4;
+            VRegnum rx = fgetregister(INTREG);
             int32 a_msb, a_lsb;
             if (addrmode == AD_RR)
                 syserr(syserr_cg_indexword);
@@ -3039,10 +3467,10 @@ default:
             else
             {   a_msb = n;  a_lsb = n+1;}
             if (addrmode == AD_VD) emitvk(J_STRBVK|J_ALIGN1, r, a_lsb, x1b);
-            else emit(J_STRBK|J_ALIGN1, r, r1, a_lsb);
+            else emit(J_STRBK|basealign|J_ALIGN1, r, r1, a_lsb);
             emit(J_SHRK+J_SIGNED, rx, r, 8);
             if (addrmode == AD_VD) emitvk(J_STRBVK|J_ALIGN1, rx, a_msb, x1b);
-            else emit(J_STRBK|J_ALIGN1, rx, r1, a_msb);
+            else emit(J_STRBK|basealign|J_ALIGN1, rx, r1, a_msb);
             bfreeregister(rx);
           }
         }
@@ -3052,7 +3480,7 @@ elsecase:
         {   J_OPCODE st_op = J_LDtoST(ld_op);
             if (addrmode == AD_RD) emit(st_op, r, r1, n);
             else if (addrmode == AD_VD) emitvk(J_addvk(st_op), r, n, x1b);
-            else emit5(J_KTOR(st_op) + down, r, r1, r2, shift);
+            else emitshift(J_KTOR(st_op) + down, r, r1, r2, shift);
         }
     }
 /* Here there had been a s_displace within the indirection, and I do the */
@@ -3084,8 +3512,7 @@ static VRegnum chroma_check(VRegnum v)
 /* behaviour is so that I have something on which to base an heuristic     */
 /* relating to spilling things to the stack.                               */
 {   if (isintregtype_(vregsort(v)))
-    {   usedregs = mkRegList(usedregs, v);
-        if (++nusedregs <= NTEMPREGS+NARGREGS+NVARREGS) return v;
+    {   if (AddUsedReg(v) <= NTEMPREGS+NARGREGS+NVARREGS) return v;
     }
     else
     {   usedfpregs = mkRegList(usedfpregs, v);
@@ -3114,12 +3541,12 @@ static VRegnum getreservedreg(VRegnum r)
     return chroma_check(r);
 }
 
-static VRegnum fgetregister(RegSort rtype)
+VRegnum fgetregister(RegSort rtype)
 {
     return chroma_check(vregister(rtype));
 }
 
-static void bfreeregister(VRegnum r)
+void bfreeregister(VRegnum r)
 {
     if (r == GAP) return;
     if (generic_member((IPtr)r, (List *)usedregs))
@@ -3148,7 +3575,7 @@ J_OPCODE Q_swap(J_OPCODE op)
     /* be cheaper.  As it stands more cases coalesce than the code admits.  */
     switch (op & Q_MASK)
     {   default: syserr(syserr_Q_swap, (long)op);
-        case Q_AL:
+        case Q_AL: case Q_AL+Q_UBIT:
         case Q_UEQ: case Q_UNE:
         case Q_EQ: case Q_NE: return op;
         case Q_LT: case Q_GT: return op ^ (Q_LT ^ Q_GT);
@@ -3162,7 +3589,7 @@ static Binder *is_local_adcon(Expr *a)
 {   if (h0_(a) == s_addrof)
     {   Expr *w = arg1_(a);
         if (h0_(w) == s_binder)
-        {   Binder *b = (Binder *)w;
+        {   Binder *b = exb_(w);
             if ((bindstg_(b) & PRINCSTGBITS) == bitofstg_(s_auto))
                 return b;
         }
@@ -3173,11 +3600,6 @@ static Binder *is_local_adcon(Expr *a)
 static Expr *take_address(Expr *e)
 {
     if (h0_(e)==s_content) return arg1_(e);     /*   & * x   --->  x     */
-    else if (h0_(e)==s_dot)                     /*   &(x.y)  ---> (&x)+y */
-        return mk_expr2(s_plus,
-                        ptrtotype_(type_(e)),
-                        take_address(arg1_(e)),
-                        mkintconst(te_int, exprdotoff_(e), 0));
     else if (h0_(e)==s_cast) return take_address(arg1_(e));  /* ignore casts */
     else return cg_optimise0(mk_expr1(s_addrof,
                                    ptrtotype_(typeofexpr(e)),
@@ -3189,42 +3611,20 @@ static Expr *take_address(Expr *e)
 /* pre-existing adcons (e.g. use FLT ones for INTs on the ARM).          */
 static Expr *take_neat_address(Binder *b, RegSort rsort)
 /* b is a static or extdef binder                                        */
-        {   int32 off = bindaddr_(b);
-            BindList *bb = datasegbinders;
-            Binder *bb_elt = NULL;
-            int32 base = 0;
-            int32 loctype = binduses_(b) & u_loctype;
-#ifdef TARGET_LDRK_MAX
-            int32 mink = TARGET_LDRK_MIN, maxk = TARGET_LDRK_MAX, span;
+{   int32 off = bindaddr_(b);
+    BindList *bb = datasegbinders;
+    Binder *bb_elt = NULL;
+    int32 base = 0;
+    int32 loctype = binduses_(b) & u_loctype;
+    J_OPCODE op = isintregtype_(rsort) ? J_LDRK+J_ALIGN4 : J_LDRFK+J_ALIGN4;
+    int32 mink, maxk, span;
 
-#ifdef TARGET_LDRFK_MAX
-            if (!isintregtype_(rsort))        /* floating/double */
-                mink = TARGET_LDRFK_MIN, maxk = TARGET_LDRFK_MAX;
-#endif
-#ifdef TARGET_IS_HELIOS
-            {   extern int suppress_module;  /* Boo Hiss... */
-/*
- * This hack has been put in at the express request of Perihelion for the
- * benefit of their Helios port for the ARM - it ensures that when the
- * magic -zr option is enabled (which itself has bizarre effects) then
- * addresses of static variables are all done separately rather than using
- * a single dataseg binder to mark the base of the current area of store.
- * When -zr is enabled the data segment will not get generated by the
- * compiler (!) so the fact that the labels referenced here will never seem
- * to get set is not a problem - their definitions are created by hand and
- * merged in with the code while building a shared kernel library.
- */
-                if (suppress_module) return take_address((Expr *)b);
-            }
-#endif
-#ifdef TARGET_LACKS_HALFWORD_STORE
-/* See cg_limit_displacement(), for this slight paranoia.               */
-/* We could envisage targets where all of an object must be addressable */
-            if (target_lacks_halfword_store && isintregtype_(rsort)) maxk--;
-#endif
-            /* The alignof_max is needed on machines like the i860.     */
-            /* alignof_max acts like quantum in cg_limit_displacement.  */
-            span = (maxk+1-mink) & -(int32)4 & -(int32)alignof_max;
+    mink = MinMemOffset(op);
+    maxk = MaxMemOffset(op);
+
+    /* The alignof_max is needed on machines like the i860.     */
+    /* alignof_max acts like quantum in cg_limit_displacement.  */
+    span = (maxk+1-mink) & -(int32)4 & -(int32)alignof_max;
 
 /* I find a binder for a variable at (&datasegment+nnn) where nnn is a   */
 /* neat number and the variable I want now is close to it.               */
@@ -3232,97 +3632,45 @@ static Expr *take_neat_address(Binder *b, RegSort rsort)
 /* @@@ In fact this whole code probably should be a call to              */
 /* cg_limit_displacement with possibly a flag arg (they do same job!).   */
 /* @@@ more complication if LDRK_MAX == LDRK_MIN...                      */
-            if (span == 0) return take_address((Expr *)b);
+    if (span == 0) return take_address((Expr *)b);
 
-            while (off > maxk)
-                base += span, off -= span;
-            while (off < mink)
-                base -= span, off += span;
-
-#else
-            IGNORE(rsort);
-#endif /* TARGET_LDRK_MAX */
+    while (off > maxk)
+        base += span, off -= span;
+    while (off < mink)
+        base -= span, off += span;
 
 /* Find a binder for the address involved...                             */
-            for (; bb != NULL; bb = bb->bindlistcdr)
-            {   bb_elt = bb->bindlistcar;
-                if (bindaddr_(bb_elt) == base &&
-                   (binduses_(bb_elt) & u_loctype) == loctype) break;
-            }
-            if (bb == NULL)
-            {   bb_elt = genglobinder(te_int);  /* MUST be global */
-                bindaddr_(bb_elt) = base;
-                binduses_(bb_elt) |= loctype;
-                datasegbinders =
-                  (BindList *) global_cons2(SU_Other, datasegbinders, bb_elt);
-            }
-            if (off == 0) return take_address((Expr *)bb_elt);
-            else return mk_expr2(s_plus, te_int,
-                                         take_address((Expr *)bb_elt),
-                                         mkintconst(te_int, off, 0));
-        }
-
-static Expr *neatify(Expr *e, RegSort rsort)
-{   int n = 0;
-    Expr *x = e;
-    if (debugging(DEBUG_CG))
-    {   eprintf("neatify(");
-        pr_expr(e);
-        eprintf(")\n");
+    for (; bb != NULL; bb = bb->bindlistcdr)
+    {   bb_elt = bb->bindlistcar;
+        if (bindaddr_(bb_elt) == base &&
+            (binduses_(bb_elt) & u_loctype) == loctype) break;
     }
-    for (;;) switch (h0_(x))
-    {
-case s_plus:
-        if (h0_(arg2_(x)) == s_integer)
-        {   n += intval_(arg2_(x));
-            x = arg1_(x);
-            continue;
-        }
-        return e;
-case s_addrof:
-        x = arg1_(x);
-        if (h0_(x) == s_binder)
-  { Binder *b = (Binder *)x;
-    BindList *bb;
-    for (bb = datasegbinders; bb != NULL; bb = bb->bindlistcdr)
-        if (b == bb->bindlistcar) return e;
-    switch (bindstg_(b) & PRINCSTGBITS)
-    {
-default:
-        syserr(syserr_cg_stgclass, (long)bindstg_(b));
-case b_globalregvar:
-case bitofstg_(s_auto):
-        return e;
-case bitofstg_(s_extern):
-        if (bindstg_(b) & b_undef) return e;
-case bitofstg_(s_static):
-        if (binduses_(b) & u_bss) return e;
-/* v1   ->    *(&datasegment + nnn)    when v1 is a static               */
-        x = take_neat_address(b, rsort);
-        if (debugging(DEBUG_CG))
-        {   eprintf("neatify2(");
-            pr_expr(x);
-            eprintf(",%ld)\n", (long)n);
-        }
-        if (h0_(x) == s_plus && h0_(arg2_(x)) == s_integer)
-            return mk_expr2(s_plus, te_int, arg1_(x),
-                                    mkintconst(te_int, n+intval_(arg2_(x)), 0));
-        if (h0_(x) == s_addrof)
-            return mk_expr2(s_plus, te_int, x,
-                                    mkintconst(te_int, n, 0));
+    if (bb == NULL)
+    {   bb_elt = genglobinder(te_int);  /* MUST be global */
+        bindaddr_(bb_elt) = base;
+        binduses_(bb_elt) |= loctype;
+        datasegbinders =
+            (BindList *) global_cons2(SU_Other, datasegbinders, bb_elt);
     }
-  }
-         /* drop through */
-default: return e;
-    }
+    if (off == 0) return take_address((Expr *)bb_elt);
+    else return mk_expr2(s_plus, te_int,
+            take_address((Expr *)bb_elt),
+            mkintconst(te_int, off, 0));
 }
 
 static VRegnum loadadcon(Binder *b)
 /* only used once from cg_addr()                                         */
 {
     VRegnum r = fgetregister(ADDRREG);
-    Inline_RealUse(b);
-    emitbinder(J_ADCON, r, b);
+    J_OPCODE op = J_ADCON;
+    if (!(bindstg_(b) & b_fnconst)) {
+        if ((bindstg_(b) & b_undef)
+              ? (alignof_toplevel_static >= 4
+                 || alignoftype(bindtype_(b)) >= 4)
+              : (bindaddr_(b) & 3) == 0)
+        op = J_ADCON+J_BASEALIGN4;
+    }
+    emitbinder(op, r, b);
     return r;
 }
 
@@ -3368,17 +3716,6 @@ static VRegnum cg_var(VRegnum r, Binder *b, AEop flag,
     IGNORE(address);
 #endif
 
-/* Here I peephole out the sequence (STR x; LDR x) where x is a variable */
-/* Experimentally skip for (potential) register variable for dataflow    */
-/* see FEATURE_ANOMALY in regalloc.c                                     */
-    if (flag == s_content && b == cgstate.juststored.var
-        && !(volatileorunaligned & IsVolatile)
-#ifdef EXPERIMENTAL_DATAFLOW
-        && (bindstg_(b) & (bitofstg_(s_auto)|b_addrof)) != bitofstg_(s_auto)
-#endif
-       )
-        return cgstate.juststored.reg;
-
     switch (bindstg_(b) & PRINCSTGBITS)
     {
 default:
@@ -3421,7 +3758,7 @@ jolly:
 case bitofstg_(s_extern):
         if (bindstg_(b) & b_undef) goto jolly;
 case bitofstg_(s_static):
-        if (binduses_(b) & u_bss) goto jolly;
+        if ((binduses_(b) & u_bss) && bindaddr_(b) == BINDADDR_UNSET) goto jolly;
 /* v1   ->    *(&datasegment + nnn)    when v1 is a static               */
 /* See comment for s_extern above for possible improvement too.          */
         r = cg_stind(r, NULL, take_neat_address(b, rsort), flag, b,
@@ -3446,7 +3783,7 @@ case bitofstg_(s_static):
     return r;
 }
 
-static VRegnum cg_storein(VRegnum r, Expr *val, Expr *e, AEop flag)
+VRegnum cg_storein(VRegnum r, Expr *val, Expr *e, AEop flag)
 /* if flag is s_displace return old value,
    else flag is s_assign and return stored value (already coerced). */
 {
@@ -3461,12 +3798,11 @@ static VRegnum cg_storein(VRegnum r, Expr *val, Expr *e, AEop flag)
     {
 case s_binder:
         if (val != NULL) r = cg_expr(val);
-        res = cg_var(r, (Binder *)e, flag, mcmode, mclength, 0);
+        res = cg_var(r, exb_(e), flag, mcmode, mclength, 0);
         break;
 
-case s_dot:
-        e = cg_content_for_dot(e);
-        return cg_storein(r, val, e, flag);
+case s_content4:
+        volatileorunaligned |= BaseIsWordAligned;
 
 case s_content:
         e = arg1_(e);
@@ -3535,15 +3871,12 @@ case s_assign:
 /* but with need for special care if a is an expression that might have  */
 /* side effects when being evaluated.                                    */
         e = arg1_(sv);
-ell:    switch (h0_(e))
+        switch (h0_(e))
         {
     default:
             syserr(syserr_cg_addr);
-    case s_dot:
-/*  &((p.q) =r )   =>   &(*(&p+q') = r)                                  */
-            e = cg_content_for_dot(e);
-            goto ell;
     case s_content:
+    case s_content4:
            {    TypeExpr *t = typeofexpr(arg1_(e));
                 Binder *gen = gentempbinder(t);
 /*     & (*p=q)                                                          */
@@ -3564,15 +3897,14 @@ ell:    switch (h0_(e))
                                                 t,
                                                 mk_expr2(s_assign,
                                                          typeofexpr(arg2_(sv)),
-                                                         mk_expr1(s_content,
+                                                         mk_expr1(h0_(e),
                                                                   t,
                                                                   (Expr *)gen),
                                                 arg2_(sv)),
                                        (Expr *)gen)));
                 if (debugging(DEBUG_CG))
                 {   eprintf("& p = q  ---> ");
-                    pr_expr(sv);
-                    eprintf("\n");
+                    pr_expr_nl(sv);
                 }
             }
             return cg_expr1(sv, valneeded);
@@ -3582,7 +3914,7 @@ ell:    switch (h0_(e))
         }
         /* drop through */
 case s_binder:
-      { Binder *b = (Binder *)sv;
+      { Binder *b = exb_(sv);
         switch (bindstg_(b) & PRINCSTGBITS)
         {
     default:
@@ -3593,194 +3925,32 @@ case s_binder:
                 return (r);
             }
             else return GAP;
-#ifdef TARGET_IS_MIPS_failed_experiment
-    case bitofstg_(s_extern):
-            if (bindstg_(b) & b_undef) goto nonlocal;
-    case bitofstg_(s_static):
-            /* FIXME: what is BSS in the MIPS system?                   */
-            if (binduses_(b) & (u_bss|b_fnconst)) goto nonlocal;
-            if (valneeded && mips_opt & 1)
-            {   int32 mcrep = mcrepofexpr((Expr *)b);
-                int32 mcmode = mcrep >> MCR_SORT_SHIFT;
-                int32 mclength = mcrep & MCR_SIZE_MASK;
-                RegSort rsort = RsortOfMcrep_(mcmode, mclength);
-                Expr *e2 = take_neat_address(b, rsort);
-                Expr *e3 = 0;
-                if (h0_(e2) == s_plus) e3 = arg2_(e2), e2 = arg1_(e2);
-                if (h0_(e2) != s_addrof) syserr("cg.c(MIPS neat_addr)");
-                e2 = arg1_(e2);
-                if (h0_(e2) != s_binder) syserr("cg.c(MIPS neat_addr)");
-                emitbinder(J_ADCON+jisize_(ADDRREG),
-                           r = fgetregister(ADDRREG), (Binder *)e2);
-                if (e3)
-                { VRegnum r1 = fgetregister(ADDRREG);
-                  if (h0_(e3) != s_integer) syserr("cg.c(MIPS neat_addr)");
-                  emit(J_ADDK, r1, r, intval_(e3));
-                  bfreeregister(r);
-                  r = r1;
-                }
-                return r;
-            }
-    nonlocal:
-#else
     case bitofstg_(s_static):
     case bitofstg_(s_extern):
-#endif
             if (valneeded) return loadadcon(b);
             else return GAP;
         }
       }
-#ifdef SOFTWARE_FLOATING_POINT
+case s_int64con:
+        if (!valneeded) return GAP;
+        emitint64(J_ADCONLL, r = fgetregister(ADDRREG), GAP, exi64_(sv));
+        return r;
 case s_floatcon:
-        if (software_floating_point_enabled) {
+      { FloatCon *f = exf_(sv);
+        if (is_float_(f->floatlen)) {
             if (!valneeded) return GAP;
-            emitfloat((((FloatCon *)sv)->floatlen) & bitoftype_(s_double)
-                  ? J_ADCOND : J_ADCONF, r = fgetregister(ADDRREG), GAP,
-                                         (FloatCon *)sv);
+            emitfloat(J_ADCONF, r = fgetregister(ADDRREG), GAP, f);
+            return r;
+        } else if (is_anydouble_(f->floatlen)) {
+            if (!valneeded) return GAP;
+            emitfloat(J_ADCOND, r = fgetregister(ADDRREG), GAP, f);
             return r;
         }
-#endif
+      }
 default:
         syserr(syserr_cg_addr1, (long)h0_(sv));
     }
 }
-
-#if defined TARGET_HAS_SCALED_ADDRESSING || defined TARGET_HAS_SCALED_OPS || \
-    defined TARGET_HAS_SCALED_ADD
-
-static Expr *ignore_ineffectual_casts(Expr *x) {
-    for (; h0_(x) == s_cast; x = arg1_(x)) {
-        int32 resrep = mcrepofexpr(x),
-              argrep = mcrepofexpr(arg1_(x));
-        int32 ressort = resrep & MCR_SORT_MASK,
-              argsort = argrep & MCR_SORT_MASK;
-        if (ressort > MCR_SORT_UNSIGNED || argsort > MCR_SORT_UNSIGNED)
-            break;
-        {   int32 ressize = resrep & MCR_SIZE_MASK,
-                  argsize = argrep & MCR_SIZE_MASK;
-            if (ressort == argsort) {
-                if (ressize < argsize)
-                    break;
-            } else if (ressize != argsize || ressize < 4)
-              break;
-        }
-    }
-    return x;
-}
-
-static int32 is_shifted(Expr *x, int32 mclength)
-/* Predicate to test if an expression is of the form something shifted.  */
-/* 11-Nov-87: changed to consult target_scalable() for 32016/vax.        */
-/* Used to decide if scaled indexed addressing is wanted.                */
-/*
- * mclength is zero for scaled-op investigation, or 1, 2, 4 or 8 for byte,
- * short, long or double memory references.  It is -1, -2, -4 or -8 for
- * memory references where the scaled index must be subtracted from the
- * base value rather than added. mclength is just handed down to a
- * target specific test for validity.
- */
-{
-    int32 n;
-    Expr *arg;
-    x = ignore_ineffectual_casts(x);
-    switch (h0_(x))
-    {
-case s_rightshift:
-case s_leftshift:
-        arg = arg2_(x);
-        if (h0_(arg)!=s_integer) return 0;
-        n = intval_(arg);
-        if (n == 0) return is_shifted(arg1_(x), mclength);
-        if (n>=0 && n<=31) return target_scalable(shift_amount(x), mclength);
-        else return 0;
-case s_times:                   /* detect multiplication by 2, 4, 6, ...  */
-        if ((arg = arg1_(x), h0_(arg)) == s_integer ||
-            (arg = arg2_(x), h0_(arg)) == s_integer)
-        {   n = intval_(arg);
-            if (n!=0 && (n & 1)==0)
-                return target_scalable(shift_amount(x), mclength);
-        }
-        return 0;
-default:
-        return 0;
-    }
-}
-
-static Expr *shift_op1(Expr *x, int32 n)
-{
-    if (n==0) syserr(syserr_cg_shift0);
-    while ((n & 1)==0) n >>= 1;
-    if (n==1) return x;
-    return mk_expr2(s_times, te_int, x,
-                    mkintconst(te_int, n, 0));
-}
-
-static Expr *shift_operand(Expr *x)
-/* if is_shifted() returned true this can be used to extract the operand */
-{
-    int32 n;
-    Expr *arg;
-    x = ignore_ineffectual_casts(x);
-    switch (h0_(x))
-    {
-case s_rightshift:
-case s_leftshift:
-        arg = arg2_(x);
-        if (h0_(arg) == s_integer && intval_(arg)==0)
-            return shift_operand(arg1_(x));
-        return arg1_(x);
-case s_times:
-        arg = arg1_(x);
-        if (h0_(arg)==s_integer)
-        {   n = intval_(arg);
-            if ((n & 1)==0) return shift_op1(arg2_(x), n);
-        }
-        else return shift_op1(arg1_(x), intval_(arg2_(x)));
-default:
-        syserr(syserr_not_shift);
-        return x;
-    }
-}
-
-static int32 shift_amount(Expr *x)
-/* if is_shifted() returned true this can be used to extract the shift   */
-{
-    int32 n;
-    Expr *arg;
-    x = ignore_ineffectual_casts(x);
-    switch (h0_(x))
-    {
-case s_rightshift:
-        n = intval_(arg2_(x));
-        if (n == 0) return shift_amount(arg1_(x));
-/* This is a horrid packing scheme */
-        n = (n & SHIFT_MASK) | SHIFT_RIGHT;
-        if (!unsigned_expression_(arg1_(x))) n |= SHIFT_ARITH;
-        return n;
-case s_leftshift:
-        arg = arg2_(x);
-        n = intval_(arg);
-        if (n == 0) return shift_amount(arg1_(x));
-        return n & SHIFT_MASK;
-case s_times:
-        arg = arg1_(x);
-        if (h0_(arg)==s_integer)
-        {   n = intval_(arg);
-            if ((n & 1)==0) return logbase2(n) & SHIFT_MASK;
-        }
-        arg = arg2_(x);
-        if (h0_(arg)==s_integer)
-        {   n = intval_(arg);
-            if ((n & 1)==0) return logbase2(n) & SHIFT_MASK;
-        }
-        /* drop through */
-default:
-        syserr(syserr_not_shift1);
-        return 0;
-    }
-}
-
-#endif /* TARGET_HAS_SCALED_ADDRESSING or _OPS */
 
 #if defined TARGET_HAS_SCALED_OPS || defined TARGET_HAS_SCALED_ADD
 static VRegnum cg_opshift(J_OPCODE jop, Expr *arg1, Expr *arg2,
@@ -3800,7 +3970,7 @@ static VRegnum cg_opshift(J_OPCODE jop, Expr *arg1, Expr *arg2,
     else
         r = cg_expr(arg1), r2 = cg_expr(arg2);
     targetreg = (jop_iscmp_(jop) ? GAP : fgetregister(INTREG));
-    emit5(jop, targetreg, r, r2, shift);
+    emitshift(jop, targetreg, r, r2, shift);
     bfreeregister(r);
     if (!same) bfreeregister(r2);
     return targetreg;
@@ -3830,115 +4000,6 @@ case 0x04000002:
 default:
         syserr(syserr_integer_expected);
     }
-}
-
-/* The code that follows is too simplistic - I need a better estimate of */
-/* the complexity of expressions, e.g. an estimate of the number of regs */
-/* needed to evaluate something.                                         */
-
-static int nastiness(Expr *x)
-{
-/* This procedure is used to provide an heuristic that helps me decide   */
-/* what order to prepare arguments for functions in. It a value between  */
-/* ISCONST and ISHARD to show if the expression x contains any function  */
-/* calls (which clobber lots of regs) or otherwise a value estimating    */
-/* the likely number of registers the expression is liable to take.      */
-    AEop op;
-    int n1, n2, n3, nr;
-#define max_(a,b) ((a)>=(b) ? (a):(b))
-    for (;;) switch (op = h0_(x))
-    {
-case s_integer:
-        return ISCONST;
-case s_floatcon:
-case_s_any_string
-        return ISXCONST;
-case s_binder:
-        return ISBIND;
-case s_dot:
-/* monadic things... */
-case s_content:
-#if 0
-        {   int32 m = mcrepofexpr(x);
-            if ((m >> MCR_SORT_SHIFT) == 3 && (m & MCR_SIZE_MASK) > 4)
-                return ISHARD;  /* big struct */
-        }
-#endif
-        if (memory_access_checks) return(ISHARD);
-case s_cast:
-case s_bitnot:
-case s_boolnot:
-case s_monplus:
-case s_neg:
-case s_addrof:
-        x = arg1_(x);
-        if (op == s_dot && h0_(x) == s_content) x = arg1_(x);
-        /* (*x . 0) is not hard just because *x would be */
-        continue;
-case s_cond:
-        /* due to the fact that operands from s_cond are never combined */
-        /* we do not need the complexity of binary operators below.     */
-        nr = nastiness(arg1_(x));
-        n2 = nastiness(arg2_(x));
-        nr = max_(nr,n2);
-        n3 = nastiness(arg3_(x));
-        nr = max_(nr,n3);
-        return max_(ISEXPR, nr);
-case s_assign:
-case s_displace:
-        {   int32 m = mcrepofexpr(x);
-            if ((m >> MCR_SORT_SHIFT) == 3 && (m & MCR_SIZE_MASK) > 4)
-                return ISHARD;  /* big struct */
-        }
-        /* drop through */
-case s_andand:
-case s_oror:
-case s_equalequal:
-case s_notequal:
-case s_greater:
-case s_greaterequal:
-case s_less:
-case s_lessequal:
-case s_comma:
-case s_and:
-case s_plus:
-case s_minus:
-case s_leftshift:
-case s_or:
-case s_rightshift:
-case s_xor:
-case s_times:
-case s_div:
-case s_rem:
-        n1 = nastiness(arg1_(x));
-        n2 = nastiness(arg2_(x));
-/* A good estimate of the complexity (number of temp registers needed)  */
-/*             n1==n2 ? n1+1 : max(n1,n2),                              */
-/* but modify the middle term so that we never exceed ISHARD, nor       */
-/* even attain it unless one term is ISHARD (thus ISHARD terms are only */
-/* those containing function like things).  See cg_fnargs for why.      */
-        nr = n1==n2 ? (n1>=ISHARD-1 ? n1 : n1+1) : max_(n1,n2);
-#ifndef TARGET_HAS_MULTIPLY
-          /* See if we will need a proc. call on the ARM and similar.      */
-          /* However, this 'better' code seems to compile a slightly 0.01% */
-          /* bigger compiler than if we omit the conjuncts which check for */
-          /* (const) multiplies which do not require a function call!!!!   */
-          /* Leave in the 'notionally correct code'.                       */
-        if (op == s_times && h0_(arg1_(x)) != s_integer
-                          && h0_(arg2_(x)) != s_integer) return ISHARD;
-#endif
-#ifndef TARGET_HAS_DIVIDE
-        if ((op == s_div || op == s_rem) && h0_(arg2_(x)) != s_integer)
-            return ISHARD;
-#endif
-        return max_(ISEXPR, nr);            /* always a little bit hard. */
-case s_let:
-        x = arg2_(x);
-        continue;
-default:   /* includes s_fnap */
-        return ISHARD;
-    }
-#undef max_
 }
 
 static VRegnum cg_binary_or_fn(J_OPCODE op, TypeExpr *type,
@@ -3994,9 +4055,9 @@ static VRegnum cg_binary_1(J_OPCODE op, Expr *a1, Expr *a2,
     }
 #ifdef TARGET_HAS_SCALED_ADD
     if (op == J_ADDR || op == J_SUBR)
-    { if (op == J_ADDR && is_shifted(a2, 0))
+    { if (op == J_ADDR && is_shifted(a2, 0, 0, 0))
         return cg_opshift(op+cond, a1, shift_operand(a2), shift_amount(a2));
-      if (is_shifted(a1, 0))
+      if (is_shifted(a1, 0, 0, 0))
       { if (condP) *condP = cond = Q_swap(cond);
         return cg_opshift((op==J_SUBR ? J_RSBR : op) + cond,
                               a2, shift_operand(a1), shift_amount(a1));
@@ -4016,9 +4077,9 @@ static VRegnum cg_binary_1(J_OPCODE op, Expr *a1, Expr *a2,
     if (op == J_ADDR || op == J_SUBR ||
         op == J_ANDR || op == J_ORRR || op == J_EORR ||
         (op & ~Q_MASK) == J_CMPR)
-    { if (is_shifted(a2, 0))
+    { if (is_shifted(a2, 0, 0, 0))
         return cg_opshift(op+cond, a1, shift_operand(a2), shift_amount(a2));
-      if (is_shifted(a1, 0))
+      if (is_shifted(a1, 0, 0, 0))
       { if (condP) *condP = cond = Q_swap(cond);
         return cg_opshift((op==J_SUBR ? J_RSBR : op) + cond,
                               a2, shift_operand(a1), shift_amount(a1));
@@ -4060,13 +4121,13 @@ static VRegnum cg_binary_1(J_OPCODE op, Expr *a1, Expr *a2,
         return targetreg;
     }
 #ifdef TARGET_HAS_FP_LITERALS
-    if (h0_(a2) == s_floatcon && fpliteral((FloatCon *) a2, J_RTOK(op)))
+    if (h0_(a2) == s_floatcon && fpliteral(exf_(a2), J_RTOK(op)))
     {   VRegnum r1 = cg_expr(a1);
         targetreg = jop_iscmp_(op) ? GAP : fgetregister(fpp);
 /* The next line is just emitfloat because it is illegal to have FP_LITERALS
  * and also needing the literals in store.
  */
-        emitfloat(J_RTOK(op+cond), targetreg, r1, (FloatCon *)a2);
+        emitfloat(J_RTOK(op+cond), targetreg, r1, exf_(a2));
         bfreeregister(r1);
         return targetreg;
     }
@@ -4116,7 +4177,7 @@ static void cg_count(FileLine fl)
 static void cg_test(Expr *x, bool branchtrue, LabelNumber *dest)
 {
 /* I wonder if the count-point that was here was really useful? ...
-    cg_count(cg_current_cmd->fileline);
+    cg_count(cmdfileline_(cg_current_cmd));
  ... end of commented out code */
     cg_test1(x, branchtrue, dest);
 }
@@ -4213,6 +4274,8 @@ static int32 alignofpointee(Expr *x, int32 knownalign)
     TypeExpr *t = princtype(typeofexpr(x));
     if (h0_(t) == t_content || h0_(t) == t_ref)
     {   TypeExpr *tt = typearg_(t);
+        if (isunaligned_type(tt))
+            return 1;
         /* the (amusingly named) test on next line seems overkeen...    */
         /* ... but it protects for memcpy applied to (void *).          */
         if (sizeoftypelegal(tt)) a1 = alignoftype(tt);
@@ -4220,7 +4283,7 @@ static int32 alignofpointee(Expr *x, int32 knownalign)
     if (isstring_(h0_(x)))
         a2 = alignof_literal;
     else if (h0_(x) == s_addrof && h0_(arg1_(x)) == s_binder)
-        a2 = toplevel_alignment((Binder *)arg1_(x));
+        a2 = toplevel_alignment(exb_(arg1_(x)));
     if (a1 > knownalign) knownalign = a1;
     if (a2 > knownalign) knownalign = a2;
     return knownalign;
@@ -4234,14 +4297,14 @@ static int32 sizeofpointee(Expr *x, int32 *padding)
 /* MIP so we can see that it is consistent.                             */
     int32 len = 0, pad = 0;
     if (h0_(x) == s_string) {
-        len = stringlength(((String *)x)->strseg)+1;    /* isstring_()? */
+        len = stringlength(exs_(x)->strseg)+1;    /* isstring_()? */
         pad = padsize(len, alignof_literal) - len;
     } else if (h0_(x) == s_addrof) {
         x = arg1_(x);
         if (h0_(x) == s_binder &&
-            sizeoftypelegal(bindtype_((Binder *)x))) {
-            len = sizeoftype(bindtype_((Binder *)x));
-            pad = padsize(len, toplevel_alignment((Binder *)x)) - len;
+            sizeoftypelegal(bindtype_(exb_(x)))) {
+            len = sizeoftype(bindtype_(exb_(x)));
+            pad = padsize(len, toplevel_alignment(exb_(x))) - len;
         }
     }
     *padding = pad;
@@ -4250,6 +4313,21 @@ static int32 sizeofpointee(Expr *x, int32 *padding)
 
 #define symisctor(s)  (LanguageIsCPlusPlus ? strncmp(symname_(s), "__ct", 4) == 0 : 0)
 
+static void emitcopy(Icode *ic) {
+    if (ic->op == J_SETSPENV) {
+        active_binders = ic->r2.bl;
+        emitsetsp(ic->op, ic->r3.bl);;
+    } else
+        emitic(ic);
+}
+
+static Inline_ArgSubstList *New_Inline_ArgSubstList(Inline_ArgSubstSort sort) {
+    Inline_ArgSubstList *sl = (Inline_ArgSubstList *)SynAlloc(sizeof(Inline_ArgSubstList));
+    sl->notnull = NO;
+    sl->sort = sort;
+    return sl;
+}
+
 static VRegnum TryInlineRestore(
   Binder *fname, ExprList *args, Expr *structresult, RegSort rsort, bool valneeded) {
     VRegnum resultr = GAP;
@@ -4257,57 +4335,72 @@ static VRegnum TryInlineRestore(
     BindList *oactive = active_binders;
     Inline_SavedFn px;
     Inline_SavedFn *p = Inline_FindFn(fname);
-    BindList *blglob;
     VRegnum structresultp = GAP;
     Binder *structresultbinder = NULL;
-
-    if (p == NULL) return NOT_OPEN_COMPILABLE;
+    bool resultisstruct = NO;
+    int32 narg = length((List *)args);
+    if (structresult != NULL && !returnsstructinregs_t(bindtype_(fname))) narg++;
+    if (p == NULL || narg != length((List *)p->fndetails.argbindlist))
+      return NOT_OPEN_COMPILABLE;
 
     px = *p;
     rc.exitlabel = nextlabel();
     rc.env = oactive;
     rc.argreplace = NULL;
-    if (returnsstructinregs_t(bindtype_(fname))) {
-        VRegnum r = V_resultreg(INTREG);
-        int i, n = sizeoftype(typearg_(bindtype_(fname))) / MEMCPYQUANTUM;
-        for (i = 0; i < n; i++) {
-          rc.resultregs[i] = r;
-          rc.newresultregs[i] = structresult == NULL ? GAP : fgetregister(INTREG);
-          r++;
-        }
-        if (structresult != NULL) {
+    {   TypeExpr *fntype = bindtype_(fname);
+        TypeExpr *restype = typearg_(fntype);
+        if (returnsstructinregs_t(fntype)
+            && (mcrepoftype(restype) & MCR_SORT_MASK) == MCR_SORT_STRUCT) {
+            /* Note that returnsstructinregs() but structresult==NULL is    */
+            /* possible: it occurs precisely when the function being called */
+            /* here provides the return value for the calling function.     */
+            /* (also, in this case the call is s_fnapstructvoid rather than */
+            /* s_fnapstruct). But we mustn't let Inline_Restore think the   */
+            /* call is voided in this case, or it will kill instructions    */
+            /* loading the result                                           */
+            VRegnum r = V_resultreg(INTREG);
+            unsigned i, n = (unsigned)sizeoftype(restype) / MEMCPYQUANTUM;
+            resultisstruct = YES;
+            for (i = 0; i < n; i++) {
+              rc.resultregs[i] = r;
+              rc.newresultregs[i] = fgetregister(INTREG);
+              r++;
+            }
             rc.nresults = n;
-            if (h0_(structresult) == s_addrof &&
-                h0_(arg1_(structresult)) == s_binder)
-                structresultbinder = (Binder *)arg1_(structresult);
+            if (structresult != NULL) {
+                if (h0_(structresult) == s_addrof &&
+                    h0_(arg1_(structresult)) == s_binder)
+                    structresultbinder = exb_(arg1_(structresult));
+                else
+                    structresultp = cg_expr(structresult);
+            }
+        } else if (isvoidtype(restype)) {
+            rc.nresults = 0;
+        } else {
+            rc.nresults = 1;
+            rc.resultregs[0] = V_resultreg(rsort);
+            if (!valneeded)
+                rc.newresultregs[0] = GAP;
             else
-                structresultp = cg_expr(structresult);
+                resultr = rc.newresultregs[0] = fgetregister(rsort);
         }
-    } else if (isvoidtype(typearg_(bindtype_(fname)))) {
-        rc.nresults = 0;
-    } else {
-        rc.nresults = 1;
-        rc.resultregs[0] = V_resultreg(rsort);
-        if (!valneeded)
-            rc.newresultregs[0] = GAP;
-        else
-            resultr = rc.newresultregs[0] = fgetregister(rsort);
     }
     /* Arrange to do inline substitution for suitable arguments, rather than
-       assignment to an argument binder. CSE can achieve the same effect, but
-       doing it here is a significant time saver for both CSE and regalloc;
-       also, by direct sustitution of &arg into *par, we can hope to remove
-       the spurious address-taken attribute from arg and improve generated
-       code significantly: this can't be done after CSE (address-taken-ness
-       has then already been used to determine aliasing).
+     * assignment to an argument binder. CSE can achieve the same effect, but
+     * doing it here is a significant time saver for both CSE and regalloc;
+     * also, by direct sustitution of &arg into *par, we can hope to remove
+     * the spurious address-taken attribute from arg and improve generated
+     * code significantly: this can't be done after CSE (address-taken-ness
+     * has then already been used to determine aliasing).
      */
     if (!(var_cc_private_flags & 1048576L)) {
         Inline_ArgSubstList **slp = &rc.argreplace;
         ExprList *a = args;
-        for (blglob = px.fndetails.argbindlist;
-             blglob != NULL;
-             blglob = blglob->bindlistcdr, a = cdr_(a)) {
-            Binder *b = blglob->bindlistcar;
+        Inline_ArgBinderList *argl;
+        for (argl = px.args;
+             argl != NULL;
+             argl = cdr_(argl), a = cdr_(a)) {
+            Binder *b = argl->globarg;
             Expr *ex = exprcar_(a);
             Expr *rest = NULL;
             bool byreference = NO;
@@ -4320,48 +4413,62 @@ static VRegnum TryInlineRestore(
                 byreference = YES;
                 ex = arg1_(ex);
             }
-            if ( ( h0_(ex) == s_binder
+            if (!byreference && h0_(ex) == s_integer) {
+                sl = New_Inline_ArgSubstList(T_Int);
+                if (argl->narrowtype != NULL) b = argl->globnarrowarg;
+
+            } else if (argl->narrowtype != NULL) {
+                if ( h0_(ex) == s_binder && !byreference
+                     && !(bindstg_(exb_(ex)) & b_addrof)
+                     && (bindstg_(exb_(ex)) & bitofstg_(s_auto))
+                     && mcrepofexpr(ex) == mcrepoftype(argl->narrowtype)) {
+                    sl = New_Inline_ArgSubstList(T_Binder);
+                    b = argl->globnarrowarg;
+                }
+            } else if (h0_(ex) == s_binder
                   /* a variable is only substitutable if it's not updated in
                      the function to be inlined. Local to the calling function
                      and not also passed by reference is sufficient to ensure
                      this. The latter is checked later.
                    */
-                   && !( (bindstg_((Binder *)ex) & b_addrof)
-                         && (mcrepofexpr(ex) & MCR_SIZE_MASK) < sizeof_int)
-                   && (byreference || (bindstg_((Binder *)ex) & bitofstg_(s_auto))))
-                 || (!byreference && h0_(ex) == s_integer)) {
-                sl = (Inline_ArgSubstList *)SynAlloc(sizeof(Inline_ArgSubstList));
-                sl->notnull = NO;
-                if (h0_(ex) == s_integer) {
-                  sl->sort = T_Int;
-                } else if (!byreference) {
-                  if (bindstg_((Binder *)ex) & b_addrof) continue;
-                  sl->sort = T_Binder;
-                  if (symisctor(currentfunction.symstr) && symisctor(bindsym_(fname)) &&
-                      (Binder *)ex == currentfunction.argbindlist->bindlistcar)
+                       && !( (bindstg_(exb_(ex)) & b_addrof)
+                             && sizeoftypelegal(bindtype_(exb_(ex)))
+                             && (mcrepofexpr(ex) & MCR_SIZE_MASK) < sizeof_int)
+                       && (byreference
+                           || (bindstg_(exb_(ex)) & bitofstg_(s_auto)))) {
+                if (!byreference) {
+                  if (bindstg_(exb_(ex)) & b_addrof) continue;
+                  sl = New_Inline_ArgSubstList(T_Binder);
+                  if (symisctor(currentfunction.symstr) && symisctor(bindsym_(fname))
+                      && exb_(ex) == currentfunction.argbindlist->bindlistcar)
                     sl->notnull = YES;
-                } else if (!(bindstg_((Binder *)ex) & bitofstg_(s_auto))) {
-                  sl->sort = T_Adcon;
-                  if (!(bindstg_((Binder *)ex) & bitofstg_(s_weak)))
+                } else if (!(bindstg_(exb_(ex)) & bitofstg_(s_auto))) {
+                  sl = New_Inline_ArgSubstList(T_Adcon);
+                  if (!(bindstg_(exb_(ex)) & bitofstg_(s_weak)))
                     sl->notnull = YES;
                 } else {
                   int32 rep = mcrepofexpr(ex);
                   int32 sort = rep & MCR_SORT_MASK,
                         len = rep & MCR_SIZE_MASK;
+                  sl = New_Inline_ArgSubstList(T_AdconV);
                   sl->size = sort == MCR_SORT_FLOATING ?
-                               (len == 4 ? MEM_F : MEM_D) :
+                                (len == 4 ? MEM_F :
+                                            MEM_D) :
                              sort < MCR_SORT_FLOATING ?
-                                (len == 1 ? MEM_B : len == 2 ? MEM_W : len == 4 ? MEM_I : MEM_LL) :
-                                -1;
-                  sl->sort = T_AdconV;
+                                (len == 1 ? MEM_B :
+                                 len == 2 ? MEM_W :
+                                 len == 4 ? MEM_I :
+                                            MEM_LL) :
+                                MEM_NONE;
                   sl->notnull = YES;
                 }
-            } else if (h0_(ex) == s_plus && h0_(arg1_(ex)) == s_binder && h0_(arg2_(ex)) == s_integer &&
-                       symisctor(currentfunction.symstr) && symisctor(bindsym_(fname)) &&
-                       (Binder *)arg1_(ex) == currentfunction.argbindlist->bindlistcar) {
-                sl = (Inline_ArgSubstList *)SynAlloc(sizeof(Inline_ArgSubstList));
+            } else if (h0_(ex) == s_plus && h0_(arg1_(ex)) == s_binder
+                       && h0_(arg2_(ex)) == s_integer
+                       && symisctor(currentfunction.symstr)
+                       && symisctor(bindsym_(fname))
+                       && exb_(arg1_(ex)) == currentfunction.argbindlist->bindlistcar) {
+                sl = New_Inline_ArgSubstList(T_Plus);
                 sl->notnull = YES;
-                sl->sort = T_Plus;
             }
             if (sl != NULL) {
                 cdr_(sl) = NULL;
@@ -4372,11 +4479,6 @@ static VRegnum TryInlineRestore(
             }
         }
     }
-    /* Remember the original, globalised argument list now (Inline_Restore
-       will produce a copy with copies of the binders, from which substituted
-       arguments have been pruned)
-     */
-    blglob = px.fndetails.argbindlist;
     if (debugging(DEBUG_CG))
         cc_msg("\ninlined $b\n", fname);
     Inline_Restore(&px, &rc);
@@ -4387,12 +4489,15 @@ static VRegnum TryInlineRestore(
         };
         ArgValList *argvals = NULL;
         Inline_ArgSubstList *sl = rc.argreplace;
+        Inline_ArgBinderList *argl = px.args;
         BindList *bl = px.fndetails.argbindlist;
         ExprList *a = args;
-        for (; blglob != NULL; blglob = blglob->bindlistcdr, a = cdr_(a)) {
+        for (; argl != NULL; argl = cdr_(argl), a = cdr_(a)) {
             Expr *ex = exprcar_(a);
             TypeExpr *t;
-            Binder *bglob = blglob->bindlistcar;
+            Binder *bglob = argl->narrowtype == NULL || argl->globnarrowarg == NULL
+                                                     ? argl->globarg
+                                                     : argl->globnarrowarg;
             if (sl != NULL && sl->arg == bglob) {
                 bool refsleft = sl->refsleft;
                 Expr *rest = sl->rest;
@@ -4405,11 +4510,16 @@ static VRegnum TryInlineRestore(
             }
             {   Binder *b = bl->bindlistcar;
                 if (bindsym_(b) != bindsym_(bglob))
-                  syserr("Inline_Restore: argument substitution confused");
-                if (h0_(ex) != s_string)
-                  t = typeofexpr(ex);
+                    syserr("Inline_Restore: argument substitution confused");
+                if (argl->globnarrowarg != NULL) {
+                    b = argl->instantiatednarrowarg;
+                    t = argl->narrowtype;
+                    /*/* this optimise0 is questionable -- Harry will improve */
+                    ex = optimise0(mkcast(s_assign, ex, t));
+                } else if (h0_(ex) != s_string)
+                    t = typeofexpr(ex);
                 else
-                  t = mk_typeexpr1(s_content, primtype_(bitoftype_(s_char)), 0);
+                    t = mk_typeexpr1(s_content, primtype_(bitoftype_(s_char)), 0);
                 bindtype_(b) = t;
                 argvals = (ArgValList *)
                           syn_list2(argvals,
@@ -4418,6 +4528,10 @@ static VRegnum TryInlineRestore(
             }
         }
         emitsetsp(J_SETSPENV, rc.env);
+        if (px.ix_narrowspenv >= 0) {
+            BlockHead *insert = blkdown_(px.top_block);
+            emitsetsp(J_SETSPENV, blkcode_(insert)[px.ix_narrowspenv].r3.bl);
+        }
         argvals = (ArgValList *)dreverse((List *)argvals);
         for (; argvals != NULL; argvals = (ArgValList *)discard2(argvals))
             cg_exprvoid(argvals->init);
@@ -4426,28 +4540,73 @@ static VRegnum TryInlineRestore(
                                       (List *)px.var_binders);
     regvar_binders = (BindList *)nconc((List *)regvar_binders,
                                        (List *)px.reg_binders);
-    {   BlockHead *insert = blkdown_(px.top_block);
+    { /* We now try to merge both the first and last blocks of an inlined
+       * function with blocks from the caller: if the inlined function has just
+       * one block, it can be inlined without introducing any extra blocks
+       * (we _have_ created the labels for the blocks we won't be introducing,
+       * which will make the labels for real blocks sparser. Let's hope it
+       * doesn't matter.
+       * (firstblockmergeable and lastblockmergeable tell us whether we can)
+       */
+        BlockHead *insert = blkdown_(px.top_block);
         BlockHead *end_insert = px.bottom_block;
-        if (insert == end_insert) {
-        /* A simple straight line function: we can inline it without
-           introducing any extra blocks. (we _have_ created the labels for the
-           blocks we won't be introducing, which will make the labels for real
-           blocks sparser. Let's hope it doesn't matter.
-         */
+        if (insert == end_insert
+            || (px.firstblockmergeable
+                && blklab_(blkdown_(insert)) == blknext_(insert)
+                && !(blkflags_(insert) & BLKSWITCH))) {
             Icode *ic = blkcode_(insert);
-            int32 len = blklength_(insert);
-            for (; --len >= 0; ic++)
-                emit(ic->op, ic->r1.r, ic->r2.r, ic->m.i);
-        } else {
+            uint32 i = 0,
+                   len = blklength_(insert);
+            uint8 *ignoremap = px.firstblockignore;
+            for (; i < len; i++, ic++)
+                if (ignoremap == NULL)
+                  emitcopy(ic);
+                else {
+                  /* The narrowing store into an argument binder is turned into
+                   * a load, to guard against cg's desire to reuse a register
+                   * just stored rather than to load from the place just stored
+                   * to.
+                   */
+                  if ((ignoremap[(i+px.ix_max)/8] & regbit((i+px.ix_max)%8)) &&
+                      stores_r1(ic->op))
+                  { ic->op = J_XtoY(ic->op, J_STRK, J_LDRK);
+                    emitcopy(ic);
+                  }
+                  else if (!(ignoremap[i/8] & regbit(i%8)))
+                    emitcopy(ic);
+                }
+            if (blkflags_(insert) & BLK2EXIT)
+                emitbranch(J_B+(blkflags_(insert) & Q_MASK), blknext1_(insert));
+            if (insert == end_insert)
+                insert = NULL;        /* just one block to be inlined */
+            else
+                insert = blkdown_(insert);
+        }
+        if (insert != NULL) {
             BlockHead *insert_after = bottom_block;
             BlockHead *insert_before;
+            BlockHead *endblock = px.lastblockmergeable ? end_insert : NULL;
             emitbranch(J_B, blklab_(insert));
             if (debugging(DEBUG_CG)) {
                 BlockHead *b = insert;
-                for (; b != NULL; b = blkdown_(b))
+                for (; b != endblock; b = blkdown_(b))
                     flowgraf_printblock(b, NO);
             }
-            start_new_basic_block(rc.exitlabel);
+            if (px.lastblockmergeable) {
+                Icode *ic = blkcode_(endblock);
+                unsigned32 i = 0, len = blklength_(endblock);
+                active_binders = blkstack_(end_insert);
+                start_new_basic_block(blklab_(endblock));
+                for (; i < len; i++, ic++)
+                    emitcopy(ic);
+                if (insert == end_insert)
+                  end_insert = blkup_(bottom_block);
+                else
+                  end_insert = blkup_(endblock);
+            } else {
+                active_binders = blkstack_(blkdown_(px.top_block));
+                start_new_basic_block(rc.exitlabel);
+            }
             insert_before = bottom_block;  /* (the new block just started) */
             blkdown_(insert_after) = insert; blkup_(insert) = insert_after;
             blkdown_(end_insert) = insert_before;
@@ -4460,8 +4619,8 @@ static VRegnum TryInlineRestore(
 
     if (structresult != NULL) {
         int32 i;
-        if (structresultbinder != NULL &&
-            !(bindstg_(structresultbinder) & bitofstg_(s_auto)))
+        if (structresultbinder != NULL
+            && !(bindstg_(structresultbinder) & bitofstg_(s_auto)))
             structresultp = cg_expr(structresult);
         for (i = 0; i < rc.nresults; i++) {
             VRegnum r = rc.newresultregs[i];
@@ -4474,8 +4633,36 @@ static VRegnum TryInlineRestore(
             bfreeregister(r);
         }
         bfreeregister(structresultp);
+    } else if (resultisstruct) {
+        /* but structresult == NULL : move renamed result registers */
+        /* to result registers                                      */
+        int32 i;
+        for (i = 0; i < rc.nresults; i++) {
+            VRegnum r = rc.newresultregs[i];
+            emitreg(J_MOVR, rc.resultregs[i], GAP, r);
+            bfreeregister(r);
+        }
     }
     return resultr;
+}
+
+#define ptrtofn_(f) (mk_expr1(s_addrof, ptrtotype_(typeofexpr(f)), (f)))
+
+static int32 LengthOfString(String *p) {
+    int32 n = 0;
+    StringSegList *s = p->strseg;
+    for ( ; s != NULL ; s = s->strsegcdr) {
+      size_t l = (size_t)s->strseglen;
+      if (l > 0) {
+        size_t l1 = strlen(s->strsegbase);
+        if (l1 < l) {
+          n += l1;
+          break;
+        }
+        n += l;
+      }
+    }
+    return n;
 }
 
 static VRegnum open_compilable(Expr **xp, RegSort rsort, bool valneeded)
@@ -4508,7 +4695,7 @@ static VRegnum open_compilable(Expr **xp, RegSort rsort, bool valneeded)
     }
 #ifdef TARGET_INLINES_MONADS    /* distinctly special case-ish          */
     if (narg == 1) {
-        int32 i = target_inlinable((Binder *)fname, narg);
+        int32 i = target_inlinable(exb_(fname), narg);
         if (i) {
             VRegnum r1 = cg_expr(a1);
             VRegnum targetreg = fgetregister(rsort);
@@ -4533,25 +4720,33 @@ static VRegnum open_compilable(Expr **xp, RegSort rsort, bool valneeded)
         return cg_fnap(mk_expr2(s_fnap, te_uint, sim.udivfn, (Expr *)exprfnargs_(x)),
                        R_A1+1, YES);
 #endif
+    if (fname == sim.llsrem && narg == 3)
+        return cg_fnap(mk_expr2(h0_(x), te_llint, ptrtofn_(sim.llsdiv), (Expr *)exprfnargs_(x)),
+                       R_A1+2, YES);
+    else if (fname == sim.llurem && narg == 3)
+        return cg_fnap(mk_expr2(h0_(x), te_ullint, ptrtofn_(sim.lludiv), (Expr *)exprfnargs_(x)),
+                       R_A1+2, YES);
+    else if (fname == sim.llsrrem && narg == 3)
+        return cg_fnap(mk_expr2(h0_(x), te_llint, ptrtofn_(sim.llsrdv), (Expr *)exprfnargs_(x)),
+                       R_A1+2, YES);
+    else if (fname == sim.llurrem && narg == 3)
+        return cg_fnap(mk_expr2(h0_(x), te_ullint, ptrtofn_(sim.llurdv), (Expr *)exprfnargs_(x)),
+                       R_A1+2, YES);
 
-    if (bindsym_((Binder *)fname) == sim.strcpysym) {
+    if (bindsym_(exb_(fname)) == sim.strcpysym) {
       if (narg == 2 && h0_(a2) == s_string) {         /* isstring_()? */
-        int32 n = 0;
-        StringSegList *s = ((String *)a2)->strseg;
-        for ( ; s != NULL ; s = s->strsegcdr) {
-          size_t l = s->strseglen;
-          if (l > 0) {
-            size_t l1 = strlen(s->strsegbase);
-            if (l < l) {
-              n += l1;
-              break;
-            }
-            n += l;
-          }
-        }
+        int32 n = LengthOfString(exs_(a2));
         *xp = mk_expr2(s_fnap, type_(x), sim.realmemcpyfn,
                        mkArgList3(a1, a2, mkintconst(te_int, n+1, 0)));
         return open_compilable(xp, rsort, valneeded);
+      } else
+        return NOT_OPEN_COMPILABLE;
+    }
+
+    if (bindsym_(exb_(fname)) == sim.strlensym) {
+      if (narg == 1 && h0_(a1) == s_string) {         /* isstring_()? */
+        int32 n = LengthOfString(exs_(a1));
+        return cg_expr(mkintconst(te_int, n, 0));
       } else
         return NOT_OPEN_COMPILABLE;
     }
@@ -4560,44 +4755,46 @@ static VRegnum open_compilable(Expr **xp, RegSort rsort, bool valneeded)
 /* It must be still in flux...                                          */
 #define structptrlike(e) ((alignofpointee(e,1) & (MOVC_ALIGN_MIN-1)) == 0)
 #ifdef TARGET_HAS_BLOCKMOVE
-#  define cg_inlineable_size(n) ((n & (MEMCPYQUANTUM-1)) == 0)
+#  define cg_inlineable_size(n) (((n) & (MEMCPYQUANTUM-1)) == 0)
 #else
 /* Currently the non-J_MOVC expansion below only works for mults of 4,   */
 /* and then only if guaranteed 4-byte aligned.                           */
 #  define cg_inlineable_size(n) (alignof_struct >= 4 && (n & 3) == 0)
 #endif
 
-    if (bindsym_((Binder *)fname) == bindsym_((Binder *)arg1_(sim.realmemcpyfn)) &&
+    if (bindsym_(exb_(fname)) == bindsym_(exb_(arg1_(sim.realmemcpyfn))) &&
         !valneeded && narg == 3 &&
         h0_(a3) == s_integer &&
-        structptrlike(a1) && structptrlike(a2))
+        ((n = intval_(a3)) < MEMCPYQUANTUM ||
+         (structptrlike(a1) && structptrlike(a2))))
     {   Expr *x1;
         Expr *args = (Expr *)exprfnargs_(x);
-        n = intval_(a3);
         if (!cg_inlineable_size(n)) {
             int32 padding;
             int32 destsize = sizeofpointee(a1, &padding);
-            if (n != destsize || padding == 0 || !cg_inlineable_size(destsize+padding))
+            if (n == destsize && padding != 0 && cg_inlineable_size(destsize+padding))
+                args = mkArgList3(a1, a2, mkintconst(te_int, destsize+padding, 0));
+            else if (n >= MEMCPYQUANTUM)
                 return NOT_OPEN_COMPILABLE;
-            args = mkArgList3(a1, a2, mkintconst(te_int, destsize+padding, 0));
         }
         x1 = mk_expr2(s_fnap, type_(x), sim.memcpyfn, args);
         return open_compilable(&x1, rsort, valneeded);
     }
-    if (bindsym_((Binder *)fname) == bindsym_((Binder *)arg1_(sim.realmemsetfn)) &&
+    if (bindsym_(exb_(fname)) == bindsym_(exb_(arg1_(sim.realmemsetfn))) &&
         narg == 3 &&
         h0_(a2) == s_integer && intval_(a2) == 0 &&
         h0_(a3) == s_integer &&
-        structptrlike(a1) && 0)         /* coming to exist */
+        ((n = intval_(a3)) < MEMCPYQUANTUM ||
+         structptrlike(a1)) && 0)         /* coming to exist */
     {   Expr *x1;
         Expr *args = (Expr *)exprfnargs_(x);
-        n = intval_(a3);
         if (!cg_inlineable_size(n)) {
             int32 padding;
             int32 destsize = sizeofpointee(a1, &padding);
-            if (n != destsize || padding == 0 || !cg_inlineable_size(destsize+padding))
+            if (n == destsize && padding != 0 && cg_inlineable_size(destsize+padding))
+                args = mkArgList3(a1, a2, mkintconst(te_int, destsize+padding, 0));
+            else if (n >= MEMCPYQUANTUM)
                 return NOT_OPEN_COMPILABLE;
-            args = mkArgList3(a1, a2, mkintconst(te_int, destsize+padding, 0));
         }
         x1 = mk_expr2(s_fnap, type_(x), sim.memsetfn, args);
         return open_compilable(&x1, rsort, valneeded);
@@ -4607,20 +4804,16 @@ static VRegnum open_compilable(Expr **xp, RegSort rsort, bool valneeded)
 /* _memcpy() and _memset() and then only if it has just 3 args, the      */
 /* last of which is an integer with value >= 0 & a multiple of           */
 /* alignof_struct (@@@ this last comment becoming out-of-date).          */
-    if (bindsym_((Binder *)fname) == bindsym_((Binder *)arg1_(sim.memcpyfn)) &&
+    if (bindsym_(exb_(fname)) == bindsym_(exb_(arg1_(sim.memcpyfn))) &&
         narg == 3 && h0_(a3) == s_integer &&
-        (n = intval_(a3)) >= 0 && cg_inlineable_size(n))
+        (n = intval_(a3)) >= 0 &&
+        (n < MEMCPYQUANTUM || cg_inlineable_size(n)))
     { VRegnum r1, r2;
       int32 align = alignofpointee(a1, 1);
       int32 al2 = alignofpointee(a2, 1);
       if (al2 < align) align = al2;
       if (align > MOVC_ALIGN_MAX) align = MOVC_ALIGN_MAX;
-      if (align >= MOVC_ALIGN_MIN)
-#ifdef TARGET_IS_SPARC
-/* We need some parameterisation like the following to allow a run-time */
-/* memcpy() to check the alignment is really as bad as we suspect.      */
-        if (align < 4 && n > 64) return NOT_OPEN_COMPILABLE;
-#endif
+      if (n < MEMCPYQUANTUM || align >= MOVC_ALIGN_MIN)
       { int32 j_align = align & 1 ? J_ALIGN1 :
                         align & 2 ? J_ALIGN2 :
                         align & 4 ? J_ALIGN4 : J_ALIGN8;
@@ -4628,33 +4821,13 @@ static VRegnum open_compilable(Expr **xp, RegSort rsort, bool valneeded)
  * Here we break pay the penalty for having pretended that the ARM has
  * a block move instruction - we have to deny it at this stage.
  */
-#if defined (TARGET_HAS_BLOCKMOVE) && !defined(TARGET_IS_ARM_OR_THUMB)
-        spareregs += 2;
-        r1 = cg_expr(a1);
-        r2 = cg_expr(a2);
-        spareregs -= 2;
-#  ifdef TARGET_IS_ACW          /* really #if corrupts_MOVC_regs or so. */
-        if (n > 16)             /* see related code in regalloc.c       */
-        {  VRegnum r3, r4;
-           r3 = fgetregister(INTREG);
-           r4 = fgetregister(INTREG);
-           emitreg(J_MOVR, r3, GAP, r1);
-           emitreg(J_MOVR, r4, GAP, r2);
-           emit(J_MOVC|j_align, r3, r4, n);
-           bfreeregister(r3);
-           bfreeregister(r4);
-        }
-        else
-#  endif
-          emit(J_MOVC|j_align, r1, r2, n);   /* must NOT corrupt r1 */
-#else  /* TARGET_HAS_BLOCKMOVE */
-        { VRegnum r3;
-#ifdef TARGET_IS_ARM_OR_THUMB
+        {
 /* ARM experiment with MOVC underway.  Copy of a single word is turned into
    LOAD+STORE, as easier for CSE to optimise away if appropriate.  Actually,
    I suppose that this is a good idea for all targets. Longer moves
    get turned into a MOVC (which destroys its argument registers if the move
    is longer than the number of registers I'm prepared to guarantee available).
+   WD: should we do this for 2 words (doubles) too?
  */
           if (n >= 8) {
             procflags |= PROC_HASMOVC;
@@ -4669,133 +4842,107 @@ static VRegnum open_compilable(Expr **xp, RegSort rsort, bool valneeded)
              */
               emit(J_MOVC|j_align, r1, r2, n);   /* must NOT corrupt r1 */
             else {
-              r3 = fgetregister(INTREG);
+              VRegnum r3 = fgetregister(INTREG);
               emitreg(J_MOVR, r3, GAP, r1);
               emit(J_MOVC|j_align, r3, r2, n);
               bfreeregister(r3);
             }
           }
-#else /* TARGET_IS_ARM */
-/* For very short moves I just do LOAD/STORE sequences. For longer ones  */
-/* I synthesize a loop.                                                  */
-          if (n >= 5*MEMCPYQUANTUM)
-          {
-            LabelNumber *ll = nextlabel();
-            VRegnum r4;
-            spareregs += 2;
-            r1 = cg_expr(a1);
-            r2 = cg_expr(a2);
-            spareregs -= 2;
-            r3 = fgetregister(MEMCPYREG);
-            r4 = fgetregister(INTREG);
-#ifndef TARGET_LACKS_RR_STORE
-#  ifdef TARGET_IS_88000
-/*
- * The following code is designed to exploit a Motorola 88000 by
- * giving scope for at least some overlap of memory transactions. On some
- * other machines it may be a DISASTER because it needs two more scratch
- * registers.  Hence at present it is guarded by the machine type.  It
- * is by now pretty clear that most targets should support blockmoves
- * at the level of gen.c.
- */
-            if ((n & 4) == 0)           /* move an even number of words */
-            {   VRegnum r5 = fgetregister(INTREG),
-                        r6 = fgetregister(INTREG);
-                emit(J_MOVK, r4, GAP, n-4);
-                start_new_basic_block(ll);
-                emitreg(J_LDRR|J_ALIGN4, r3, r2, r4);
-                emit(J_SUBK, r5, r4, 4);
-                emitreg(J_LDRR|J_ALIGN4, r6, r2, r5);
-                emitreg(J_STRR|J_ALIGN4, r3, r1, r4);
-                emit(J_SUBK, r4, r5, 4);
-                emitreg(J_STRR|J_ALIGN4, r6, r1, r5);
-                emit(J_CMPK + Q_GE, GAP, r4, 0);
-                emitbranch(J_B + Q_GE, ll);
-                bfreeregister(r6);
-                bfreeregister(r5);
-                bfreeregister(r4);
-                bfreeregister(r3);
-            }
-            else            /* odd number of words to move */
-#  endif
-#endif
-            {
-#  ifdef TARGET_PREFER_CMPEQZ
-                if (n & 3) syserr("MOVC/CLRC not multiple of 4");
-                emit(J_MOVK, r4, GAP, n);
-#  else
-                emit(J_MOVK, r4, GAP, n-MEMCPYQUANTUM);
-#  endif
-#  ifdef TARGET_LACKS_RR_LOAD
-                    emit(J_ADDK, r2, r2, n);
-#  endif
-#  ifdef TARGET_LACKS_RR_STORE
-                    emit(J_ADDK, r1, r1, n);
-#  endif
-                start_new_basic_block(ll);
-#  ifdef TARGET_LACKS_RR_LOAD
-                emit(J_SUBK, r2, r2, MEMCPYQUANTUM);
-                emit(J_memcpy(J_LDRK|J_ALIGN4), r3, r2, 0);
-#  else
-                emitreg(J_memcpy(J_LDRR|J_ALIGN4), r3, r2, r4);
-#  endif
-#  ifdef TARGET_LACKS_RR_STORE
-                emit(J_SUBK, r1, r1, MEMCPYQUANTUM);
-                emit(J_memcpy(J_STRK|J_ALIGN4), r3, r1, 0);
-#  else
-                emitreg(J_memcpy(J_STRR|J_ALIGN4), r3, r1, r4);
-#  endif
-                emit(J_SUBK, r4, r4, MEMCPYQUANTUM);
-#  ifdef TARGET_PREFER_CMPEQZ
-                emit(J_CMPK + Q_NE, GAP, r4, 0);
-                emitbranch(J_B + Q_NE, ll);
-#  else
-                emit(J_CMPK + Q_GE, GAP, r4, 0);
-                emitbranch(J_B + Q_GE, ll);
-#  endif
-                bfreeregister(r4);
-                bfreeregister(r3);
-            }
-          }
-#endif
           else
           { Binder *loadv = is_local_adcon(a2),
                    *storev = is_local_adcon(a1);
-            bool load_notvk = NO,
-                 store_notvk = NO;
+            r1 = GAP; r2 = GAP;
             spareregs += 2;
-            if (storev != NULL) {
-                r1 = GAP;
-                if ((mcrepofexpr((Expr *)storev) & MCR_SORT_MASK) < MCR_SORT_FLOATING)
-                    store_notvk = YES;
-            } else
-                r1 = cg_expr(a1);
-            if (loadv != NULL) {
-                r2 = GAP;
-                if ((mcrepofexpr((Expr *)loadv) & MCR_SORT_MASK) < MCR_SORT_FLOATING)
-                    load_notvk = YES;
-            } else
-                r2 = cg_expr(a2);
-            spareregs -= 2;
-            r3 = fgetregister(MEMCPYREG);
-            while ((n -= MEMCPYQUANTUM) >= 0)
-            {   if (load_notvk)
-                    emitbinder(J_LDRV|J_ALIGN4, r3, loadv);
-                else if (loadv)
-                    emitvk(J_memcpy(J_LDRVK|J_ALIGN4), r3, n, loadv);
-                else
-                    emit(J_memcpy(J_LDRK|J_ALIGN4), r3, r2, n);
-                if (store_notvk)
-                    emitbinder(J_STRV|J_ALIGN4, r3, storev);
-                else if (storev)
-                    emitvk(J_memcpy(J_STRVK|J_ALIGN4), r3, n, storev);
-                else
-                    emit(J_memcpy(J_STRK|J_ALIGN4), r3, r1, n);
+            if (n < MEMCPYQUANTUM) {
+                VRegnum r3;
+                if (storev == NULL ||
+                    (mcrepofexpr((Expr *)storev) & MCR_SORT_MASK) < MCR_SORT_FLOATING)
+                    r1 = cg_expr(a1);
+                if (loadv == NULL ||
+                    (mcrepofexpr((Expr *)loadv) & MCR_SORT_MASK) < MCR_SORT_FLOATING)
+                    r2 = cg_expr(a2);
+                spareregs -= 2;
+                r3 = fgetregister(MEMCPYREG);
+                while (--n >= 0)
+                {   if (r2 != GAP)
+                        emit(J_LDRBK|J_ALIGN1, r3, r2, n);
+                    else
+                        emitvk(J_LDRBVK|J_ALIGN1, r3, n, loadv);
+                    if (r1 != GAP)
+                        emit(J_STRBK|J_ALIGN1, r3, r1, n);
+                    else
+                        emitvk(J_STRBVK|J_ALIGN1, r3, n, storev);
+                }
+                bfreeregister(r3);
+            } else if (n == sizeof_int && !valneeded) {
+                Expr *e = mk_expr2(s_assign, te_int,
+                                    mk_expr1(s_content, te_int,
+                                      optimise0(mk_expr1(s_cast, ptrtotype_(te_int), a1))),
+                                    mk_expr1(s_content, te_int,
+                                      optimise0(mk_expr1(s_cast, ptrtotype_(te_int), a2))));
+                cg_exprvoid(e);
+
+            } else {
+                VRegnum r3, r4;
+                bool load_notvk = NO,
+                     store_notvk = NO;
+                if (storev != NULL) {
+                    if ((mcrepofexpr((Expr *)storev) & MCR_SORT_MASK) < MCR_SORT_FLOATING)
+                        store_notvk = YES;
+                } else
+                    r1 = cg_expr(a1);
+                if (loadv != NULL) {
+                    if ((mcrepofexpr((Expr *)loadv) & MCR_SORT_MASK) < MCR_SORT_FLOATING)
+                        load_notvk = YES;
+                } else
+                    r2 = cg_expr(a2);
+                spareregs -= 2;
+                /* WD - experiment: generate result delay scheduled code */
+                r3 = fgetregister(MEMCPYREG);
+                r4 = fgetregister(MEMCPYREG);
+                while ((n -= 2 * MEMCPYQUANTUM) >= 0)
+                {   if (loadv == NULL) {
+                        emit(J_memcpy(J_LDRK|J_ALIGN4), r3, r2, n);
+                        emit(J_memcpy(J_LDRK|J_ALIGN4), r4, r2, n + MEMCPYQUANTUM);
+                    } else if (load_notvk) {
+                        emitbinder(J_LDRV|J_ALIGN4, r3, loadv);
+                        emitbinder(J_LDRV|J_ALIGN4, r4, loadv);
+                    } else {
+                        emitvk(J_memcpy(J_LDRVK|J_ALIGN4), r3, n, loadv);
+                        emitvk(J_memcpy(J_LDRVK|J_ALIGN4), r4, n + MEMCPYQUANTUM, loadv);
+                    }
+                    if (storev == NULL) {
+                        emit(J_memcpy(J_STRK|J_ALIGN4), r3, r1, n);
+                        emit(J_memcpy(J_STRK|J_ALIGN4), r4, r1, n + MEMCPYQUANTUM);
+                    } else if (store_notvk) {
+                        emitbinder(J_STRV|J_ALIGN4, r3, storev);
+                        emitbinder(J_STRV|J_ALIGN4, r4, storev);
+                    } else {
+                        emitvk(J_memcpy(J_STRVK|J_ALIGN4), r3, n, storev);
+                        emitvk(J_memcpy(J_STRVK|J_ALIGN4), r4, n + MEMCPYQUANTUM, storev);
+                    }
+                }
+                bfreeregister(r4);
+                n += 2 * MEMCPYQUANTUM;
+                while ((n -= MEMCPYQUANTUM) >= 0)
+                {   if (loadv == NULL)
+                        emit(J_memcpy(J_LDRK|J_ALIGN4), r3, r2, n);
+                    else if (load_notvk)
+                        emitbinder(J_LDRV|J_ALIGN4, r3, loadv);
+                    else
+                        emitvk(J_memcpy(J_LDRVK|J_ALIGN4), r3, n, loadv);
+
+                    if (storev == NULL)
+                        emit(J_memcpy(J_STRK|J_ALIGN4), r3, r1, n);
+                    else if (store_notvk)
+                        emitbinder(J_STRV|J_ALIGN4, r3, storev);
+                    else
+                        emitvk(J_memcpy(J_STRVK|J_ALIGN4), r3, n, storev);
+                }
+                bfreeregister(r3);
             }
-            bfreeregister(r3);
           }
         }
-#endif  /* TARGET_HAS_BLOCKMOVE */
         bfreeregister(r2);
         return r1;
       }
@@ -4805,24 +4952,27 @@ static VRegnum open_compilable(Expr **xp, RegSort rsort, bool valneeded)
  * were there are 3 args and the second and third args are
  * zero and divisible by alignof_struct exactly.
  */
-    if (bindsym_((Binder *)fname) == bindsym_((Binder *)arg1_(sim.memsetfn)) &&
+    if (bindsym_(exb_(fname)) == bindsym_(exb_(arg1_(sim.memsetfn))) &&
         narg == 3 &&
         h0_(a2) == s_integer && intval_(a2) == 0 &&
-        h0_(a3) == s_integer && (n = intval_(a3)) >= 0 && cg_inlineable_size(n))
+        h0_(a3) == s_integer &&
+        (n = intval_(a3)) >= 0 &&
+        (n < MEMCPYQUANTUM || cg_inlineable_size(n)))
     { VRegnum r1;
         /* @@@ currently _memset/J_CLRC implies at least J_ALIGN4.      */
       int32 align = alignofpointee(a1, 1);
-      if (!(align & 3))
-      {
+      if (n < MEMCPYQUANTUM || !(align & 3))
+      { VRegnum r2;
 #if defined (TARGET_HAS_BLOCKMOVE) && !defined(TARGET_IS_ARM)
-        spareregs += 1;                 /* duh?                         */
-        r1 = cg_expr(a1);
-        spareregs -= 1;
-        emit(J_CLRC|J_ALIGN4, r1, GAP, n);      /* must NOT corrupt r1? */
+        if (n >= MEMCPYQUANTUM) {
+          spareregs += 1;                 /* duh?                         */
+          r1 = cg_expr(a1);
+          spareregs -= 1;
+          emit(J_CLRC|J_ALIGN4, r1, GAP, n);      /* must NOT corrupt r1? */
+        }
 #else  /* TARGET_HAS_BLOCKMOVE */
 /* For very short memset's I just do STORE sequences. For longer ones  */
 /* I synthesize a loop.                                                */
-        VRegnum r2;
 #ifdef TARGET_IS_ARM
         if (n >= 8) {
           procflags |= PROC_HASMOVC;
@@ -4846,12 +4996,7 @@ static VRegnum open_compilable(Expr **xp, RegSort rsort, bool valneeded)
             r2 = MEMCPYREG==DBLREG ? cg_loadfpzero(DBLREG,0) : cg_expr(a2);
             spareregs -= 2;
             r3 = fgetregister(INTREG);
-#  ifdef TARGET_PREFER_CMPEQZ
-            if (n & 3) syserr("MOVC/CLRC not multiple of 4");
-            emit(J_MOVK, r3, GAP, n);
-#  else
             emit(J_MOVK, r3, GAP, n-MEMCPYQUANTUM);
-#  endif
 #ifdef TARGET_LACKS_RR_STORE
                 emit(J_ADDK, r1, r1, n);
 #endif
@@ -4863,76 +5008,83 @@ static VRegnum open_compilable(Expr **xp, RegSort rsort, bool valneeded)
                 emitreg(J_memcpy(J_STRR|J_ALIGN4), r2, r1, r3);
 #endif
             emit(J_SUBK, r3, r3, MEMCPYQUANTUM);
-#  ifdef TARGET_PREFER_CMPEQZ
-            emit(J_CMPK + Q_NE, GAP, r3, 0);
-            emitbranch(J_B + Q_NE, ll);
-#  else
             emit(J_CMPK + Q_GE, GAP, r3, 0);
             emitbranch(J_B + Q_GE, ll);
-#  endif
             bfreeregister(r3);
             bfreeregister(r2);
         }
 #endif
+#endif  /* TARGET_HAS_BLOCKMOVE */
         else
         {   Binder *storev = is_local_adcon(a1);
-            bool store_notvk = NO;
+            r1 = GAP;
             spareregs += 2;
-            if (storev != NULL) {
-                r1 = GAP;
-                if ((mcrepofexpr((Expr *)storev) & MCR_SORT_MASK) < MCR_SORT_FLOATING)
-                    store_notvk = YES;
-            } else
-                r1 = cg_expr(a1);
-            r2 = MEMCPYREG==DBLREG && !store_notvk ? cg_loadfpzero(DBLREG,0) :
-                                                     cg_expr(a2);
-            spareregs -= 2;
-            while ((n -= MEMCPYQUANTUM) >= 0)
-            {
-                if (store_notvk)
-                    emitbinder(J_STRV|J_ALIGN4, r2, storev);
-                else if (storev)
-                    emitvk(J_memcpy(J_STRVK|J_ALIGN4), r2, n, storev);
-                else
-                    emit(J_memcpy(J_STRK|J_ALIGN4), r2, r1, n);
+            if (n < MEMCPYQUANTUM) {
+                if (storev == NULL ||
+                    (mcrepofexpr((Expr *)storev) & MCR_SORT_MASK) < MCR_SORT_FLOATING)
+                    r1 = cg_expr(a1);
+                r2 = cg_expr(a2);
+                spareregs -= 2;
+                while (--n >= 0) {
+                    if (r1 != GAP)
+                        emit(J_STRBK|J_ALIGN1, r2, r1, n);
+                    else
+                        emitvk(J_STRBVK|J_ALIGN1, r2, n, storev);
+                }
+            } else {
+                bool store_notvk = NO;
+                if (storev != NULL) {
+                    if ((mcrepofexpr((Expr *)storev) & MCR_SORT_MASK) < MCR_SORT_FLOATING)
+                        store_notvk = YES;
+                } else
+                    r1 = cg_expr(a1);
+                r2 = MEMCPYREG==DBLREG && !store_notvk ? cg_loadfpzero(DBLREG,0) :
+                                                         cg_expr(a2);
+                spareregs -= 2;
+                while ((n -= MEMCPYQUANTUM) >= 0) {
+                    if (storev == NULL)
+                        emit(J_memcpy(J_STRK|J_ALIGN4), r2, r1, n);
+                    else if (store_notvk)
+                        emitbinder(J_STRV|J_ALIGN4, r2, storev);
+                    else
+                        emitvk(J_memcpy(J_STRVK|J_ALIGN4), r2, n, storev);
+                }
             }
             bfreeregister(r2);
         }
-#endif  /* TARGET_HAS_BLOCKMOVE */
         return r1;
       }
     }
-    if (bindsym_((Binder *)fname) == bindsym_((Binder *)arg1_(sim.memcpyfn))) {
+    if (bindsym_(exb_(fname)) == bindsym_(exb_(arg1_(sim.memcpyfn)))) {
       /* _memcpy which has failed to be expanded in-line (length or alignment
          wrong - can only happen with __packed structs).
        */
         *xp = mk_expr2(s_fnap, type_(x), sim.realmemcpyfn, (Expr *)exprfnargs_(x));
         return NOT_OPEN_COMPILABLE;
     }
-    if (bindsym_((Binder *)fname) == bindsym_((Binder *)arg1_(sim.memsetfn))) {
+    if (bindsym_(exb_(fname)) == bindsym_(exb_(arg1_(sim.memsetfn)))) {
       /* _memset which has failed to be expanded in-line (see above) */
         *xp = mk_expr2(s_fnap, type_(x), sim.realmemsetfn, (Expr *)exprfnargs_(x));
         return NOT_OPEN_COMPILABLE;
     }
-    if (bindsym_((Binder *)fname) ==
-        bindsym_((Binder *)arg1_(sim.inserted_word)) &&
-        narg == 1 && h0_(a1) == s_integer)
+    if (bindsym_(exb_(fname)) == bindsym_(exb_(arg1_(sim.inserted_word)))
+        && narg == 1 && h0_(a1) == s_integer)
     {
 /* _word(nnn) will plant nnn in the code - for EXPERT/lunatic use only! */
         emit(J_WORD, GAP, GAP, intval_(a1));
         return R_A1; /* /* Resultregister wanted here? */
     }
 
-    if ((bindstg_((Binder *)fname) & bitofstg_(s_inline)) &&
+    if ((bindstg_(exb_(fname)) & bitofstg_(s_inline)) &&
         !(var_cc_private_flags & 8192L)) {
         Expr *structresult = NULL;
         ExprList *args = exprfnargs_(x);
-        if (returnsstructinregs_t(bindtype_((Binder *)fname)))
+        if (returnsstructinregs_t(bindtype_(exb_(fname))))
             if (h0_(x) != s_fnap) {
                 structresult = exprcar_(args);
                 args = cdr_(args);
             }
-        return TryInlineRestore((Binder *)fname, args, structresult, rsort, valneeded);
+        return TryInlineRestore(exb_(fname), args, structresult, rsort, valneeded);
     }
 
     return NOT_OPEN_COMPILABLE;
@@ -5028,7 +5180,8 @@ static void set_local_vregister(Binder *b, int32 rep, bool isarg)
     else local_binders = mkBindList(local_binders, b);
 }
 
-static void init_slave_reg(Binder *b, int32 nfltregargs, int32 nintregargs)
+static void init_slave_reg(
+    Binder *b, int32 argno, int32 nfltregwords, int32 nintregargs)
 /* b is the binder for a potentially registered argument variable. Load  */
 /* its initial value from the place where the relevant argument was      */
 /* passed - register a1 to a4 for simple cases and the stack otherwise.  */
@@ -5039,12 +5192,8 @@ static void init_slave_reg(Binder *b, int32 nfltregargs, int32 nintregargs)
     int32 n = addr / alignof_toplevel_auto;
     VRegnum v = bindxx_(b);
     if (v != GAP)
-    {   int32 ni = n - (8/alignof_toplevel_auto)*nfltregargs;
-#ifdef TARGET_IS_MIPS
-        int32 ir = n;   /* flt regs cause 'missing' int reg args.       */
-#else
+    {   int32 ni = n - nfltregwords;
         int32 ir = ni;
-#endif
         RegSort rsort = vregsort(v);
 #ifdef TARGET_STRUCT_RESULT_REGISTER
         if (b == result_variable)
@@ -5056,11 +5205,7 @@ static void init_slave_reg(Binder *b, int32 nfltregargs, int32 nintregargs)
 /* @@@ The following lines need tidying (remember adenart stops         */
 /* collecting args when it sees a struct (parameterise!)).              */
 /* @@@ Are the other NARGREGS's below OK too?                           */
-#ifdef TARGET_IS_MIPS
-            if (ir < NARGREGS)
-#else
             if (0 <= ni && ni < nintregargs)
-#endif
               emitreg(J_MOVR, v, GAP, R_P1+ir);
             else emitbinder(J_LDRV1|J_ALIGN4V, v, b);
         }
@@ -5070,7 +5215,7 @@ static void init_slave_reg(Binder *b, int32 nfltregargs, int32 nintregargs)
 /* J_MOVIFR has to copy a bit-pattern from an integer register into one */
 /* of the FP registers.                                                 */
         {   if (ni < 0)
-              emitreg(J_MOVDFR, v, GAP, R_FP1+addr/sizeof_double);
+              emitreg(J_MOVFR, v, GAP, R_FP1+argno);
             else if (ir < NARGREGS)
 #ifdef TARGET_SHARES_INTEGER_AND_FP_REGISTERS
               emitreg(J_MOVFR, v, GAP, R_P1+ir);
@@ -5081,23 +5226,13 @@ static void init_slave_reg(Binder *b, int32 nfltregargs, int32 nintregargs)
                 emitbinder(J_LDRFV1|J_ALIGN4V, v, b);
         }
         else
-#ifdef TARGET_FP_ARGS_CALLSTD2  /* shared arg reg space, e.g. r0,f1,r2  */
-        {   if (n < NARGREGS)
-                emitreg(J_MOVDR, v, GAP, R_FP1+addr/sizeof_double);
-            else
-                emitbinder(J_LDRDV1|J_ALIGN8, v, b);
-        }
-#else
 /* If I have a double-precision arg the value is passed in two integers  */
 /* and here I must be prepared to move it into a doubleprecision FP      */
 /* register.                                                             */
         {   if (ni < 0)
 /* The following line assumes FPREGARGS are arranged to appear first...  */
-              emitreg(J_MOVDR, v, GAP, R_FP1+addr/sizeof_double);
+              emitreg(J_MOVDR, v, GAP, R_FP1+argno);
             else
-#ifdef TARGET_IS_ADENART
-              emitbinder(J_LDRDV1|J_ALIGN8, v, b);
-#else
             if (ir < NARGREGS-1)
                 emitreg(J_MOVIDR, v, R_P1+ir, R_P1+ir+1);
             else
@@ -5109,9 +5244,7 @@ static void init_slave_reg(Binder *b, int32 nfltregargs, int32 nintregargs)
             {   if (ir == NARGREGS-1) procflags |= PROC_ARGPUSH;
                 emitbinder(J_LDRDV1|J_ALIGN8, v, b);
             }
-#endif
         }
-#endif /* !TARGET_FP_ARGS_CALLSTD2 */
     }
 }
 
@@ -5144,11 +5277,7 @@ static int32 cg_bindargs_size(BindList *args)
         int32 rep = mcrepofexpr((Expr *)b);
 /* Things in an argument list can only have s_auto storage class     */
         if (!(bindstg_(b) & bitofstg_(s_auto))) syserr(syserr_nonauto_arg);
-#ifdef TARGET_IS_SPARC
-        argoff = padtomcrep(argoff, rep & ~MCR_ALIGN_DOUBLE);
-#else
         argoff = padtomcrep(argoff, rep);
-#endif
         set_local_vregister(b, rep, 1);
         bindaddr_(b) = argoff | BINDADDR_ARG;
         argoff += padsize(rep & MCR_SIZE_MASK, alignof_toplevel_auto);
@@ -5156,44 +5285,6 @@ static int32 cg_bindargs_size(BindList *args)
     return argoff;
 }
 
-
-
-#ifdef TARGET_IS_ADENART
-/* On this target we allow only 'int' values into int regs.             */
-static int32 cg_nintregargs(BindList *args, bool ellipsis)
-{   int32 n=0;
-    BindList *x;
-    for (x = args; x != NULL; x = x->bindlistcdr)
-    {   Binder *b = x->bindlistcar;
-        unsigned32 repsort = mcrepofexpr((Expr *)b) >> MCR_SORT_SHIFT;
-        if (repsort >= 2) return n;
-        n++;
-    }
-    return ellipsis ? NARGREGS : n;
-}
-
-/* this should arguably be in syn...                                    */
-static Cmd *adenart_call(Cmd *c, SynBindList *formals)
-{   Expr *arginit = 0;
-    SynBindList *f;
-    int32 n = FIRST_ADETRAN_ARG;
-    for (f = formals; f != NULL; f = f->bindlistcdr)
-    {   Binder *b = f->bindlistcar;
-        TypeExpr *bt = bindtype_(b);
-/* A call from adetran has args in 0x101,0x102... with pointers         */
-/* encoded as WORD pointers.  Convert to C byte pointers.               */
-        Expr *e = mkunary(s_content, mkintconst(ptrtotype_(bt), 8*n++, 0));
-        e = mkbinary(s_init, (Expr *)b,
-              h0_(princtype(bt)) == t_content ?
-                mk_expr2(s_leftshift, bt, e, mkintconst(te_int,3,0)) : e);
-        arginit = arginit ? mkbinary(s_comma, arginit, e) : e;
-    }
-    arginit = cg_optimise0(arginit);
-    return arginit==0 ? c : mk_cmd_block(c->fileline, formals,
-        mkCmdList(mkCmdList(0, c),
-                  mk_cmd_e(s_semicolon, c->fileline, arginit)));
-}
-#endif
 
 /* One might worry here about functions that specify their formals with  */
 /* a type such as char, short or float.  For language independence sem.c */
@@ -5211,7 +5302,8 @@ static int32 cg_bindargs(BindList *args, bool ellipsis)
 {
     BindList *x;
     int32 argoff, lyingargwords;
-    int32 nfltregargs = 0, nintregargs = 0;
+    int32 nfltregargs = 0, nintregargs = 0, nfltregwords = 0;
+    int32 argno = 0;
 
 /* If ANY argument has its address taken I mark ALL arguments as having  */
 /* their address taken, unless the user has declared them as registers.  */
@@ -5233,13 +5325,13 @@ static int32 cg_bindargs(BindList *args, bool ellipsis)
         for (x = args; x != NULL; x = x->bindlistcdr) {
             Binder *b = x->bindlistcar;
             BindList *newbl = mkBindList(NULL, b);
-            int32 repsort = mcrepofexpr((Expr *)b) >> MCR_SORT_SHIFT;
-            if (repsort == 2 && nfltregargs < NFLTARGREGS
-#ifdef TARGET_IS_MIPS           /* only LEADING flt args in flt regs.   */
-                             && intargs == NULL
-#endif
+            int32 rep = mcrepofexpr((Expr *)b);
+            if ((rep & MCR_SORT_MASK) == MCR_SORT_FLOATING
+                && nfltregargs < NFLTARGREGS
                )
-            {
+            {   int32 bytes = rep & MCR_SIZE_MASK;
+                nfltregwords += (bytes > alignof_toplevel_auto ? bytes : alignof_toplevel_auto) /
+                                sizeof_int;
                 nfltregargs++,
                 *fltregargp = newbl, fltregargp = &newbl->bindlistcdr;
             } else
@@ -5248,22 +5340,15 @@ static int32 cg_bindargs(BindList *args, bool ellipsis)
         if (intargs != NULL) *fltregargp = intargs;
         args = fltregargs;
         argoff = cg_bindargs_size(args);
-#ifdef TARGET_IS_ADENART
-        nintregargs = cg_nintregargs(intargs, ellipsis);
-#else
         nintregargs = intargs == NULL ? 0 :
             (argoff - (bindaddr_(intargs->bindlistcar) & ~BINDADDR_MASK))/4;
-#endif
     } else
 #endif /* TARGET_FP_ARGS_IN_FP_REGS */
     {   argoff = cg_bindargs_size(args),
-#ifdef TARGET_IS_ADENART
-        nintregargs = cg_nintregargs(args, ellipsis);
-#else
         nintregargs = argoff/alignof_toplevel_auto;
-#endif
     }
 
+    currentfunction.fltargwords = nfltregwords;
     if (nintregargs > NARGREGS) nintregargs = NARGREGS;
     max_argsize = argoff;
 #ifdef TARGET_STRUCT_RESULT_REGISTER
@@ -5289,12 +5374,12 @@ static int32 cg_bindargs(BindList *args, bool ellipsis)
         /* note the first zero is dubious -- rely on regalloc.c not       */
         /* using it!                                                      */
         k_argdesc_(lyingargwords, 0, nintregargs, nfltregargs,
-                   (int32)currentfunction.nresultregs, 0));
+        (int32)currentfunction.nresultregs, ellipsis ? K_VAFUNC : 0));
 #ifdef TARGET_STRUCT_RESULT_REGISTER
-    if (result_variable != NULL) init_slave_reg(result_variable, 0, 0);
+    if (result_variable != NULL) init_slave_reg(result_variable, 0, 0, 0);
 #endif
     for (x=args; x!=NULL; x=x->bindlistcdr)
-        init_slave_reg(x->bindlistcar, nfltregargs, nintregargs);
+        init_slave_reg(x->bindlistcar, argno++, nfltregwords, nintregargs);
     active_binders = NULL;
     current_stackdepth = greatest_stackdepth = 0;
     start_new_basic_block(nextlabel());
@@ -5310,18 +5395,6 @@ static void loadresultsfrombinder(Binder *x) {
 static void cg_return(Expr *x, bool implicitinvaluefn)
 {
     LabelNumber *retlab = (implicitinvaluefn ? RetImplLab : RetVoidLab);
-#ifdef TARGET_IS_ALPHA
-/*
- * here, if memory_access_checks are enabled, I force in a call to
- * a function that marks the exit from a normal user procedure.
- */
-            if (memory_access_checks)
-            {   Expr *fname = sim.proc_exit;
-                Expr *x;
-                x = mk_expr2(s_fnap, te_void, fname, (Expr *)0);
-                cg_exprvoid(x);
-            }
-#endif
     if (x!=0)
     {   int32 mcrep = mcrepofexpr(x);
 /* Structure results are massaged here to give an assignment via a       */
@@ -5332,11 +5405,17 @@ static void cg_return(Expr *x, bool implicitinvaluefn)
         if ((mcrep >> MCR_SORT_SHIFT) == 3)
         {   TypeExpr *t = typeofexpr(x);
             if (currentfunction.nresultregs > 0) {
-                if (h0_(x) == s_fnap && returnsstructinregs(arg1_(x)))
-                    cg_expr(mk_expr2(s_fnapstructvoid, te_void, arg1_(x),
-                                     mkArg(exprfnargs_(x), NULL)));
-                else if (h0_(x) == s_binder && (bindstg_((Binder *)x) & bitofstg_(s_auto)))
-                    loadresultsfrombinder((Binder *)x);
+                if (h0_(x) == s_fnap && returnsstructinregs(arg1_(x))) {
+                    VRegnum r = cg_expr(mk_expr2(s_fnapstructvoid, te_void, arg1_(x),
+                                                 mkArg(exprfnargs_(x), NULL)));
+                    if (r != R_A1 && r != GAP) {
+                        int n;
+                        for (n = 0; n < currentfunction.nresultregs; n++)
+                            emitreg(J_MOVR, R_A1+n, GAP, r+n);
+                    }
+
+                } else if (h0_(x) == s_binder && (bindstg_(exb_(x)) & bitofstg_(s_auto)))
+                    loadresultsfrombinder(exb_(x));
                 else {
                     if (h0_(x) != s_fnap) {
                         t = ptrtotype_(t);
@@ -5441,13 +5520,11 @@ static void cg_return(Expr *x, bool implicitinvaluefn)
     }
     emitsetspenv(active_binders, (BindList *)NULL);
     /* Not emitsetsp, because we don't want to allow it to be optimised out */
+    /* See comments in the CSE code for the need for a SETSP just before    */
+    /* every RETURN.  function modifycode()....                             */
+    /* Do not optimise this away lightly!                                   */
     /* Note also that 'active_binders = NULL;' is, in some sense, missed    */
     /* out here, but because of the emitbranch() this is NECESSARY!         */
-    /* @@@ AM wonders why not. */
-    /* See comments in the CSE code for the need for a SETSP just before
-     * every RETURN.  function modifycode()....
-     * Do not optimise this away lightly!
-     */
 
     emitbranch(J_B, retlab);
 }
@@ -5472,7 +5549,7 @@ static void cg_loop(Expr *init, Expr *pretest, Expr *step, Cmd *body,
 
     if (init != 0) cg_exprvoid(init);  /* the initialiser (if any)       */
 
-    cg_count(cg_current_cmd->fileline);
+    cg_count(cmdfileline_(cg_current_cmd));
 
 /* The variable once has been set true if, on the basis if looking at    */
 /* the initialiser and the pretest I can tell that the loop will be      */
@@ -5490,7 +5567,7 @@ static void cg_loop(Expr *init, Expr *pretest, Expr *step, Cmd *body,
         }
         start_new_basic_block(bodylab);
         if (body != NULL)
-        {   cg_count(body->fileline);
+        {   cg_count(cmdfileline_(body));
             cg_cmd(body);
         }
         if (loopinfo.contlab != 0) start_new_basic_block(loopinfo.contlab);
@@ -5500,7 +5577,7 @@ static void cg_loop(Expr *init, Expr *pretest, Expr *step, Cmd *body,
 /* When cg_loop is called there can NEVER be both a pretest and a post-  */
 /* test specified. Here I put out the (conditional) branch back up to    */
 /* the top of the loop.                                                  */
-        cg_count(cg_current_cmd->fileline);
+        cg_count(cmdfileline_(cg_current_cmd));
         if (pretest != 0) cg_test(pretest, YES, bodylab);
         else if (posttest != 0) cg_test(posttest, YES, bodylab);
         else emitbranch(J_B, bodylab);
@@ -5521,17 +5598,17 @@ static void cg_loop(Expr *init, Expr *pretest, Expr *step, Cmd *body,
         if (step != 0) {
             if (pretest == 0) emitbranch(J_B, bodylab);
             start_new_basic_block(steplab);
-            if (step->fileline != 0)
-                emitfl(J_INFOLINE, *step->fileline);
+            if (exprfileline_(step) != 0)
+                emitfl(J_INFOLINE, *exprfileline_(step));
             cg_exprvoid(step);
             if (testlab != 0) emitbranch(J_B, testlab);
         }
         start_new_basic_block(bodylab);
         if (body != NULL)
-        {   cg_count(body->fileline);
+        {   cg_count(cmdfileline_(body));
             cg_cmd(body);
         }
-        cg_count(cg_current_cmd->fileline);
+        cg_count(cmdfileline_(cg_current_cmd));
         if (posttest != 0)
             cg_test(posttest, YES, steplab);
         else
@@ -5570,7 +5647,7 @@ static int32 dense_case_table(CasePair *v, int32 ncases)
                 for (n = 0; n < ncases; n++)
                     if (v[n].caseval >= 0) break;
                 uhigh = just32bits_(v[n-1].caseval);
-                if (uhigh >> (shift+1) < ncases &&
+                if (uhigh >> (shift+1) < (uint32)ncases &&
                     ncases >= 4+3)
                     return shift+1+J_UNSIGNED;
             }
@@ -5679,7 +5756,7 @@ static void casebranch(VRegnum r, CasePair *v, int32 ncases,
  */
             /* The following line is a nasty hack.                          */
             /* It is also not always optimal on such machines.              */
-            emit(J_CMPK + Q_XXX, GAP, r, v[mid].caseval);
+            emit(J_CMPK + Q_UKN, GAP, r, v[mid].caseval);
             blkflags_(bottom_block) |= BLKCCEXPORTED;
             emitbranch(J_B + Q_EQ, v[mid].caselab);
             blkflags_(bottom_block) |= BLKCCLIVE;
@@ -5709,7 +5786,7 @@ static void cg_case_or_default(LabelNumber *l1)
         emitsetsp(J_SETSPENV, bl);
         start_new_basic_block(l);
     }
-    cg_count(cg_current_cmd->fileline);
+    cg_count(cmdfileline_(cg_current_cmd));
 }
 
 static VRegnum cg_loadconst(int32 n, Expr *e)
@@ -5717,7 +5794,7 @@ static VRegnum cg_loadconst(int32 n, Expr *e)
     VRegnum r;
     if (e) (void)cg_exprvoid(e);
 #ifdef TARGET_HAS_CONST_R_ZERO
-    if (n == 0 && R_ZERO != -1) return R_ZERO;
+    if (n == 0) return R_ZERO;
 #endif
     emit(J_MOVK, r=fgetregister(INTREG), GAP, n);
     return r;
@@ -5749,8 +5826,8 @@ static VRegnum cg_cond(Expr *c, bool valneeded, VRegnum targetreg,
 {
     Expr *b = arg1_(c), *e1 = arg2_(c), *e2 = arg3_(c);
     LabelNumber *l1 = nextlabel();
-    if (usrdbg(DBG_LINE) && c->fileline != 0)
-        emitfl(J_INFOLINE, *c->fileline);
+    if (usrdbg(DBG_LINE) && exprfileline_(c) != 0)
+        emitfl(J_INFOLINE, *exprfileline_(c));
     cg_test(b, 0, l1);
     cg_cond1(e1, valneeded, targetreg, l3, structload);
     start_new_basic_block(l1);
@@ -5763,7 +5840,7 @@ static int32 ispoweroftwo(Expr *x)
     unsigned32 n, r;
     if (!integer_constant(x)) return 0;
     n = result2;
-    r = n & (-n);
+    r = n & (0-n);
     if (n == 0 || r != n) return 0;
     r = 0;
     while (n != 1) r++, n >>= 1;
@@ -5811,9 +5888,20 @@ case s_assign:
 /*       *g = r,                                                         */
 /*       p = *g )                                                        */
 /*                 thus &q gets evaluated only once                      */
+/* or to ( q = r, p = q ) if q is simple                                 */
+
         {   TypeExpr *t = typeofexpr(rhs);
-            Binder *gen = gentempbinder(ptrtotype_(t));
-            e = mk_exprlet(s_let,
+            if (!isvolatile_type(t) && issimplelvalue(arg1_(rhs))) {
+                e = mk_expr2(s_comma,
+                             t,
+                             rhs,
+                             mk_expr2(s_assign,
+                                      t,
+                                      lhs,
+                                      arg1_(rhs)));
+            } else {
+                Binder *gen = gentempbinder(ptrtotype_(t));
+                e = mk_exprlet(s_let,
                          t,
                          mkSynBindList(0, gen),
                          mk_expr2(s_comma,
@@ -5836,6 +5924,7 @@ case s_assign:
                                                     mk_expr1(s_content,
                                                              t,
                                                              (Expr *)gen)))));
+            }
         }
         break;
 case s_fnap:
@@ -5848,9 +5937,24 @@ case s_cond:
 /*       g = &a,                                                         */
 /*       b ? (*g = c) : (*g = d))                                        */
 /*                                                                       */
+/*  or to b ? (a = c) : (a = d) if a is simple                           */
+
         {   TypeExpr *t = typeofexpr(lhs);
-            Binder *gen = gentempbinder(ptrtotype_(t));
-            e = mk_exprlet(s_let,
+            if (issimplelvalue(lhs)) {
+                e = mk_expr3(s_cond,
+                             t,
+                             arg1_(rhs),
+                             mk_expr2(s_assign,
+                                      t,
+                                      lhs,
+                                      arg2_(rhs)),
+                             mk_expr2(s_assign,
+                                      t,
+                                      lhs,
+                                      arg3_(rhs)));
+            } else {
+                Binder *gen = gentempbinder(ptrtotype_(t));
+                e = mk_exprlet(s_let,
                          t,
                          mkSynBindList(0, gen),
                          mk_expr2(s_comma,
@@ -5874,8 +5978,15 @@ case s_cond:
                                                              t,
                                                              (Expr *)gen),
                                                     arg3_(rhs)))));
+            }
         }
         break;
+case s_binder:
+        if (bindconst_(exb_(rhs)) != NULL)
+        {   if (LanguageIsCPlusPlus)
+                syserr("bindconst $b got to cg.c", exb_(rhs));
+            rhs = bindconst_(exb_(rhs));
+        }
 default:
         e = mk_expr2(s_fnap, te_void, sim.memcpyfn,
                      mkArgList3(take_address(lhs), take_address(rhs),
@@ -5884,8 +5995,7 @@ default:
     }
     if (debugging(DEBUG_CG))
     {   eprintf("Structure assignment: ");
-        pr_expr(e);
-        eprintf("\n");
+        pr_expr_nl(e);
     }
     cg_exprvoid(e);
 }
@@ -5946,12 +6056,7 @@ static VRegnum cg_expr1(Expr *x, bool valneeded)
  */
     if ((nusedregs >= (NTEMPREGS+NARGREGS+NVARREGS-spareregs-3)
 #else
-#ifdef TARGET_IS_MIPS
-/* AM: see above as thumb */
-    if ((nusedregs >= (NTEMPREGS+NARGREGS+NVARREGS-spareregs-3)
-#else
     if ((nusedregs >= (NTEMPREGS+NARGREGS+NVARREGS-spareregs-4)
-#endif
 #endif
 #ifndef TARGET_SHARES_INTEGER_AND_FP_REGISTERS
 /* AM has unilaterally decided that 2 spare FP regs should always be enough */
@@ -6141,13 +6246,11 @@ void cg_topdecl2(BindList *local_binders, BindList *regvar_binders)
 /* requested -- this will ensure that FP is set up.                      */
 /* N.B. We could probably optimise this if no vars spill, i.e. the       */
 /* debugger *probably* does not need FP, but why bother??                */
-    if (usrdbg(DBG_VAR)) procflags |= PROC_ARGPUSH;
+    if (usrdbg(DBG_VAR) && dbg_needsframepointer())
+      procflags |= PROC_ARGPUSH;
 
 /* This is the place where I put tables into the output stream for use   */
 /* by debugging tools - here are the names of functions.                 */
-#ifdef TARGET_IS_MIPS
-    cg_fnname_offset_in_codeseg = -1;
-#else
 #ifndef TARGET_IS_ARM
     cg_fnname_offset_in_codeseg = (feature & FEATURE_SAVENAME) ?
                         codeseg_function_name(currentfunction.symstr, currentfunction.argwords) : -1;
@@ -6156,7 +6259,6 @@ void cg_topdecl2(BindList *local_binders, BindList *regvar_binders)
 /* This work is now done in arm/gen.c so that fn names are only dumped   */
 /* for functions which have stack frames.                                */
     cg_fnname_offset_in_codeseg = -1;
-#endif
 #endif
     linearize_code();
     dbg_xendproc(currentfunction.fl);
@@ -6225,9 +6327,9 @@ static void correct_addrof(BindList *local_binders, BindList *regvar_binders) {
         Icode *ip = blkcode_(b);
         for (; --n >= 0; ip++)
             if ((ip->op & J_TABLE_BITS) == J_ADCONV)
-                bindstg_(ip->m.b) |= b_really_addresstaken;
+                bindstg_(ip->r3.b) |= b_really_addresstaken;
             else if (vkformat(ip->op))
-                bindstg_(ip->m.b) |= b_vk_addressed;
+                bindstg_(ip->r3.b) |= b_vk_addressed;
     }
     clear_addrof2(local_binders);
     clear_addrof2(regvar_binders);
@@ -6261,7 +6363,7 @@ void cg_topdecl(TopDecl *x, FileLine fl)
             Cmd *body = x->v_f.fn.body;
             Symstr *name = bindsym_(b);
             TypeExpr *t = prunetype(bindtype_(b)), *restype;
-            int32 resrep;
+            int32 resrep, old_profile_option = 0;
             fl.p = dbg_notefileline(fl);
             currentfunction.fl = fl;
 /* Object module generation may want to know if this module defines
@@ -6272,6 +6374,11 @@ void cg_topdecl(TopDecl *x, FileLine fl)
                 (bindstg_(b) & bitofstg_(s_extern)) != 0)
                 defining_main = has_main = YES;
             else defining_main = NO;
+            /* disable profiling for compiler generated functions, vtables included */
+            if (bindstg_(b) & b_generated)
+            {   old_profile_option = var_profile_option;
+                var_profile_option = 0;
+            }
             if (h0_(t)!=t_fnap)
             {   syserr(syserr_cg_topdecl);
                 return;
@@ -6296,7 +6403,7 @@ void cg_topdecl(TopDecl *x, FileLine fl)
                     result_variable = currentfunction.structresult;
                     if (result_variable == 0) syserr(syserr_cg_return_struct);
                     if (usrdbg(DBG_VAR))
-                        dbg_locvar(result_variable, body->fileline);
+                        dbg_locvar(result_variable, cmdfileline_(body));
 #ifndef TARGET_STRUCT_RESULT_REGISTER
                     formals = mkSynBindList(formals, result_variable);
 #endif
@@ -6314,12 +6421,6 @@ void cg_topdecl(TopDecl *x, FileLine fl)
                                                                DBLREG;
                 currentfunction.baseresultreg = V_Presultreg(rsort);
             }
-#ifdef TARGET_IS_ADENART
-            if (isadetran(name))
-            {   body = adenart_call(body, formals);
-                formals = 0;
-            }
-#endif
 /* Here is a ugly mess - 'formals' has SynAlloc store, which is         */
 /* corrupted by drop_local_store().  It needs copying for both for the  */
 /* use below (PROC_ARGPUSH) and for its use in regalloc.c.              */
@@ -6330,29 +6431,6 @@ void cg_topdecl(TopDecl *x, FileLine fl)
             }
             currentfunction.argwords = cg_bindargs(argument_bindlist, x->v_f.fn.ellipsis);
             currentfunction.symstr = bindsym_(b);
-#ifdef TARGET_IS_ALPHA
-/*
- * To help debug on an otherwise dodgy machine I can generate a call to
- * a debugging function at the head of each user procedure. I give it 2
- * args, one indicating how many args were involved for the function, and
- * the other a string that is the function name.  Grim and expensive but
- * it can help me debug.
- */
-            if (memory_access_checks)
-            {   Expr *fname = sim.proc_entry;
-                char *v = (char *)GlobAlloc(SU_Other,
-                                     (size_t)(2+strlen(symname_(name))));
-                StringSegList *ss = (StringSegList *)binder_list3(
-                                                (StringSegList *)0, v,
-                                                strlen(symname_(name)));
-                Expr *sss = (Expr *)syn_list2(s_string, ss);
-                Expr *args = mkArgList2(sss, globalize_int(currentfunction.argwords));
-                Expr *x;
-                x = mk_expr2(s_fnap, te_void, fname, args);
-                strcpy(v, symname_(name));
-                cg_exprvoid(x);
-            }
-#endif
             cg_cmd(body);
 #ifdef never
             /* the following code is maybe what AM would like */
@@ -6385,14 +6463,11 @@ void cg_topdecl(TopDecl *x, FileLine fl)
                  !Inline_Save(b, local_binders, regvar_binders)) {
 
                 cg_topdecl2(local_binders, regvar_binders);
-/* ECN: Many Thumb jopcodes will modify registers which cg does not know about
- *      Therefore we must mark R0-R3 as being used.
- */
-#ifdef TARGET_IS_THUMB
-                regmask |= 0x0f;
-#endif
-                typefnaux_(t).usedregs = regmaskvec;
+                symext_(currentfunction.symstr)->usedregs = regmaskvec;
             }
+            /* enable profile option, if necessary */
+            if (old_profile_option)
+                var_profile_option = old_profile_option;
         }
 }
 
@@ -6401,8 +6476,8 @@ void cg_init(void)
     obj_init();                 /* MUST precede codebuf_init() */
     Inline_Init();
     regalloc_init();
-    mcdep_init();             /* code for system dependent module header */
     codebuf_init();
+    mcdep_init();             /* code for system dependent module header */
     datasegbinders = (BindList *)global_cons2(SU_Other, 0, datasegment);
     max_icode = 0; max_block = 0;
     cse_init();
@@ -6420,13 +6495,6 @@ void cg_init(void)
 
     show_entry(bindsym_(codesegment), xr_code+xr_defloc);  /* nasty here */
     show_code(bindsym_(codesegment));                      /* nasty here */
-#ifdef TARGET_IS_ACW
-    /* this split of mcdep_init() is needed for labelling disassembler */
-    /* to work properly */
-      mcdep_init2();
-      show_entry(stackcheck, xr_code+xr_defloc);
-      show_code(stackcheck);
-#endif
 }
 
 void cg_reinit(void)
@@ -6454,11 +6522,9 @@ void cg_tidy(void)
        padbss(alignto);
 #endif
 #ifdef CONST_DATA_IN_CODE
-       {   DataDesc *datap_o = datap;
-           datap = &constdata;
-           padstatic(alignto);
-           datap = datap_o;
-       }
+       SetDataArea(DS_Const);
+       padstatic(alignto);
+       SetDataArea(DS_ReadWrite);
 #endif
     }
 

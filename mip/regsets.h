@@ -2,12 +2,13 @@
  * regsets.h, version 1a
  * Copyright (C) Acorn Computers Ltd., 1988.
  * Copyright (C) Codemist Ltd., 1988.
+ * SPDX-Licence-Identifier: Apache-2.0
  */
 
 /*
- * RCS $Revision: 1.8 $
- * Checkin $Date: 1995/06/20 10:05:11 $
- * Revising $Author: amycroft $
+ * RCS $Revision$
+ * Checkin $Date$
+ * Revising $Author$
  */
 
 #ifndef _regsets_h

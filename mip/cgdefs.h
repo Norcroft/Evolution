@@ -2,13 +2,14 @@
  * cgdefs.h - structures used by the back-end
  * Copyright (C) Acorn Computers Ltd., 1988-1990.
  * Copyright (C) Codemist Ltd., 1987-1992.
- * Copyright (C) Advanced RISC Machines Limited, 1991-1992.
+ * Copyright 1991-1997 Advanced Risc Machines Limited. All rights reserved
+ * SPDX-Licence-Identifier: Apache-2.0
  */
 
 /*
- * RCS $Revision: 1.15 $ Codemist 4
- * Checkin $Date: 1995/06/26 16:37:19 $
- * Revising $Author: amycroft $
+ * RCS $Revision$ Codemist 4
+ * Checkin $Date$
+ * Revising $Author$
  */
 
 #ifndef _cgdefs_LOADED
@@ -20,6 +21,7 @@ typedef struct Icode Icode;
 typedef struct VRegSet *VRegSetP;
 typedef struct BlockList BlockList;
 typedef struct CSEBlockHead CSEBlockHead;
+typedef struct SRBlockHead SRBlockHead;
 
 /*
  * LabelNumbers describe compiler-generated labels (e.g. arising from if-else
@@ -35,7 +37,6 @@ struct LabelNumber {            /* compiler-generated-label descriptor */
       List *frefs;              /* forwd ref list, managed by local cg */
       int32 defn;               /* jopcode location or code location   */
   } u;
-  int32 lndraft;                /* worst case code position -- gen.c   */
   int32 name;                   /* 'name' (internal label number) -  */
 };                              /* top bit indicates 'label defined' */
 /*
@@ -50,6 +51,7 @@ struct LabelNumber {            /* compiler-generated-label descriptor */
 #define lab_name_(l)        ((l)->name)
 #define lab_xname_(l)       (is_exit_label(l) ? (int32)(IPtr)(l) : \
                              lab_name_(l) & 0x7fffffff)
+#define lab_block_(l)       ((l)->block)
 
 /*
  * A list of labels numbrs is a generic List... used by local code generators
@@ -57,11 +59,41 @@ struct LabelNumber {            /* compiler-generated-label descriptor */
  * mkLabList: LabList x LabelNumber -> LabList
  */
 typedef struct LabList LabList;
+#ifndef labcdr
+#  define labcdr cdr
+#endif
 struct LabList {
     LabList *labcdr;
     LabelNumber *labcar;
 };
 #define mkLabList(a,b) ((LabList *)binder_cons2((LabList *)a,(LabelNumber *)b))
+
+
+typedef struct HandlerList HandlerList;
+struct HandlerList
+{  HandlerList* cdr;
+  int /*TypeId*/ type;
+  LabelNumber *handler;};
+
+typedef enum { ex_destructor, ex_handlerblock } ex_enum;
+/*
+ * Structure describing an exception environment (one per basic block)
+ */
+typedef struct ExceptionEnv ExceptionEnv;
+struct ExceptionEnv
+{
+  ExceptionEnv *cdr;
+  ex_enum type;
+  union {
+    Binder *destructee;
+    struct HandlerEnv {
+      int handlercount;
+      LabelNumber *handlerblock;
+      HandlerList *handlerlist;
+    } henv;
+  } handlers;
+};
+extern ExceptionEnv *currentExceptionEnv;
 
 /*
  * Structure describing a basic block.
@@ -91,9 +123,87 @@ struct BlockHead
         } stack;
   BindListList *debenv;             /* @@@ temp/rationalise - see flowgraph */
   BlockList *usedfrom;              /* list of blocks that ref. this one */
-  CSEBlockHead *cse;
+  union {
+    CSEBlockHead *cse;
+    SRBlockHead *sr;
+  } extra;
   int32  loopnest;                  /* depth of loop nesting in this blk */
+  ExceptionEnv* exenv;              /* exception environment             */
 };
+
+#define blklstcdr cdr
+
+
+#define blkcode_(x)     (x->code)            /* start of 3-address code  */
+#define blklength_(x)   (x->length)          /* length of ditto          */
+#define blkflags_(x)    (x->flags)           /* misc flag bits           */
+#define blknext_(x)     (x->succ1.next)      /* successor block          */
+#define blknext1_(x)    (x->succ2.next1)     /* alternative successor    */
+#define blktable_(x)    (x->succ1.table)     /* table of successors      */
+#define blktabsize_(x)  (x->succ2.tabsize)   /* size of aforesaid table  */
+#define blkbackp_(x)    (x->succ1.backp)     /* for branch_chain() only  */
+#define blkbackp1_(x)   (x->succ2.backp1)    /* for branch_chain() only  */
+#define blkdown_(x)     (x->down)            /* forward chaining         */
+#define blkup_(x)       (x->up)              /* backward chaining        */
+#define blklab_(x)      (x->lab)             /* label for this block     */
+#define blkuse_(x)      (x->use)      /* registers needed at block head  */
+#define blk_dominators_(x) (x->use)
+#define blkstack_(x)    (x->stack.l)  /* binders active at head of block */
+#define blkstacki_(x)   (x->stack.i)
+#define blkdebenv_(x)   (x->debenv)   /* for debugger                    */
+#define blkusedfrom_(x) (x->usedfrom) /* used in cross-jump optimization */
+#define blknest_(x)     (x->loopnest) /* # loops enclosing this block.   */
+#define blkexenv_(x)    (x->exenv)    /* exception environment           */
+#define blkcse_(x)      (x->extra.cse)
+#define blksr_(x)       (x->extra.sr)
+
+/* bits for use in blkflags_(x)                                          */
+
+/* #define BLKREFMASK          3L  DEFUNCT    refcount 0,1,2,many        */
+#define BLKALIVE               4L   /* used when flattening graph        */
+#define BLKSWITCH              8L   /* contains 'switch' multi-exit      */
+#define BLK2EXIT            0x10L   /* contains conditional exit         */
+#define BLKBUSY             0x20L   /* used when flattening graph        */
+#define BLKCODED            0x40L   /* ditto                             */
+#define BLKEMPTY            0x80L   /* SET IF BLOCK EMPTY                */
+#define BLKLOOP            0x100L   /* block is a loop head              */
+#define BLKCCLIVE          0x200L   /* condition code set on entry to    */
+                                    /* block (block is second part of    */
+                                    /* 3-way branch)                     */
+/*#define BLKINNER         0x200L*/ /* loop has no other loops inside    */
+                                    /* Nowhere used ?                    */
+#define BLKOUTER           0x400L   /* set in function header block      */
+#define BLK0EXIT           0x800L   /* no exit (tail procedure call)     */
+#define BLKP2             0x1000L   /* bits used to control backpointer  */
+#define BLKP3             0x2000L   /* bits used to control backpointer  */
+#define BLKCALL           0x4000L   /* block contains a proc call        */
+#define BLK2CALL          0x8000L   /* block contains 2 proc calls       */
+#define BLKSETJMP        0x10000L   /* block may call setjmp (groan).    */
+#define BLKSTACKI       0x100000L   /* blkstack is a number not a bindlist*/
+#define BLKREXPORTED2   0x200000L
+#define BLKCCEXPORTED   0x400000L
+#define BLKREXPORTED    0x800000L
+/* N.B. Q_MASK values above also used when BLK2EXIT is set (condition)   */
+/* Also, the following bits are are disjoint from the above but are only */
+/* used in 'procflags'.  Some of them may later be BLK oriented.         */
+#define PROC_ARGADDR      0x20000L  /* arg address taken                 */
+#define PROC_ARGPUSH      0x40000L  /* treat args carefully (see cg.c)   */
+#define PROC_BIGSTACK     0x80000L  /* stack bigger than 256             */
+#define PROC_USESADCONS  0x200000L
+#define PROC_HASMOVC    0x1000000L
+#define PROC_CASEBRANCH 0x2000000L
+#define PROC_FPTEMP     0x4000000L  /* hack for SPARC.  Generalise?      */
+#define PROC_INLNASM    0x8000000L  /* Fn contains inline assembler      */
+/* Special values to go in blknext_(), getting to be too many...         */
+
+#define RetIntLab       ((LabelNumber *)-256L)
+#define RetFloatLab     ((LabelNumber *)-252L)
+#define RetDbleLab      ((LabelNumber *)-248L)
+#define RetVoidLab      ((LabelNumber *)-244L)
+#define RetImplLab      ((LabelNumber *)-240L)
+/* and for use in flowgraph.c - change soon? */
+#define RETLAB          ((LabelNumber *)-236L)
+#define NOTALAB         ((LabelNumber *)-232L)
 
 struct BlockList
 { BlockList *blklstcdr;
@@ -127,6 +237,7 @@ typedef int32 RealRegister;
 #endif
 
 #define regbit(n) (((unsigned32)1L)<<(n))
+#define reglist(first,nregs) (regbit((first)+(nregs))-regbit(first))
 
 /* the next lines are horrid, but less so that the previous magic numbers */
 /*   - they test for virtual regs having become real - see flowgraph.c   */
@@ -158,6 +269,9 @@ typedef struct RegList {
 } RegList;
 
 #define mkRegList(a,b) ((RegList *)binder_icons2(a,b))
+#define RegList_Member(a,l) (generic_member((IPtr)(a), (List *)(l)))
+#define RegList_DiscardOne(p) ((RegList *)discard2(p))
+#define RegList_NDelete(a,p) ((RegList *)generic_ndelete((IPtr)(a), (List *)(p)))
 
 /* Structure for an abstract instruction (3-address code)                */
 
@@ -166,14 +280,16 @@ typedef union VRegInt
     /* VRegnum */ IPtr r;
     /* RealRegister */ IPtr rr;
     /* int32 */ IPtr i;
-    char *str;
+    char const *str;
     StringSegList *s;
     LabelNumber *l;
     LabelNumber **lnn;
     Binder *b;
+    Expr *ex;             /* Binder, when we want to view it as an Expr */
     FloatCon *f;
     BindList *bl;
     Symstr *sym;
+    Int64Con *i64;
     void *p;            /* should only be used for debugger support */
 } VRegInt;
 
@@ -185,10 +301,13 @@ struct Icode
  * rather than the unchecked arithmetic coding currently used?  This is not
  * the highest priority clean-up for me to worry about
  */
-  int32 op;
-  VRegInt r1, r2;
-  VRegInt m;
+  uint32 op, flags;
+  VRegInt r1, r2, r3, r4;
 };
+
+#define INIT_IC(ic,o) {(ic).op=(o);(ic).flags=0;(ic).r1.r=(ic).r2.r=(ic).r3.r=GAP;(ic).r4.r=0;}
+#define INIT_IC3(ic,o,R1,R2,R3) {(ic).op=(o);(ic).flags=0;(ic).r1=(R1);(ic).r2=(R2);(ic).r3=(R3);(ic).r4.r=0;}
+#define INIT_IC4(ic,o,R1,R2,R3,R4) {(ic).op=(o);(ic).flags=0;(ic).r1=(R1);(ic).r2=(R2);(ic).r3=(R3);(ic).r4.r=(R4);}
 
 #endif
 

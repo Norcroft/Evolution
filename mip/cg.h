@@ -3,12 +3,13 @@
  * Copyright (C) Acorn Computers Ltd., 1988-1990.
  * Copyright (C) Codemist Ltd., 1987-1992.
  * Copyright (C) Advanced RISC Machines Limited, 1991-1992.
+ * SPDX-Licence-Identifier: Apache-2.0
  */
 
 /*
- * RCS $Revision: 1.13 $
- * Checkin $Date: 1995/09/18 14:59:23 $
- * Revising $Author: enevill $
+ * RCS $Revision$
+ * Checkin $Date$
+ * Revising $Author$
  */
 
 #ifndef _cg_h
@@ -35,21 +36,28 @@ extern Binder *gentempvarofsort(RegSort sort);
 
 extern Binder *gentempvarofsortwithname(RegSort sort, char *name);
 
-#ifdef TARGET_IS_INTERPRETER
-#define cg_topdecl(x, fl) 0
-#define cg_reinit() 0
-#define cg_tidy() 0
+#if defined(CALLABLE_COMPILER)
+#define cg_topdecl(x, fl)               ((void)0)
+#define cg_reinit()                     ((void)0)
+#define cg_tidy()                       ((void)0)
+#define cg_topdecl2(locals,regs)        ((void)0)
+#define cg_init()                       ((void)0)
+#define cg_sub_reinit()                 ((void)0)
 #else
 extern void cg_topdecl(TopDecl *x, FileLine fl);
 extern void cg_reinit(void);
 extern void cg_tidy(void);
+extern void cg_topdecl2(BindList *local_binders, BindList *regvar_binders);
+extern void cg_init(void);
+extern void cg_sub_reinit(void);
 #endif
 
-extern void cg_topdecl2(BindList *local_binders, BindList *regvar_binders);
+extern VRegnum cg_exprvoid(Expr *x);
+extern VRegnum cg_expr(Expr *x);
 
-extern void cg_init(void);
-
-extern void cg_sub_reinit(void);
+extern void bfreeregister(VRegnum r);
+extern VRegnum fgetregister(RegSort rsort);
+extern VRegnum cg_storein(VRegnum r,Expr *val,Expr *e,AEop flag);
 
 #endif
 

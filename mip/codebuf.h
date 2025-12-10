@@ -3,12 +3,13 @@
  * Copyright (C) Acorn Computers Ltd., 1988-1990.
  * Copyright (C) Codemist Ltd, 1988-1992.
  * Copyright (C) Advanced Risc Machines Ltd., 1991-1992.
+ * SPDX-Licence-Identifier: Apache-2.0
  */
 
 /*
- * RCS $Revision: 1.18 $
- * Checkin $Date: 1996/01/10 14:54:25 $
- * Revising $Author: hmeeking $
+ * RCS $Revision$
+ * Checkin $Date$
+ * Revising $Author$
  */
 
 #ifndef _codebuf_LOADED
@@ -18,16 +19,6 @@
 #  include "defs.h"
 #endif
 #include "xrefs.h"
-
-#ifdef TARGET_ASM_NAMES_LITERALS
-#  define genlitbinder(typ) \
-       global_mk_binder(0, gensymval(2), bitofstg_(s_static), typ)
-#  define lit_keepname(b) 1
-#else
-#  define genlitbinder(typ) \
-       mk_binder(gensymval(0), bitofstg_(s_static), typ)
-#  define lit_keepname(b) 0
-#endif
 
 typedef struct DataDesc {
     DataInit *head, *tail;
@@ -40,17 +31,76 @@ typedef struct DataDesc {
     uint8 wtype;
 } DataDesc;
 
-#ifndef TARGET_IS_INTERPRETER
-extern DataDesc data;           /* hard for fgrep to find!              */
-#define vardata data            /* easier for fgrep to find!            */
+typedef enum {
+  DS_None
+  , DS_ReadWrite
 #ifdef CONST_DATA_IN_CODE
-extern DataDesc constdata;
-#else
-#define dataloc   (data.size)   /* compatibility with other back ends.  */
-#define datainitp (data.head)
-#define dataxrefs (data.xrefs)
+  , DS_Const
 #endif
-extern DataDesc *datap;
+} DataAreaSort;
+
+#if defined(CALLABLE_COMPILER)
+#define get_datadesc_ht(head)                   ((DataInit *)0)
+#define set_datadesc_ht(head,val)               ((void)0)
+#define get_datadesc_size()                     ((int32) 0)
+#define set_datadesc_size(val)                  ((void)0)
+#define get_datadesc_xrefs()                    ((DataXref *)0)
+#define set_datadesc_xrefs(val)                 ((void)0)
+#define get_datadesc_xrarea()                   ((int)0)
+#define set_datadesc_xrarea(val)                ((void)0)
+#define get_datadesc()                          ((DataDesc *)0)
+#define copy_datadesc(dest)                     ((void)0)
+#define restore_datadesc(src)                   ((void)0)
+#define data_size()                             ((int32)0)
+#define data_head()                             ((DataInit *)0)
+#define data_xrefs()                            ((DataXref *)0)
+#define constdata_size()                        ((int32)0)
+#define constdata_head()                        ((DataInit *)0)
+#define constdata_xrefs()                       ((DataXref *)0)
+#define is_constdata()                          ((bool)0)
+#define SetDataArea(x)                          DS_ReadWrite
+#else
+extern DataInit *get_datadesc_ht(bool head);
+extern void set_datadesc_ht(bool head, DataInit *val);
+extern int32 get_datadesc_size(void);
+extern void set_datadesc_size(int32 val);
+extern DataXref *get_datadesc_xrefs(void);
+extern void set_datadesc_xrefs(DataXref *val);
+extern int get_datadesc_xrarea(void);
+extern void set_datadesc_xrarea(int val);
+extern DataDesc *get_datadesc(void);
+extern void copy_datadesc(DataDesc *dest);
+extern void restore_datadesc(DataDesc *src);
+extern int32 data_size(void);
+extern DataInit *data_head(void);
+extern DataXref *data_xrefs(void);
+extern DataInit *get_extable_ht(bool head);
+extern void set_extable_ht(bool head, DataInit *val);
+extern void set_extable_size(int32 val);
+extern int32 extable_size(void);
+extern DataInit *extable_head(void);
+extern DataXref *extable_xrefs(void);
+extern bool is_extable(void);
+extern DataInit *get_exhandler_ht(bool head);
+extern void set_exhandler_ht(bool head, DataInit *val);
+extern void set_exhandler_size(int32 val);
+extern int32 exhandler_size(void);
+extern DataInit *exhandler_head(void);
+extern DataXref *exhandler_xrefs(void);
+extern bool is_exhandler(void);
+#  ifdef CONST_DATA_IN_CODE
+extern int32 constdata_size(void);
+extern DataInit *constdata_head(void);
+extern DataXref *constdata_xrefs(void);
+extern bool is_constdata(void);
+#  else
+#define dataloc   (get_datadesc_size())   /* compatibility with other back ends.  */
+#define datainitp (get_datadesc_ht(YES))
+#define dataxrefs (get_datadesc_xrefs())
+#  endif
+extern DataAreaSort SetDataArea(DataAreaSort);
+
+#endif
 
 extern int32 code_area_idx;     /* for armcc -S -ZO ... */
 
@@ -61,7 +111,6 @@ extern int32 codep;
 
 #ifdef TARGET_HAS_BSS
 extern int32 bss_size;
-#endif
 #endif
 
 /* xxx/gen.c obj.c and asm.c should now only access 'codeandflagvec'    */
@@ -129,18 +178,16 @@ extern struct LabelNumber *nextlabel(void);
 extern void labeldata(Symstr *b);
 extern int32 trydeletezerodata(DataInit *previous, int32 minsize);
 
-extern void gendlabel(Binder *b, bool topflag, DataDesc *seg);
 extern void gendcAX(Symstr *sv, int32 offset, int xrflavour);
  /* (possibly external) name + offset, flavour is xr_data or xr_code */
-#ifdef TARGET_IS_INTERPRETER
-#define gendc0(n) 0
+#ifdef CALLABLE_COMPILER
+#define gendc0(n)               ((void)0)
 #else
 extern void gendc0(int32 nbytes);
 #endif
 extern void gendcI_a(int32 len, int32 val, bool aligned);
 #define gendcI(len, val) gendcI_a(len, val, YES)
 extern void gendcE(int32 len, FloatCon *val);
-extern Binder *gendcSlit(StringSegList *s);
 #ifdef TARGET_CALL_USES_DESCRIPTOR
 extern void gendcF(Symstr *sv, int32 offset);
 extern int32 genfncon(Symstr* sv);

@@ -1,11 +1,12 @@
 /* C compiler file coffobj.c :  Copyright (C) Codemist Ltd, 1988.       */
+/* SPDX-Licence-Identifier: Apache-2.0 */
 /* 'COFF' (system V unix) output routines */
 /* version 13j */
 
 /*
- * RCS $Revision: 1.6 $
- * Checkin $Date: 1994/02/07 16:45:35 $
- * Revising $Author: hmeekings $
+ * RCS $Revision$
+ * Checkin $Date$
+ * Revising $Author$
  */
 
 /* AM: Feb 90: add AUX items for sections.  Fix bug in common refs      */

@@ -1,12 +1,13 @@
 /*
  * peepgen.c: Peephole table generator
  * Copyright (C) Advanced Risc Machines Ltd., 1991
+ * SPDX-Licence-Identifier: Apache-2.0
  */
 
 /*
- * RCS $Revision: 1.18 $
- * Checkin $Date: 1995/03/15 10:59:19 $
- * Revising $Author: irickard $
+ * RCS $Revision$
+ * Checkin $Date$
+ * Revising $Author$
  */
 
 #include <stdlib.h>
@@ -19,11 +20,8 @@
 #  include <varargs.h>
 #endif
 
-#define NO 0
-#define YES 1
-typedef int bool;
-
-#define StrEq(a, b) (strcmp(a, b) == 0)
+#include "host.h"
+#include "globals.h"
 
 static int peephole_index;
 
@@ -61,14 +59,18 @@ typedef enum {
   p_loads_r1,
   p_uses_r1,
   p_uses_r2,
-  p_uses_r3
+  p_uses_r3,
+  p_uses_r4,
+  p_loads_r2
 } P_OpPred;
 
 static char const * const opr_name[] = {
   "p_loads_r1",
   "p_uses_r1",
   "p_uses_r2",
-  "p_uses_r3"
+  "p_uses_r3",
+  "p_uses_r4",
+  "p_loads_r2"
 };
 
 typedef enum {
@@ -80,7 +82,11 @@ typedef enum {
    pf_r3,
    pf_r4,
    pf_dataflow,
-   pf_cond
+   pf_cond,
+   pf_dead_r1,
+   pf_dead_r2,
+   pf_dead_r3,
+   pf_dead_r4
 } P_Field;
 
 static char const * const field_name[] = {
@@ -92,7 +98,11 @@ static char const * const field_name[] = {
   "pf_r3",
   "pf_r4",
   "pf_dataflow",
-  "pf_cond"
+  "pf_cond",
+  "pf_dead_r1",
+  "pf_dead_r2",
+  "pf_dead_r3",
+  "pf_dead_r4"
 };
 
 static char const * const dead_name[] = {
@@ -102,7 +112,8 @@ static char const * const dead_name[] = {
   0,
   "p_dead_r1",
   "p_dead_r2",
-  "p_dead_r3"
+  "p_dead_r3",
+  "p_dead_r4"
 };
 
 typedef enum {
@@ -127,6 +138,7 @@ typedef enum {
    prt_swapr2r3,
    prt_set,
    prt_asr,
+   prt_reverse_fn,
    prt_proc
 } P_ReplaceType;
 
@@ -136,6 +148,7 @@ static char const * const rt_name[] = {
    "prt_swapr2r3",
    "prt_set",
    "prt_asr",
+   "prt_reverse_fn",
    "prt_proc"
 };
 
@@ -221,7 +234,7 @@ static char const * const ct_name[] = {
   "pct_or"
 };
 
-#define MaxOps 5
+#define MaxOps 10
 #define MaxConstraints 32
 #define MaxReplace 32
 
@@ -283,7 +296,7 @@ typedef struct PeepOpDef {
       union { char *c; int i; } mask;
     } op;
     struct {
-      int val;
+      unsigned val;
       union { char *c; int i; } mask;
     } prop;
     struct {
@@ -350,10 +363,12 @@ typedef struct {
 
 static KeyTable const op_predicates[] = {
   {"loads_r1", p_loads_r1},
-  {"sets_r1", p_loads_r1},
   {"uses_r1", p_uses_r1},
   {"uses_r2", p_uses_r2},
   {"uses_r3", p_uses_r3},
+  {"uses_r4", p_uses_r4},
+  {"loads_r2", p_loads_r2},
+  {"sets_r1", p_loads_r1},
   {0,0}
 };
 
@@ -361,6 +376,7 @@ static KeyTable const op_dead[] = {
   {"dead_r1", deadbit(pf_r1)},
   {"dead_r2", deadbit(pf_r2)},
   {"dead_r3", deadbit(pf_r3)},
+  {"dead_r4", deadbit(pf_r4)},
   {0,0}
 };
 
@@ -402,6 +418,7 @@ static KeyFnTable const replace_keys[] = {
   {"kill", prt_kill, 1},
   {"swapr2r3", prt_swapr2r3, 1},
   {"adjuststackrefs", prt_asr, 2},
+  {"reverse_fn", prt_reverse_fn, 1},
   {0,0}
 };
 
@@ -410,11 +427,14 @@ static KeyTable const field_table[] = {
   {"r1", pf_r1},
   {"r2", pf_r2},
   {"r3", pf_r3},
-  {"m",  pf_r3},
   {"r4", pf_r4},
   {"peep", pf_peep},
   {"dataflow", pf_dataflow},
   {"cond", pf_cond},
+  {"dead_r1", pf_dead_r1},
+  {"dead_r2", pf_dead_r2},
+  {"dead_r3", pf_dead_r3},
+  {"dead_r4", pf_dead_r4},
   {0,0}
 };
 
@@ -510,7 +530,7 @@ static void Warn(const char *s, ...) {
   va_end(ap);
 }
 
-static int NextCh() {
+static int NextCh(void) {
   int ch = fgetc(input);
   if (debug)
     debugbuf[debugix++] = ch;
@@ -723,9 +743,11 @@ static PeepOp **ReadOps(int *chp, int *np) {
   int ch = WantCh('(', *chp, "ReadOps");
   int count = 0;
   PeepOp *ops[MaxOps];
-  ops[count] = NextOp(&ch);
-  for (; ops[count] != NULL ;) {
-    ops[++count] = NextOp(&ch);
+  PeepOp *op = NextOp(&ch);
+  for (; op != NULL; count++) {
+    if (count >= MaxOps) SyntaxError("Too many ops");
+    ops[count] = op;
+    op = NextOp(&ch);
   }
   if (count < 1) SyntaxError("Too few ops");
   if (opMax < count) opMax = count;
@@ -1013,26 +1035,30 @@ static void ReadReplacements(PeepHole *ph, int *chp) {
 #define ENABLE_CG 1 /* bodge - get JOPCODE tables to include names */
 #define JOPCODEDEF_ONLY
 
-typedef long int32;
-typedef unsigned long unsigned32;
-
 #define _defs_LOADED 1
 
+#include "options.h"
 #include "jopcode.h"
 #include "mcdpriv.h"
 
 static int32 u_bit[] = {
+  /* this table is indexed with P_OpPred! */
   _J_SET_R1,
   _J_READ_R1,
   _J_READ_R2,
-  _J_READ_R3
+  _J_READ_R3,
+  _J_READ_R4,
+  _J_SET_R2
 };
 
 static int32 a_u_bit[] = {
+  /* this table is indexed with P_OpPred! */
   _a_set_r1,
   _a_read_r1,
   _a_read_r2,
-  _a_read_r3
+  _a_read_r3,
+  _a_read_r4,
+  _a_set_r2
 };
 
 #define JOPNAME(op) ((op)<=J_LAST_JOPCODE ? joptable[op].name :\
@@ -1095,8 +1121,8 @@ static unsigned32 a_opuse(char const *op, P_OpPred u)
 }
 
 static bool peepop_use(PeepOpDef const *p, P_OpPred u) {
-  if (u == p_uses_r3+1) /* uses_r4 - a function of peep as well as op */
-    return YES;
+  if (u == p_uses_r4) /* uses_r4 - a function of peep as well as op */
+                      return YES;       /* WD: is fault!!!!!!!!!!! */
 
   switch (p->type) {
   case pot_op_m:
@@ -1614,7 +1640,7 @@ static bool SameReplace(PeepReplace const *r1, PeepReplace const *r2) {
           SameField(&r1->f2, &r2->f2));
 }
 
-static void WriteReplacements() {
+static void WriteReplacements(void) {
   int count = MaxReplace;
   int index = 0;
   PeepReplace **replacements = (PeepReplace **)
@@ -1746,12 +1772,13 @@ typedef struct IntList { struct IntList *next; int i; } IntList;
 static struct { int count; IntList *p; } perop[J_LAST_A_JOPCODE+1];
 
 static void WritePeepHoles(PeepHole *pl) {
-  fputs("typedef int32 propproc(J_OPCODE);\n", output);
+  fputs("typedef int32 propproc(const PendingOp *const p);\n", output);
   fputs("static propproc * const peepprops[] = {\n", output);
-  fputs(" a_loads_r1,\n a_uses_r1,\n a_uses_r2,\n a_uses_r3\n};\n", output);
+  fputs(" a_loads_r1,\n a_uses_r1,\n a_uses_r2,\n a_uses_r3,\n a_uses_r4,\n a_loads_r2\n};\n", output);
 
   fputs("#define p_loads_r1 0\n#define p_uses_r1 1\n", output);
   fputs("#define p_uses_r2 2\n#define p_uses_r3 3\n", output);
+  fputs("#define p_uses_r4 4\n#define p_loads_r2 5\n", output);
 
   fputs("#define fb_(a, b) ((((int32)(a))<<8) | (b))\n", output);
   fputs("#define fh_(a, b) ((((int32)(a))<<16) | (b))\n", output);
