@@ -4,9 +4,9 @@
  */
 
 /*
- * RCS $Revision: 1.11 $ Codemist 4
- * Checkin $Date: 93/10/07 17:39:12 $
- * Revising $Author: irickard $
+ * RCS $Revision: 1.28 $ Codemist 4
+ * Checkin $Date: 1995/10/17 16:05:30 $
+ * Revising $Author: fwai $
  */
 
 /*
@@ -49,6 +49,17 @@
     */
 #endif
 
+#ifndef immed_op
+  /* target.h may define this otherwise, to return 1 if n may be an immediate
+   * operand in the expansion of J_OPCODE op. If the value is 0, CSE is more
+   * enthusiastic about making a load of the value into a CSE or hoisting it
+   * out of loops.
+   * immed_cmp is a special case, sensibly defined as immed_op(n, J_CMPK) where
+   * immed_op has a non-default value.
+   */
+#  define immed_op(n, op) 1
+#endif
+
 #ifdef TARGET_INLINES_MONADS
 extern int32 target_inlinable(Binder *b, int32 nargs);
 #endif
@@ -57,10 +68,6 @@ extern int32 target_inlinable(Binder *b, int32 nargs);
 extern bool alterscc(Icode *ip);
 #endif
 
-#ifdef TARGET_IS_XAP
-extern RealRegister local_base(Binder *b, int32 k);
-extern int32 local_address(Binder *b, int32 k);
-#else
 extern RealRegister local_base(Binder *b);
 /* Returns the base register to be used in accessing the object b (must be
  * local).
@@ -69,9 +76,7 @@ extern RealRegister local_base(Binder *b);
 extern int32 local_address(Binder *b);
 /* Returns the offset from local_base(b) to be used in accessing object b.
  */
-#endif
 
-#ifndef TARGET_HAS_HARVARD_SEGS
 extern void setlabel(LabelNumber *l);
 /* Sets the argument label at the current code position.
  * Although the idea of setlabel is target independent, it is in the mc-dep
@@ -81,12 +86,36 @@ extern void setlabel(LabelNumber *l);
  */
 
 extern void branch_round_literals(LabelNumber *m);
-#endif /* TARGET_HAS_HARVARD_SEGS */
+
+/* Encouraged by a comment that only ARM used mustlitby, it has been removed
+   from the codebuf interface, and the initialisations of it which used to
+   happen in codebuf.c turned into calls of the following function. Targets
+   which don't care will just refrain from setting localcg_newliteralpool_exists
+ */
+#ifdef localcg_newliteralpool_exists
+extern void localcg_newliteralpool(void);
+#else
+#define localcg_newliteralpool() 0
+#endif
+#ifdef TARGET_HAS_MULTIPLE_CODE_AREAS
+void localcg_endcode(void);
+#endif
 
 extern void show_instruction(J_OPCODE op, VRegInt r1, VRegInt r2, VRegInt m);
 
 extern void localcg_reinit(void);       /* under threat (use J_ENTER)   */
 extern void localcg_tidy(void);         /* ditto (use J_ENDPROC)        */
+
+#ifdef TARGET_IS_ARM
+/* Maybe more widely used later */
+#ifdef TARGET_IS_THUMB
+void CorruptsRegisters(Icode *p, RealRegSet *corrupts);
+#endif
+void FixedRegisterUse(Icode *p, RealRegSet *clashwith_in, RealRegSet *clashwith_out);
+bool UnalignedLoadMayUse(RealRegister r);
+  /* A special purpose version of FixedRegisterUse, but called before it's   */
+  /* known what Icode the load is going to expand into.                      */
+#endif
 
 /***************************************************************************/
 /*                Interface to the object code formatter                   */
@@ -153,17 +182,6 @@ extern void request_stub(Symstr *name);
 extern void asm_header(void);
 extern void asm_trailer(void);
 extern void display_assembly_code(Symstr *);
-#ifdef TARGET_KEEP_COMMENT
-extern void asm_listcomment(char *);
-extern void asm_listeof(char *);
-#endif
-#ifdef TARGET_IS_XAP_OR_NEC
-extern char asm_codesegname[128];
-#endif
-#ifdef TARGET_HAS_C4P_SECTS
-extern int find_dataseg(char *);
-extern void set_dataseg(int, char *);
-#endif
 
 #endif
 
@@ -174,9 +192,12 @@ extern void set_dataseg(int, char *);
 #define DBG_LINE 1           /* line info -- reduces peepholing     */
 #define DBG_PROC 2           /* top level info -- no change to code */
 #define DBG_VAR  4           /* local var info -- no leaf procs     */
-#define DBG_KEEPCODE  8      /* don't inhibit dead-code if DBG      */
-                             /*   (see usrdbgk())                   */
-#define DBG_ANY  (DBG_LINE|DBG_PROC|DBG_VAR)
+#define DBG_PP   8
+#ifdef TARGET_DEBUGGER_WANTS_MACROS
+#  define DBG_ANY (DBG_LINE|DBG_PROC|DBG_VAR|DBG_PP)
+#else
+#  define DBG_ANY (DBG_LINE|DBG_PROC|DBG_VAR)
+#endif
 
 #ifdef TARGET_HAS_DEBUGGER
 
@@ -202,22 +223,18 @@ extern void set_dataseg(int, char *);
 #define DT_UCHAR    19
 #define DT_MAX      19
 
-  extern char dbg_name[4];
+  extern char dbg_name[];
   extern int usrdbgmask;
-#ifdef TARGET_IS_XAP
-#  define usrdbgk(DBG_WHAT) \
-     (usrdbgmask & (DBG_WHAT) && usrdbgmask & DBG_KEEPCODE)
-#else
-#  define usrdbgk(DBG_WHAT) usrdbg(DBG_WHAT)
-#endif
 #  define usrdbg(DBG_WHAT) (usrdbgmask & (DBG_WHAT))
   extern int32 dbg_tablesize(void);
   extern int32 dbg_tableindex(int32 dt_number);
   extern void *dbg_notefileline(FileLine fl);
   extern void dbg_addcodep(void *debaddr, int32 codeaddr);
   extern bool dbg_scope(BindListList *, BindListList *);
+  extern void dbg_final_src_codeaddr(int32, int32);
 
-#ifdef TARGET_HAS_BSS
+
+#  ifdef TARGET_HAS_BSS
 #    define DS_EXT 1  /* bits in stgclass argument of dbg_topvar */
 #    define DS_BSS 2
 #    define DS_CODE 4
@@ -225,10 +242,10 @@ extern void set_dataseg(int, char *);
 #    define DS_UNDEF 16
     extern void dbg_topvar(Symstr *name, int32 addr, TypeExpr *t, int stgclass,
                            FileLine fl);
-#else
+#  else
     extern void dbg_topvar(Symstr *name, int32 addr, TypeExpr *t, bool ext,
                            FileLine fl);
-#endif
+#  endif
   extern void dbg_type(Symstr *name, TypeExpr *t, FileLine fl);
   extern void dbg_proc(Symstr *name, TypeExpr *t, bool ext, FileLine fl);
   extern void dbg_locvar(Binder *name, FileLine fl);
@@ -238,10 +255,22 @@ extern void set_dataseg(int, char *);
   extern void dbg_bodyproc(void);
   extern void dbg_return(int32 addr);
   extern void dbg_xendproc(FileLine fl);
+#  ifdef TARGET_DEBUGGER_WANTS_MACROS
+  typedef struct dbg_ArgList dbg_ArgList;
+  struct dbg_ArgList {
+      char const *name;
+      dbg_ArgList *next;
+  };
+  extern void dbg_define(char const *name, bool objectmacro, char const *body,
+                         dbg_ArgList const *args, FileLine fl);
+  extern void dbg_undef(char const *name, FileLine fl);
+#  else
+#    define dbg_undef(a, b)
+#    define dbg_define(a, b, c, d, e)
+#  endif
   extern void dbg_init(void);
 #else
 #  define usrdbg(DBG_WHAT)               0
-#  define usrdbgk(DBG_WHAT)              0
 #  define dbg_tablesize()                0
 #  define dbg_tableindex(a)              0
 #  define dbg_notefileline(a)            0
@@ -258,6 +287,77 @@ extern void set_dataseg(int, char *);
 #  define dbg_locvar(a,b)
 #  define dbg_locvar1(a)
 #  define dbg_commblock(a, b, c)
+#  define dbg_undef(a, b)
+#  define dbg_define(a, b, c, d, e)
+#  define dbg_finalise()
+#  define dbg_setformat(a)
+#  define dbg_debugareaexists(a)        0
+#endif
+
+/***************************************************************************/
+/* Interface between debug table generator, object formatter and target    */
+/*                          code generator                                 */
+/***************************************************************************/
+
+#ifdef TARGET_HAS_DEBUGGER
+
+#include "xrefs.h"
+
+int32 local_fpaddress(Binder const *b);
+/* Returns the offset of the object from the fp (assuming that fp and sp
+ * have not been split in the frame containing the object ...).
+ */
+
+RealRegister local_fpbase(Binder const *b);
+
+void dbg_writedebug(void);
+/* Call from the object formatter to the debug table generator to
+ * cause tables to be output
+ */
+
+void obj_writedebug(void const *, int32);
+
+#define DBG_INTFLAG 0x80000000L
+/* flag in the size argument to obj_writedebug indicating that the things
+ * being written are 4-byte ints (to be byte reversed if appropriate);
+ */
+#define DBG_SHORTFLAG 0x40000000L
+/* flag in the size argument to obj_writedebug indicating that the things
+ * being written are 2-byte ints (to be byte reversed if appropriate);
+ * If neither flag is present, they are byte strings to be written as
+ * presented.
+ */
+
+void dbg_finalise(void);
+
+#  ifdef TARGET_HAS_FP_OFFSET_TABLES
+
+typedef struct FPList FPList;
+typedef struct {
+  FPList *fplist;
+  int32 startaddr, endaddr, saveaddr;
+  Symstr *codeseg;
+  int32 initoffset;
+} ProcFPDesc;
+
+struct FPList {
+  FPList *cdr;
+  int32 addr;
+  int32 change;
+};
+
+void obj_notefpdesc(ProcFPDesc const *);
+
+#  endif
+
+void dbg_setformat(int);
+
+bool dbg_debugareaexists(char const *name);
+
+Symstr *obj_notedebugarea(char const *name);
+void obj_startdebugarea(char const *name);
+void obj_enddebugarea(char const *name, DataXref *relocs);
+
 #endif
 
 /***************************************************************************/
@@ -268,7 +368,15 @@ typedef enum { KW_NONE, KW_OK, KW_MISSINGARG, KW_BADARG } KW_Status;
 
 extern KW_Status mcdep_keyword(const char *key, int *argp, char **argv);
 
+#ifdef TARGET_IS_INTERPRETER
+#define mcdep_config_option(n, t) 0
+#else
 extern bool mcdep_config_option(char name, char tail[]);
+#endif
+
+#ifdef TARGET_HAS_DATA_VTABLES
+extern bool mcdep_data_vtables(void);
+#endif
 
 extern void config_init(void);
 

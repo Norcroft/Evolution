@@ -6,9 +6,9 @@
  */
 
 /*
- * RCS $Revision: 1.10 $
- * Checkin $Date: 93/10/07 17:21:45 $
- * Revising $Author: irickard $
+ * RCS $Revision: 1.13 $
+ * Checkin $Date: 1995/09/18 14:59:23 $
+ * Revising $Author: enevill $
  */
 
 #ifndef _cg_h
@@ -24,15 +24,6 @@
 #include "jopcode.h"
 #endif
 
-extern int32 greatest_stackdepth;   /* needed for stack check code */
-extern int32 max_argsize;           /* for regalloc.c              */
-extern int32 cg_fnname_offset_in_codeseg;      /* for xxx/gen.c    */
-
-extern BindList *argument_bindlist; /* for regalloc.c              */
-
-extern int32 procflags;             /* see jopcode.h               */
-extern int32 procauxflags;
-
 extern bool has_main;
 
 extern J_OPCODE Q_swap(J_OPCODE);
@@ -40,16 +31,25 @@ extern J_OPCODE Q_swap(J_OPCODE);
    of a comparison
  */
 
-extern Binder *gentempvar(TypeExpr *t, VRegnum r);
-extern J_OPCODE cg_accessop(VRegnum r, J_OPCODE model);
+extern Binder *gentempvarofsort(RegSort sort);
 
+extern Binder *gentempvarofsortwithname(RegSort sort, char *name);
+
+#ifdef TARGET_IS_INTERPRETER
+#define cg_topdecl(x, fl) 0
+#define cg_reinit() 0
+#define cg_tidy() 0
+#else
 extern void cg_topdecl(TopDecl *x, FileLine fl);
+extern void cg_reinit(void);
+extern void cg_tidy(void);
+#endif
+
+extern void cg_topdecl2(BindList *local_binders, BindList *regvar_binders);
 
 extern void cg_init(void);
 
-extern void cg_reinit(void);
-
-extern void cg_tidy(void);
+extern void cg_sub_reinit(void);
 
 #endif
 

@@ -5,9 +5,9 @@
  */
 
 /*
- * RCS $Revision: 1.9 $ Codemist 10
- * Checkin $Date: 93/10/07 17:28:34 $
- * Revising $Author: irickard $
+ * RCS $Revision: 1.24 $ Codemist 9
+ * Checkin $Date: 1996/01/10 14:54:29 $
+ * Revising $Author: hmeeking $
  */
 
 /* This file is included after host.h, options.h and target.h and       */
@@ -46,7 +46,8 @@
 /* Allocating both a,b to datasegment initially allows one address      */
 /* constant to suffice.                                                 */
 #ifndef BSS_THRESHOLD
-#  define BSS_THRESHOLD 100
+/* ECN: Changed from 100 to 8 (Apr 95) */
+#  define BSS_THRESHOLD 8
 #endif
 
 #ifndef NTEMPREGS                       /* gentle upwards compatibility */
@@ -99,9 +100,6 @@
 #  endif
 #endif
 
-#ifndef sizeof_char
-#  define sizeof_char 1                 /* 1, 2, 4 (units are 8-bits) */
-#endif
 #ifndef sizeof_short
 #  define sizeof_short 2                /* 2, 4 */
 #endif
@@ -121,15 +119,29 @@
 #  define sizeof_float 4                /* 4 */
 #endif
 #ifndef sizeof_double
-#  define sizeof_double (target_singlefloat ? 4 : 8) /* 4, 8 */
+#  define sizeof_double 8               /* 8 */
 #endif
 #ifndef sizeof_ldble
-#  define sizeof_ldble 8                /* 8 */
+#  define sizeof_ldble sizeof_double    /* 8 */
 #endif
 
-#ifndef alignof_char
-#  define alignof_char sizeof_char      /* 1, 2, 4 */
+#ifdef MIN_ALIGNMENT_CONFIGURABLE
+   extern int32 alignof_struct_val;
+#  define alignof_struct alignof_struct_val
+#  ifndef alignof_struct_default
+#    define alignof_struct_default 4
+#  endif
+   extern int32 alignof_toplevel_static_var;
+#  define alignof_toplevel_static alignof_toplevel_static_var
+#  ifndef alignof_toplevel_static_default
+#    ifdef TARGET_HAS_NATURALLY_ALIGNED_STATICS
+#      define alignof_toplevel_static_default 1
+#    else
+#      define alignof_toplevel_static_default 4
+#    endif
+#  endif
 #endif
+
 #ifndef alignof_short
 #  define alignof_short sizeof_short    /* 2, 4 */
 #endif
@@ -149,7 +161,7 @@
 #  define alignof_float sizeof_float    /* 4 */
 #endif
 #ifndef alignof_double
-#  define alignof_double (target_singlefloat ? 4 : 4)  /* 2, 4, 8 */
+#  define alignof_double 4              /* 2, 4, 8 */
 #endif
 #ifndef alignof_ldble
 #  define alignof_ldble alignof_double  /* 8 */
@@ -157,14 +169,14 @@
 #ifndef alignof_struct
 #  define alignof_struct 4      /* 4, but stricter member alignment wins */
 #endif
-#ifndef alignof_toplevel
-#  define alignof_toplevel 4    /* min alignment for static things */
+#ifndef alignof_toplevel_auto     /* somewhat a hack.             */
+#  define alignof_toplevel_auto 4    /* min alignment for named things */
 #endif
-#ifndef alignof_stack
-#  define alignof_stack alignof_toplevel   /* min alignment of stack things */
+#ifndef alignof_toplevel_static
+#  define alignof_toplevel_static 4
 #endif
-#ifndef alignof_tophack        /* somewhat a hack.             */
-#  define alignof_tophack alignof_stack
+#ifndef alignof_literal
+#  define alignof_literal 4
 #endif
 #ifndef alignof_member          /* must be <= alignof_struct    */
 #  define alignof_member 1      /* min alignment for members    */
@@ -209,14 +221,89 @@
 #define TARGET_LACKS_DIVIDE_LITERALS 1
 #endif
 
+#ifdef TARGET_LDRK_MAX
+#  ifndef TARGET_LDRBK_MAX
+#    define TARGET_LDRBK_MAX TARGET_LDRK_MAX
+#    define TARGET_LDRBK_MIN TARGET_LDRK_MIN
+#  endif
+#  ifndef TARGET_LDRWK_MAX
+#    define TARGET_LDRWK_MAX TARGET_LDRK_MAX
+#    define TARGET_LDRWK_MIN TARGET_LDRK_MIN
+#  endif
+#  ifndef TARGET_LDRLK_MAX
+#    define TARGET_LDRLK_MAX TARGET_LDRK_MAX
+#    define TARGET_LDRLK_MIN TARGET_LDRK_MIN
+#  endif
+#  ifndef TARGET_LDRFK_MAX
+#    define TARGET_LDRFK_MAX TARGET_LDRK_MAX
+#    define TARGET_LDRFK_MIN TARGET_LDRK_MIN
+#  endif
+#  ifndef TARGET_LDRDK_MAX
+#    define TARGET_LDRDK_MAX TARGET_LDRFK_MAX
+#    define TARGET_LDRDK_MIN TARGET_LDRFK_MIN
+#  endif
+#endif
+
+#ifdef TARGET_SP_LDRK_MAX
+#  ifndef TARGET_SP_LDRBK_MAX
+#    define TARGET_SP_LDRBK_MAX TARGET_SP_LDRK_MAX
+#    define TARGET_SP_LDRBK_MIN TARGET_SP_LDRK_MIN
+#  endif
+#  ifndef TARGET_SP_LDRWK_MAX
+#    define TARGET_SP_LDRWK_MAX TARGET_SP_LDRK_MAX
+#    define TARGET_SP_LDRWK_MIN TARGET_SP_LDRK_MIN
+#  endif
+#  ifndef TARGET_SP_LDRLK_MAX
+#    define TARGET_SP_LDRLK_MAX TARGET_SP_LDRK_MAX
+#    define TARGET_SP_LDRLK_MIN TARGET_SP_LDRK_MIN
+#  endif
+#  ifndef TARGET_SP_LDRFK_MAX
+#    define TARGET_SP_LDRFK_MAX TARGET_SP_LDRK_MAX
+#    define TARGET_SP_LDRFK_MIN TARGET_SP_LDRK_MIN
+#  endif
+#  ifndef TARGET_SP_LDRDK_MAX
+#    define TARGET_SP_LDRDK_MAX TARGET_SP_LDRFK_MAX
+#    define TARGET_SP_LDRDK_MIN TARGET_SP_LDRFK_MIN
+#  endif
+#endif
+
+#ifndef TARGET_MAX_FRAMESIZE
+#define TARGET_MAX_FRAMESIZE 256
+#endif
+
+#ifndef TARGET_LDRK_QUANTUM
+#  define target_ldrk_quantum(size, flt) 1
+#endif
+
+#ifndef TARGET_LDRK_QUANTUM
+#  define target_ldrk_quantum(size, flt) 1
+#endif
+
+#ifndef MEMCPYQUANTUM
+/* These might look like things that properly belong in cgdefs.h or     */
+/* jopcode.h, but unfortunately they're wanted by the front end to      */
+/* determine whether functions return structure results in registers    */
+/* (and so receive a result pointer as an extra first argument). This   */
+/* is needed because of C++ treatment of return struct-returning-fn()   */
+
+/* The following lines highlight the dependency on alignof_struct==4 of */
+/* code for struct-return in registers.                                 */
+#  ifdef TARGET_IS_ADENART
+#    define MEMCPYREG DBLREG
+#    define MEMCPYQUANTUM 8
+#  else
+#    define MEMCPYREG INTREG
+#    define MEMCPYQUANTUM 4
+#  endif
+#endif
+
 #ifndef sizeof_wchar            /* wide string element type.            */
 /* The following lines serve to make the compiler use wchar_t == int.   */
 /* This happens works with both 16 and 32 bit target ints.              */
 #  define sizeof_wchar sizeof_int
+#  define te_wchar     te_int   /* for sem.c */
+#  define NUM_WCHAR    NUM_INT  /* for lex.c */
 #endif
-/* Two slightly spurious constants for sem.c and lex.c.                 */
-#define te_wchar (sizeof_wchar>sizeof_int ? te_lint : te_int)
-#define NUM_WCHAR (sizeof_wchar>sizeof_int ? NUM_INT|NUM_LONG : NUM_INT)
 
 #ifndef LANGUAGE
 #  ifdef PASCAL
@@ -256,11 +343,18 @@
 #  ifndef ENABLE_SYN
 #     define ENABLE_SYN       1
 #  endif
-#  ifndef ENABLE_CG
-#     define ENABLE_CG        1
-#  endif
 #  ifndef ENABLE_BIND
 #     define ENABLE_BIND      1
+#  endif
+#  ifndef ENABLE_PP
+#     define ENABLE_PP        1
+#  endif
+#  ifndef ENABLE_AETREE
+#     define ENABLE_AETREE    1
+#  endif
+# ifndef TARGET_IS_INTERPRETER
+#  ifndef ENABLE_CG
+#     define ENABLE_CG        1
 #  endif
 #  ifndef ENABLE_TYPE
 #     define ENABLE_TYPE      1
@@ -292,12 +386,6 @@
 #  ifndef ENABLE_SPILL
 #     define ENABLE_SPILL     1
 #  endif
-#  ifndef ENABLE_AETREE
-#     define ENABLE_AETREE    1
-#  endif
-#  ifndef ENABLE_PP
-#     define ENABLE_PP        1
-#  endif
 #  ifndef ENABLE_DATA
 #     define ENABLE_DATA      1
 #  endif
@@ -307,6 +395,10 @@
 #  ifndef ENABLE_LOCALCG
 #     define ENABLE_LOCALCG   1
 #  endif
+#  ifndef ENABLE_TEMPLATE
+#     define ENABLE_TEMPLATE  1
+#  endif
+# endif
 #endif
 
 #ifdef ENABLE_LEX
@@ -409,6 +501,11 @@
 #else
 #  define DEBUG_LOCALCG 0
 #endif
+#ifdef ENABLE_TEMPLATE
+#  define DEBUG_TEMPLATE 0x200000L
+#else
+#  define DEBUG_TEMPLATE 0
+#endif
 
 /* The following generates no code in if (debugging(n)) if 'n' is 0 */
 extern long sysdebugmask;
@@ -460,6 +557,45 @@ extern long sysdebugmask;
 #include "sixchar.h"
 
 #endif /* POLICE_THE_SIX_CHAR_NAME_LIMIT */
+
+#ifndef software_floating_point_enabled
+#  define software_floating_point_enabled 1 /* only used if SOFTWARE_FLOATING_POINT defined */
+#endif
+
+#ifndef just32bits_
+#  define just32bits_(x) (x)
+#endif
+
+#ifndef target_stack_moves_once
+#  ifdef TARGET_STACK_MOVES_ONCE
+#    define target_stack_moves_once 1
+#  else
+#    define target_stack_moves_once 0
+#  endif
+#endif
+
+#ifndef two_address_code
+#  define two_address_code(op) 1
+#endif
+
+/* TARGET_PREFIX is a prefix to be attached to all builtin functions
+ * Eg. __rt_sdiv & co. This is required where there may be more than
+ * one version of the builtin function depending on compiler & options
+ * used, and it is a requirement that these interwork.
+ */
+#ifndef TARGET_PREFIX
+#  define TARGET_PREFIX(fname) fname
+#endif
+
+#ifndef TARGET_IS_ARM_OR_THUMB
+#ifdef TARGET_IS_ARM
+#define TARGET_IS_ARM_OR_THUMB 1
+#else
+#ifdef TARGET_IS_THUMB
+#define TARGET_IS_ARM_OR_THUMB 1
+#endif
+#endif
+#endif
 
 #endif
 

@@ -6,9 +6,9 @@
  */
 
 /*
- * RCS $Revision: 1.22 $ Codemist 61
- * Checkin $Date: 93/09/29 14:51:14 $
- * Revising $Author: lsmith $
+ * RCS $Revision: 1.51 $ Codemist 61
+ * Checkin $Date: 1995/10/15 21:14:18 $
+ * Revising $Author: amycroft $
  */
 
 /*
@@ -23,6 +23,7 @@
  *               to recognise '+\n='.  A #if would clobber things.
  */
 
+#ifndef _LEX_H
 #ifdef __STDC__
 #  include <stddef.h>
 #  include <string.h>
@@ -40,6 +41,26 @@
 #include "util.h"
 #include "aeops.h"
 #include "errors.h"
+#endif
+
+#ifndef CPLUSPLUS
+#define lex_getbodysym() 0
+#define lex_putbodysym() 0
+#endif
+
+/* 2 worlds stuff */
+typedef struct SymBuf {
+  struct SymBuf *prev; SymInfo prevsym;         /* for save/restore     */
+  SymInfo *buf;
+  int size, pos, count;
+  bool dup_hack;    /* template and d-or-e uses have diverged (sigh!)   */
+} SymBuf;
+
+static SymBuf *lexbuf_vec, *nextsym_lookaside;
+static int nextsym_put_handle;  /* only one template can be active      */
+static int lexbuf_max;
+static int buffersym_bufidx;
+/* */
 
 static FileLine endofsym_fl;
 
@@ -61,7 +82,7 @@ static int intofxdigit(int c)
 static char *lex_strptr;     /* next free char in lex_strbuf            */
 static char *lex_strend;     /* one beyond end of lex_strbuf            */
 
-static SymInfo prevlex, nextlex = {s_nothing};
+static SymInfo prevlex, prevlex_hif, nextlex = {s_nothing};
 
 static int curchar;          /* The look-ahead character */
 /* The next 3 variables are notionally a single tuple. Export to misc. */
@@ -92,16 +113,13 @@ static unsigned32 lexclass[1+255];
 /* the values are chosen for easy punning into sem.c types  */
 
 #define NUM_FLOAT  bitoftype_(s_double)
-#define NUM_FRAC   bitoftype_(s_frac)   /* only if EXTENSION_FRAC.      */
 #define NUM_INT    bitoftype_(s_int)
 #define NUM_LONG   bitoftype_(s_long)
 #define NUM_SHORT  bitoftype_(s_short)
 #define NUM_UNSIGN bitoftype_(s_unsigned)
-#ifdef CPLUSPLUS
-#  define NUM_CHAR bitoftype_(s_char)   /* Type of 'a' is char in C++.  */
-#else
-#  define NUM_CHAR NUM_INT              /* Type of 'a' is int in C.     */
-#endif
+#define NUM_CHAR   (LanguageIsCPlusPlus ? bitoftype_(s_char) : NUM_INT)
+                           /* Type of 'a' is int in C, char in C++.     */
+
 /* Note that NUM_WCHAR is defined in defaults.h.                        */
 
 
@@ -130,14 +148,7 @@ static unsigned32 lexclass[1+255];
 
 /* make_floating uses GLOBAL store for its value.  Is this reasonable? */
 static AEop make_floating(char *s, int32 flag)
-{   FloatCon *x = real_of_string(s, flag);
-#ifdef EXTENSION_FRAC
-    if (flag & NUM_FRAC)
-    {   curlex.a1.i = x->floatbin.irep[0];
-        curlex.a2.flag = flag ^ (NUM_FLOAT ^ NUM_INT);
-        return s_integer;
-    }
-#endif
+{   FloatCon *x = real_of_string(s,flag);
     curlex.a1.fc = x;
     return x->h0;
 }
@@ -236,7 +247,7 @@ case 16:while ((c = *cp++) != 0)
 /* The following routine does checks for 'constraint violation' when    */
 /* coverting a pp_number to a token, caller has already checked for     */
 /* illegal uses of 'e+' in fp or hex numbers.                           */
-static void lex_check_pp_number()
+static void lex_check_pp_number(void)
 {   if (curchar == '.' ||
         curchar != PP_EOF && (lexclass_(curchar) & l_idcont))
             cc_ansi_rerr(lex_rerr_pp_number);
@@ -300,28 +311,10 @@ static int32 read_floating(int32 k)
     }
     /* note that calls ensure that k > 0 here. */
     namebuf[k] = '\0';
-#ifdef EXTENSION_FRAC
-    for (;;)
-    {   if ((curchar == 'l' || curchar == 'L') &&
-                !(flag & (NUM_LONG|NUM_SHORT)))
-        {   flag |= NUM_LONG; nextchar(); continue;
-        }
-        if ((curchar == 'f' || curchar == 'F') &&
-                !(flag & (NUM_LONG|NUM_SHORT|NUM_FRAC)))
-        {   flag |= NUM_SHORT; nextchar(); continue;
-        }
-        if ((curchar == 'r' || curchar == 'R') &&
-                !(flag & (NUM_SHORT|NUM_FRAC)))
-        {   flag |= NUM_FRAC; nextchar(); continue;
-        }
-        break;
-    }
-#else
     switch (curchar)
     {   case 'l': case 'L': flag |= NUM_LONG; nextchar(); break;
         case 'f': case 'F': flag |= NUM_SHORT; nextchar(); break;
     }
-#endif
 /* Note that a fp number ending in 'E' above has already been diagnosed */
     lex_check_pp_number();
     return flag;
@@ -499,12 +492,11 @@ return_ch:
 
 static void read_string(int quote, AEop type, bool lengthwanted)
 {   char *symstrp = lex_strptr, *val = lex_strptr;
-    int chsize = type==s_wstring ? sizeof_wchar : sizeof_char;
 #ifdef EXTENSION_COUNTED_STRINGS
-    bool isMPWPascalString = NO;
+    bool isCountedString = NO;
     if (lengthwanted) {
         curchar = 0;
-        isMPWPascalString = YES;
+        isCountedString = YES;
     } else
 #endif
     nextchar();
@@ -531,20 +523,25 @@ static void read_string(int quote, AEop type, bool lengthwanted)
         if (val == symstrp && escaped && curchar == 'p' &&
             (feature & FEATURE_ALLOWCOUNTEDSTRINGS))
         { /* "\p" at start of string */
-            isMPWPascalString = YES;
+            isCountedString = YES;
+#ifdef EXTENSION_UNSIGNED_STRINGS
+            if (type == s_string) type = s_ustring;
+#endif
             escaped = NO;  /* discard the '\' : 'p' will be planted in the */
                            /* string and overwritten at the end            */
         }
 #endif
-        if (lex_string_char(symstrp, chsize, escaped))
-            symstrp += chsize;
+        if (lex_string_char(symstrp, (type == s_wstring ? sizeof_wchar : 1),
+                            escaped))
+            symstrp += (type == s_wstring ? sizeof_wchar : 1);
     }
     nextchar();
     if (quote == '"')
     {   curlex.a2.len = symstrp - val;
 #ifdef EXTENSION_COUNTED_STRINGS
-        if (isMPWPascalString)  /* treat wide strings rationally        */
-            lex_string_insert(val, chsize, curlex.a2.len-1);
+        if (isCountedString)  /* treat wide strings rationally        */
+            lex_string_insert(val, (type == s_wstring ? sizeof_wchar : 1),
+                              curlex.a2.len-1);
 #endif
         lex_strptr = &val[pad_to_word(curlex.a2.len)];   /* commit usage */
         curlex.a1.s = val;
@@ -560,14 +557,9 @@ static void read_string(int quote, AEop type, bool lengthwanted)
             if (n != 0) k = sizeof_wchar == 2 ? *(int16 *)val:
                                                 *(int32 *)val;
         }
-        else if (n == sizeof_char)
-        {   if (sizeof_char == 1)
-                k = (feature & FEATURE_SIGNED_CHAR) ? *(int8 *)val
-                                                    : *(unsigned8 *)val;
-            else
-                k = (feature & FEATURE_SIGNED_CHAR) ? *(int16 *)val
-                                                    : *(unsigned16 *)val;
-        }
+        else if (n == 1)
+            k = (feature & FEATURE_SIGNED_CHAR) ? *(int8 *)val
+                                                : *(unsigned8 *)val;
         else
         {   /* The effect of n>1 is implementation-defined */
             int32 i;
@@ -575,7 +567,7 @@ static void read_string(int quote, AEop type, bool lengthwanted)
                 cc_rerr(lex_rerr_empty_char);
             else if (n > sizeof_int)
                 cc_rerr(lex_rerr_overlong_char), n = sizeof_int;
-            else
+            else if (!(suppress & D_MPWCOMPATIBLE))
                 cc_warn(lex_warn_multi_char);
             /* The following code follows pcc, and is host independent  */
             /* but assembles bytes 'backwards' on 68000-sex machines.   */
@@ -594,6 +586,9 @@ static void read_string(int quote, AEop type, bool lengthwanted)
     }
 }
 
+#define CPP_word 256      /* identifier (but warned) for C, keyword for C++ */
+#define CPP_word2 512     /* keyword for C++, but currently warned+ident.   */
+
 static AEop next_basic_sym(void)
 /* all of nextsym() except debug info */
 {   unsigned32 charinfo;
@@ -601,10 +596,7 @@ static AEop next_basic_sym(void)
     FileLine startofsym_fl;
 
     if (endofsym_fl.filepos != -1 && !pp_inhashif)
-    {   int32 ofilepos = curlex.fl.filepos;
         curlex.fl = endofsym_fl;
-        curlex.fl.filepos = ofilepos & 0x80000000;
-    }
 
     if (curchar == NOTACHAR) nextchar();
     startofsym_fl = curlex.fl;
@@ -654,25 +646,38 @@ case l_idstart:
                 read_string(curchar, s_ustring, YES);
 #endif
             else
-            {   curlex.a1.sv = sym_lookup(namebuf, SYM_GLOBAL);
-#ifdef CPLUSPLUS
-#  define CPP_word 0            /* treat as per C keyword.      */
-#else
-#  define CPP_word 256          /* treat as warning for of id.  */
+            {   int32 type;
+                curlex.a1.sv = sym_lookup(namebuf, SYM_GLOBAL);
+                type = symtype_(curlex.a1.sv);
 /* To prepare for C++, give a warning ONCE per file in ANSI mode when a */
 /* C++ keyword is used as a C identifier.                               */
-                if (symtype_(curlex.a1.sv) & CPP_word)
-                    symtype_(curlex.a1.sv) = s_identifier,
-                    cc_ansi_warn(lex_warn_cplusplusid, curlex.a1.sv);
+                if (type & (CPP_word|CPP_word2)) {
+                    if (LanguageIsCPlusPlus)
+                    {   symtype_(curlex.a1.sv) = type &= ~CPP_word;
+                        if (type & CPP_word2)
+                        {   symtype_(curlex.a1.sv) = type = s_identifier;
+                            cc_ansi_warn(lex_warn_cplusplusid, curlex.a1.sv);
+                        }
+                    }
+                    else {
+                        int32 tflag = type & (CPP_word|CPP_word2);
+                        symtype_(curlex.a1.sv) = type = s_identifier;
+#ifndef FOR_ACORN
+                        if (tflag != (CPP_word|CPP_word2))
+                            /* don't warn for wchar_t which appears       */
+                            /* stdlib.h and stddef.h in C mode.           */
+                            cc_ansi_warn(lex_warn_cplusplusid, curlex.a1.sv);
 #endif
+                    }
+                }
 /* There are no keywords during pp (including #if), following ANSI/Reiser. */
 /* Consider adding a new s_ppidentifier which could aid lex.c.             */
 #ifdef ALLOW_KEYWORDS_IN_HASHIF
-                curlex.sym = symtype_(curlex.a1.sv);
+                curlex.sym = type;
 #else
-                curlex.sym = pp_inhashif ? s_identifier :
-                                           symtype_(curlex.a1.sv);
+                curlex.sym = pp_inhashif ? s_identifier : type;
 #endif
+                curlex.a2.flag = 0;
 #ifdef EXTENSION_VALOF
 /* The following represents a rather nasty piece of context-sensitive      */
 /* hackery - inside a valof block the word 'resultis' is recognized as a   */
@@ -698,12 +703,12 @@ case l_digit1:                  /* decimal int or floating */
             curlex.sym = read_number(10);
             break;
 case l_dot:     nextchar();
-#ifdef CPLUSPLUS
+
                 if (curchar == '*')
                         curlex.sym = s_dotstar,
                         curchar = NOTACHAR;
                 else
-#endif
+
                 if (isdigit(curchar))
                 {   int32 flag, k = 0;
                     namebuf[k++] = '.';
@@ -765,12 +770,12 @@ case l_minus:   nextchar();   /* l_selfglue but for "->", (C++)"->*". */
                     curchar = NOTACHAR;
                 else if (curchar=='>')
                   { nextchar();
-#ifdef CPLUSPLUS
+
                     if (curchar=='*')
                         curlex.sym = s_arrowstar,
                         curchar = NOTACHAR;
                     else
-#endif
+
                         curlex.sym = s_arrow;
                   }
                 else
@@ -785,146 +790,67 @@ case l_quote1:
 case l_quote2:  read_string(curchar, s_string, NO);
                 break;
     }
-    /* BEWARE & = and * = in default argument lists in C++. */
-#ifndef CPLUSPLUS
-    /* recognise whitespace (but NOT newlines) in += etc    */
-    /* as a sop to olde-style (K&R) C.                      */
-    if (can_have_becomes(curlex.sym))
-    {   if (curchar == NOTACHAR) nextchar();
+    if (can_have_becomes(curlex.sym) && (feature & FEATURE_PCC))
+    {   /* recognise whitespace (but NOT newlines) in += etc */
+        /* as a sop to olde-style (K&R) C.                   */
+        /* BEWARE & = and * = in C++ default argument lists. */
+        /* So, this may only be done in cc -pcc mode...      */
+        if (curchar == NOTACHAR) nextchar();
         while (curchar == ' ' || curchar == '\t') nextchar();
-/* Beware the effect of pp.c if you ever want to extend this over a '\n'. */
         if (curchar == '=')
         {   curlex.sym = and_becomes(curlex.sym);
             curchar = NOTACHAR;
-            cc_ansi_rerr(lex_err_illegal_whitespace, curlex.sym);
         }
     }
-#endif
     endofsym_fl = curlex.fl;     /* save for next call */
     if (!pp_inhashif)
       curlex.fl = startofsym_fl; /* reset to start of symbol */
-    return(curlex.sym);
+    return curlex.sym;
 }
 
-
-/* exported routines... */
-
-#ifdef CPLUSPLUS
-/* C++ requires function definitions within class definitions to be     */
-/* lexed, but not parsed (typedefs) nor typechecked [ES, p178].         */
-/* We save them as as token streams until we are ready -- the end       */
-/* is observable by counting {}'s.                                      */
-/* Note there is a complication about reading such a saved token stream */
-/* since such a fn body may contain embedded fns within yet other       */
-/* (local) class definitions.                                           */
-/* Globalise everything to be buffered for now (very little to do).     */
-typedef struct SymBuf {
-  struct SymBuf *prev; SymInfo prevsym;         /* for save/restore     */
-  SymInfo *buf;
-  int size, pos;
-} SymBuf;
-static int lexbuf_max;
-static SymBuf *lexbuf_vec, *nextsym_lookaside;
-static const SymBuf lexbuf_empty =
-   { 0, { s_eof }, (SymInfo *)DUFF_ADDR, 0, /*pos*/ -1 };
-#define INIT_NLEXBUFS 8         /* initially max 8 member fn defs.      */
-#define INIT_LEXBUFSIZE 32      /* initially max 32 tokens per def.     */
-
-static int lex_findsavebuf()
-{   int i;
-    for (i = 0; i<lexbuf_max; i++)
-        if (lexbuf_vec[i].pos < 0) return i;
-    {   int nmax = (lexbuf_max == 0 ? INIT_NLEXBUFS : 2*lexbuf_max);
-        SymBuf *nvec = (SymBuf *)GlobAlloc(SU_Other,
-                                     (int32)nmax * sizeof(SymBuf));
-        memcpy(nvec, lexbuf_vec, lexbuf_max * sizeof(SymBuf));
-        for (i = lexbuf_max; i < nmax; i++) nvec[i] = lexbuf_empty;
-        lexbuf_max = nmax, lexbuf_vec = nvec;
-        return lex_findsavebuf();       /* retry */
-    }
-}
-
-int lex_savebody()
-{   int h = lex_findsavebuf();
-    SymBuf *p = &lexbuf_vec[h];
-    int k = 0, braces = 0;
-    p->pos = 0;                 /* inuse + ready for reader.        */
-/* save all the tokens in p->buf, followed by a s_eof token.        */
-    for (;;)
-    {   if (k >= p->size)
-        {   int nsize = (p->size == 0 ? INIT_LEXBUFSIZE : p->size*2);
-            SymInfo *nbuf = (SymInfo *)GlobAlloc(SU_Other,
-                                           (int32)nsize * sizeof(SymInfo));
-            memcpy(nbuf, p->buf, p->size * sizeof(SymInfo));
-            p->size = nsize, p->buf = nbuf;
-        }
-        lex_beware_reinit();                    /* globalise curlex     */
-        p->buf[k++] = curlex;
-        switch (curlex.sym)
-        {   case s_lbrace: braces++;
-            default:       nextsym();
-                           break;
-            case s_rbrace: if (--braces == 0) curlex.sym = s_eof;
-                           else nextsym();
-                           break;
-            case s_eof:    return h;
-        }
-    }
-}
-
-void lex_openbody(int h)
-{   lexbuf_vec[h].prev = nextsym_lookaside;
-    lex_beware_reinit();                        /* globalise curlex     */
-    lexbuf_vec[h].prevsym = curlex;
-    nextsym_lookaside = &lexbuf_vec[h];
-    nextsym();                  /* currently always '{'!                */
-}
-
-void lex_closebody()
-{   nextsym_lookaside -> pos = -1;
-    curlex = nextsym_lookaside -> prevsym;
-    nextsym_lookaside = nextsym_lookaside -> prev;
-}
-
-static void lex_getbodysym()
-{   curlex = nextsym_lookaside->buf[nextsym_lookaside->pos];
-    if (curlex.sym != s_eof) nextsym_lookaside->pos++;
-}
-
-/* check nextsym_for_hashif uses consistent!.                           */
-#endif
 
 void ungetsym(void)
-{   nextlex = curlex;    /* Surprisingly, this copying is as efficient */
-    curlex = prevlex;    /* as pointer juggling - perhaps more so.     */
+{   if (nextlex.sym != s_nothing) syserr("too many ungetsyms");
+    if ((debugging(DEBUG_LEX))!=0)
+        {   cc_msg("<ungetsym: sym %ld=%s %lx",
+                            (long)curlex.sym,
+                            sym_name_table[curlex.sym & s_SYMMASK],
+                            (long)curlex.a1.i);
+            if (curlex.sym==s_identifier)
+                cc_msg(" $r", curlex.a1.sv);
+            cc_msg(">\n");
+        }
+    nextlex = curlex;    /* Surprisingly, this copying is as efficient */
+                         /* as pointer juggling - perhaps more so.     */
+    if (pp_inhashif) curlex = prevlex_hif; else curlex = prevlex;
 }
 
 AEop nextsym(void)
 /* sets curlex.sym to next symbol */
 {
     errs_on_this_sym = 0;
-    prevlex = curlex;
+    if (pp_inhashif) prevlex_hif = curlex; else prevlex = curlex;
     if (nextlex.sym != s_nothing)
     {   curlex = nextlex;
         nextlex.sym = s_nothing;
     }
-    else
-#ifdef CPLUSPLUS
-    if (nextsym_lookaside && !pp_inhashif)
+    else if (LanguageIsCPlusPlus && nextsym_lookaside && !pp_inhashif)
         lex_getbodysym();
     else
-#endif
-        next_basic_sym();
-    if ((debugging(DEBUG_LEX))!=0)
+    {   next_basic_sym();
+        if (LanguageIsCPlusPlus && nextsym_put_handle >= 0 && !pp_inhashif)
+            lex_putbodysym();
+    }
+    if (debugging(DEBUG_LEX))
         {   cc_msg("<nextsym: sym %ld=%s %lx",
                             (long)curlex.sym,
-                            sym_name_table[curlex.sym],
+                            sym_name_table[curlex.sym & s_SYMMASK],
                             (long)curlex.a1.i);
             if (curlex.sym==s_identifier)
                 cc_msg(" $r", curlex.a1.sv);
             cc_msg(">\n");
         }
-    return(curlex.sym);
+    return curlex.sym;
 }
 
 AEop nextsym_for_hashif(void)
@@ -937,6 +863,61 @@ AEop nextsym_for_hashif(void)
 static void setuplexclass1(char *s, unsigned32 l)
 {   unsigned char ch;
     while ((ch = *s++) != 0) lexclass_(ch) = l | l_idcont;
+}
+
+static void init_sym_name_table(void)
+{   /* add entries for error messages for non-reserved words, e.g. block */
+    /* (currently) non-table driven... */
+    sym_name_table[s_error]       = msg_lookup(errname_error);       /* <previous error> */
+    sym_name_table[s_invisible]   = msg_lookup(errname_invisible);   /* <invisible> */
+    sym_name_table[s_let]         = msg_lookup(errname_let);         /* <let> */
+    sym_name_table[s_character]   = msg_lookup(errname_character);   /* <character constant> */
+    sym_name_table[s_wcharacter]  = msg_lookup(errname_wcharacter);  /* <wide character constant> */
+    sym_name_table[s_boolean]     = msg_lookup(errname_boolean);     /* <boolean constant> */
+    sym_name_table[s_integer]     = msg_lookup(errname_integer);     /* <integer constant> */
+    sym_name_table[s_floatcon]    = msg_lookup(errname_floatcon);    /* <floating constant> */
+    sym_name_table[s_string]      = msg_lookup(errname_string);      /* <string constant> */
+    sym_name_table[s_wstring]     = msg_lookup(errname_wstring);     /* <wide string constant> */
+    sym_name_table[s_identifier]  = msg_lookup(errname_identifier);  /* <identifier> */
+    sym_name_table[s_pseudoid]    = msg_lookup(errname_identifier);  /* <identifier> */
+    sym_name_table[s_binder]      = msg_lookup(errname_binder);      /* <variable> */
+    sym_name_table[s_tagbind]     = msg_lookup(errname_tagbind);     /* <struct/union tag> */
+    sym_name_table[s_cond]        = msg_lookup(errname_cond);        /* _?_:_ */
+    sym_name_table[s_displace]    = msg_lookup(errname_displace);    /* ++ or -- */
+    sym_name_table[s_postinc]     = msg_lookup(errname_postinc);     /* ++ */
+    sym_name_table[s_postdec]     = msg_lookup(errname_postdec);     /* -- */
+    sym_name_table[s_arrow]       = msg_lookup(errname_arrow);       /* -> */
+    sym_name_table[s_arrowstar]   = msg_lookup(errname_arrowstar);   /* ->* */
+    sym_name_table[s_dotstar]     = msg_lookup(errname_dotstar);     /* .* */
+    sym_name_table[s_ctor]        = msg_lookup(errname_constructor); /* <constructor> */
+    sym_name_table[s_dtor]        = msg_lookup(errname_destructor);  /* <destructor> */
+    sym_name_table[s_addrof]      = msg_lookup(errname_addrof);      /* unary & */
+    sym_name_table[s_content]     = msg_lookup(errname_content);     /* unary * */
+    sym_name_table[s_monplus]     = msg_lookup(errname_monplus);     /* unary + */
+    sym_name_table[s_neg]         = msg_lookup(errname_neg);         /* unary - */
+    sym_name_table[s_fnap]        = msg_lookup(errname_fnap);        /* <function argument> */
+    sym_name_table[s_subscript]   = msg_lookup(errname_subscript);   /* <subscript> */
+    sym_name_table[s_cast]        = msg_lookup(errname_cast);        /* <cast> */
+    sym_name_table[s_sizeoftype]  = msg_lookup(errname_sizeoftype);  /* sizeof */
+    sym_name_table[s_sizeofexpr]  = msg_lookup(errname_sizeofexpr);  /* sizeof */
+    sym_name_table[s_ptrdiff]     = msg_lookup(errname_ptrdiff);     /* - */   /*  for (a-b)=c msg */
+    sym_name_table[s_endcase]     = msg_lookup(errname_endcase);     /* break */
+    sym_name_table[s_block]       = msg_lookup(errname_block);       /* <block> */
+    sym_name_table[s_decl]        = msg_lookup(errname_decl);        /* decl */
+    sym_name_table[s_fndef]       = msg_lookup(errname_fndef);       /* fndef */
+    sym_name_table[s_typespec]    = msg_lookup(errname_typespec);    /* typespec */
+    sym_name_table[s_typedefname] = msg_lookup(errname_typedefname); /* typedefname */
+#ifdef EXTENSION_VALOF
+    sym_name_table[s_valof]       = msg_lookup(errname_valof);       /* valof */
+#endif
+    sym_name_table[s_ellipsis]    = msg_lookup(errname_ellipsis);    /* ... */
+    sym_name_table[s_eol]         = msg_lookup(errname_eol);         /* \\n */
+    sym_name_table[s_eof]         = msg_lookup(errname_eof);         /* <eof> */
+#ifdef RANGECHECK_SUPPORTED
+    sym_name_table[s_rangecheck]  = msg_lookup(errname_rangecheck);  /* <rangecheck> */
+    sym_name_table[s_checknot]    = msg_lookup(errname_checknot);    /* <check> */
+#endif
+    sym_name_table[s_init]        = msg_lookup(errname_init);        /* = */
 }
 
 void lex_init()         /* C version  */
@@ -961,11 +942,7 @@ void lex_init()         /* C version  */
         { mklc(l_eqglue, s_xor, s_xorequal, 0),     "^", "^=" },
         { mklc(l_eqglue, s_boolnot, s_notequal, 0), "!", "!=" },
         /* now the self-gluers (only the single form is assignable) */
-#ifdef CPLUSPLUS
-        { mklc(l_selfglue, s_colon, s_coloncolon, 0),  ":", "::", "" },
-#else
-        { mklc(l_noglue, s_colon, 0, 0),     ":" },
-#endif
+        { mklc(l_noglue, s_colon, 0, 0),     ":" }, /* maybe updated later (C++) */
         { mklc(l_selfglue, s_assign, s_equalequal, s_equalequal),
                                                     "=", "==", "==" },
         { mklc(l_selfglue, s_and,  s_andand, s_andequal),
@@ -1018,11 +995,7 @@ void lex_init()         /* C version  */
         { "void",     s_void },
         { "while",    s_while },
 /* C extension:                                                         */
-#ifdef EXTENSION_FRAC
-        { "__frac",   s_frac},
-#else
         { "__int64", s_longlong},
-#endif
 /* specials to help the compiler/library.                               */
         { "___toplevel",s_toplevel },
         { "___type",  s_typestartsym },
@@ -1030,6 +1003,7 @@ void lex_init()         /* C version  */
         { "___weak",  s_weak },
         { "__pure",    s_pure },
         { "__value_in_regs", s_structreg },
+        { "__packed", s_unaligned},
 #ifdef TARGET_IS_ARM
         { "__swi",    s_swi },
         { "__swi_indirect", s_swi_i },
@@ -1041,8 +1015,9 @@ void lex_init()         /* C version  */
         { "__irq", s_irq },
         { "__global_reg", s_globalreg },
         { "__global_freg", s_globalfreg },
+        { "__inline",   s_inline },
 
-#define N_PCC_FUSSY_KEYWORDS 41 /* everything above!  Bad style!!!      */
+#define N_PCC_FUSSY_KEYWORDS 42 /* everything above!  Bad style!!!      */
 /* The following are ANSI C keywords, but old PCC (unix) sources        */
 /* (compile with -pcc -fussy) may treat them as identifiers!            */
         { "const",    s_const },
@@ -1050,9 +1025,11 @@ void lex_init()         /* C version  */
         { "volatile", s_volatile },
 /* C++ only keywords (redeclared as s_identifier on use in C mode)      */
         { "asm",      CPP_word|s_asm },
+        { "bool",     CPP_word|s_bool },
         { "catch",    CPP_word|s_catch },
         { "class",    CPP_word|s_class },
         { "delete",   CPP_word|s_delete },
+        { "false",    CPP_word|s_false },
         { "friend",   CPP_word|s_friend },
         { "inline",   CPP_word|s_inline },
         { "new",      CPP_word|s_new },
@@ -1063,12 +1040,43 @@ void lex_init()         /* C version  */
         { "template", CPP_word|s_template },
         { "this",     CPP_word|s_this },
         { "throw",    CPP_word|s_throw },
+        { "true",     CPP_word|s_true },
         { "try",      CPP_word|s_try },
         { "virtual",  CPP_word|s_virtual },
+/* ANSI C++ draft 950428 adds the following keywords (just warn for now). */
+        { "const_cast",       CPP_word2|s_error },
+        { "dynamic_cast",     CPP_word2|s_error },
+        { "mutable",          CPP_word2|s_error },
+        { "namespace",        CPP_word2|s_error },
+        { "reinterpret_cast", CPP_word2|s_error },
+        { "static_cast",      CPP_word2|s_error },
+        { "typeid",           CPP_word2|s_error },
+        { "typename",         CPP_word2|s_error },
+        { "using",            CPP_word2|s_error },
+        { "wchar_t",          CPP_word|CPP_word2|s_error },
+/* ANSI C++ draft 950428 adds operator alternative representations...     */
+        { "bitand",           CPP_word2|s_error },
+        { "and",              CPP_word2|s_error },
+        { "bitor",            CPP_word2|s_error },
+        { "or",               CPP_word2|s_error },
+        { "xor",              CPP_word2|s_error },
+        { "compl",            CPP_word2|s_error },
+        { "and_eq",           CPP_word2|s_error },
+        { "or_eq",            CPP_word2|s_error },
+        { "xor_eq",           CPP_word2|s_error },
+        { "not",              CPP_word2|s_error },
+        { "not_eq",           CPP_word2|s_error },
 #ifdef EXTENSION_VALOF
         { "resultis", s_resultis },
 #endif
     };
+
+  {
+    char *unset=msg_lookup(errname_unset); /* for speed */
+    for (i = 0; i < s_NUMSYMS; i++) sym_name_table[i] = unset;
+  }
+    init_sym_name_table();  /* language independent inits... */
+
     /* although lexclass[] is notionally constant, C's initialisation
        facilities do not conveniently enable us to initialise it... */
     for (i = 0; i <= 255; i++) lexclass[i] = l_illegal;
@@ -1091,7 +1099,7 @@ void lex_init()         /* C version  */
         for (u = 0; u < n; ++u)
         {   char *name = ns[u].name; int32 sym = ns[u].sym;
             sym_insert(name, sym);
-            sym_name_table[sym & ~CPP_word] = name;
+            sym_name_table[sym & ~(CPP_word|CPP_word2)] = name;
         }
     }
     {   unsigned int u;
@@ -1103,6 +1111,10 @@ void lex_init()         /* C version  */
             if ((s = (lc >> 16) & 255) != 0) sym_name_table[s] = sp[u].name1;
             if ((s = (lc >> 24) & 255) != 0) sym_name_table[s] = sp[u].name2;
         }
+        if (LanguageIsCPlusPlus)
+        {   lexclass[':'] = mklc(l_selfglue, s_colon, s_coloncolon, 0);
+            sym_name_table[s_coloncolon] = "::";
+        }
     }
 #ifdef EXTENSION_VALOF
 /* 'resultis' is a funny (experimental) syntax extension */
@@ -1113,9 +1125,10 @@ void lex_init()         /* C version  */
     errs_on_this_sym = 0;
     lex_strend = lex_strptr = (char *)DUFF_ADDR;
     endofsym_fl.filepos = -1;  /* mark as invalid */
-#ifdef CPLUSPLUS
+
     lexbuf_max = 0; lexbuf_vec = (SymBuf *)DUFF_ADDR; nextsym_lookaside = 0;
-#endif
+    buffersym_bufidx = -1;
+    nextsym_put_handle = -1;
 }
 
 void lex_beware_reinit()

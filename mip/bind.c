@@ -6,15 +6,16 @@
  */
 
 /*
- * RCS $Revision: 1.39 $  Codemist 56
- * Checkin $Date: 93/10/01 15:23:28 $
- * Revising $Author: hmeekings $
+ * RCS $Revision: 1.130 $  Codemist 55
+ * Checkin $Date: 1996/01/10 14:54:08 $
+ * Revising $Author: hmeeking $
  */
 
 /* AM memo: @@@ the use of assert(0) in the development of PASCAL is    */
 /* untidy but only temporary.                                           */
 
-/* AM Mar-95: fix odd bugs in >BSS_THRESHOLD const tentatives.          */
+/* #define DEBUG_TENTATIVE_DEFS 1        -- BUT ONLY during development */
+
 /* AM Dec-90: the BSS code was broken in several interesting ways.      */
 /*   Mend it, and move PCC mode nearer to being ANSI code with only     */
 /*   local differences.  u_tentative is now dead.                       */
@@ -22,6 +23,7 @@
 /* AM Jul-87: experiment with memo-ising globalize_typeexpr(). */
 /* exports globalize_int(), globalize_typeexpr() */
 
+#ifndef _BIND_H
 #include <stddef.h>         /* for offsetof() */
 #include <string.h>
 #include <ctype.h>
@@ -40,17 +42,21 @@
 #include "xrefs.h"          /* for LIT_LABEL */
 #include "errors.h"
 #include "aeops.h"
+/* for C-only compilers... */
+static int accessOK;
+#define merge_default_arguments(a,b) 0
+#define check_access(a,b) 0
+#define nullbinder(cl) 0
+#define set_linkage(b,l,m) 0
+#endif
 
 #ifdef PASCAL
 /* for production qualify compilers prefer syserr() over assert().      */
 #  include <assert.h>
 #endif
 
-#define EQtype_(t1,t2)   ((t1)->h0==(t2)->h0 && (t1)->typearg==(t2)->typearg \
-                          && (t1)->typespecbind==(t2)->typespecbind)
 
 static int gensymline, gensymgen;         /* For generating unique syms   */
-static int32 gensymlit;                   /* literal gensym names.        */
 static Symstr *(*hashvec)[BIND_HASHSIZE]; /* Symbol table buckets         */
 char *sym_name_table[s_NUMSYMS];          /* translation back to strings  */
 
@@ -72,10 +78,10 @@ static int lang_namecmp(char *s, char *t)
 #  define lang_namecmp(a, b) strcmp(a, b)
 #endif
 
-Symstr *sym_lookup(char *name, int glo)
+Symstr *(sym_lookup)(char const *name, int glo)
 {   int32 wsize;
     unsigned32 hash, temp;
-    char *s;
+    char const *s;
     Symstr *next, **lvptr = NULL;
   /*
    * 'glo' ==  SYM_LOCAL  => allocate in Binder store
@@ -87,7 +93,7 @@ Symstr *sym_lookup(char *name, int glo)
     else
     {   hash = 1;
         for (s = name; *s != 0; ++s)
-        {   temp = (hash << 7) & 0xffffffffu;
+        {   temp = just32bits_(hash << 7);
             hash = ((hash >> 25)^(temp >> 1)^(temp >> 4) ^
                                              lang_hashofchar(*s)) & 0x7fffffff;
         }
@@ -100,7 +106,7 @@ Symstr *sym_lookup(char *name, int glo)
     wsize = offsetof(Symstr, symname[0]) + padstrlen(strlen(name));
     next = glo != SYM_LOCAL ? (Symstr *) GlobAlloc(SU_Sym, wsize)
                             : (Symstr *) BindAlloc(wsize);
-    memclr((void *)next, (size_t)wsize);
+    memclr(next, (size_t)wsize);
     if (lvptr != NULL)
     {   *lvptr = next;
         symchain_(next) = NULL;
@@ -113,14 +119,14 @@ Symstr *sym_lookup(char *name, int glo)
     return(next);
 }
 
-Symstr *sym_insert(char *name, AEop type)
-{   Symstr *p = sym_lookup(name, SYM_GLOBAL);
+Symstr *sym_insert(char const *name, AEop type)
+{   Symstr *p = (sym_lookup)(name, SYM_GLOBAL);
     symtype_(p) = type;
     return(p);
 }
 
-Symstr *sym_insert_id(char *name)
-{   return sym_lookup(name, SYM_GLOBAL);
+Symstr *sym_insert_id(char const *name)
+{   return (sym_lookup)(name, SYM_GLOBAL);
 }
 
 static void check_extern(Symstr *s)
@@ -151,9 +157,9 @@ static void check_extern(Symstr *s)
         if (symfold_(p) == 0)
             symfold_(p) = s;
         if (symfold_(p) != s)
-            cc_err(bind_err_extern_clash,
-                   s, symfold_(p), (long)LINKER_NAME_MAX,
-                   LINKER_NAME_MONOCASE ? " monocase" : "");
+            cc_err(LINKER_NAME_MONOCASE ? bind_err_extern_clash_monocase,
+                                        : bind_err_extern_clash,
+                   s, symfold_(p), (long)LINKER_NAME_MAX);
     }
 #endif /* TARGET_HAS_LINKER_NAME_LIMIT */
 }
@@ -164,16 +170,6 @@ Symstr *gensymval(bool glo)
     /* (Not quite unique in that line 1 may occur in 2 files, but    */
     /*  we RELY on NO_CHAIN below to treat as unique).               */
     char name[30];
-    if (glo >= 2)
-    {
-#ifdef TARGET_IS_XAP
-        sprintf(name, "%s%04ld", glo==3 ? "?mem":"?lit", (long)++gensymlit);
-#else
-        sprintf(name, "__lit%04ld", (long)++gensymlit);
-#endif
-    }
-    else
-    {
 #ifdef TARGET_IS_CLIPPER
     /* the next line is a hack to ensure these gensyms are assemblable */
     /* Note that this HOPEs that the user has no names Intsym_nnn      */
@@ -183,69 +179,23 @@ Symstr *gensymval(bool glo)
         gensymline = curlex.fl.l, gensymgen = 1;
     else
         ++gensymgen;
-#ifdef TARGET_IS_XAP
-    sprintf(name, "?Anon%d_line%d", gensymgen, gensymline);
-#else
     sprintf(name, "<Anon%d_at_line_%d>", gensymgen, gensymline);
 #endif
-#endif
-    }
-    return gensymvalwithname(glo>0, name);
+    return sym_lookup(name, (glo ? SYM_GLOBAL+NO_CHAIN : SYM_LOCAL+NO_CHAIN));
 }
 
-Symstr *gensymvalwithname(bool glo, char *name)
+Symstr *gensymvalwithname(bool glo, char const *name)
 {
-    return sym_lookup(name, glo ? SYM_GLOBAL+NO_CHAIN : SYM_LOCAL+NO_CHAIN);
+    return sym_lookup(name, (glo ? SYM_GLOBAL+NO_CHAIN : SYM_LOCAL+NO_CHAIN));
 }
 
-bool isgensym(Symstr *sym)      /* actually is-unchained-gensym!        */
+bool isgensym(Symstr const *sym)      /* actually is-unchained-gensym!        */
 {   return symchain_(sym) == sym;
-}
-
-#ifdef TARGET_ASM_NAMES_LITERALS
-Binder *genlocalstaticbinder(Symstr *sv)
-{   char a[64];
-    char *p = a;
-    Symstr *r;
-    Binder *b;
-    int32 l = strlen(symname_(sv)) + strlen(symname_(currentfunction.symstr));
-    if (l > 50) p = (char *)SynAlloc(l+14);
-    sprintf(p, "%s?%s", symname_(currentfunction.symstr), symname_(sv));
-    r = sym_lookup(p, SYM_GLOBAL);
-    /* chain in this one so we can be sure names are unique.            */
-    if (bind_global_(r))
-    {   /* already seen, e.g. static f() { { static a;} {static a;}}.   */
-        sprintf(p, "%s?%s?%04ld", symname_(currentfunction.symstr),
-                symname_(sv), (long)++gensymlit);
-        r = sym_lookup(p, SYM_GLOBAL);
-    }
-    /* use 'int' since the local type may not have been globalized.     */
-    b = global_mk_binder(0, r, bitofstg_(s_static), te_int);
-    bind_global_(r) = b;        /* mark as seen (see above).            */
-    return b;
-}
-#endif
-
-/*
- * a temporary home before its demise...
- */
-
-int32 evaluate(Expr *a)
-{
-/* evaluate the compile-time expression a to yield an integer result     */
-    switch (h0_(a))
-    {
-case s_integer:
-        return(intval_(a));
-default:
-        moan_nonconst(a, bind_msg_const);
-        return 1;
-    }
 }
 
 Binder *global_mk_binder(Binder *b, Symstr *c, SET_BITMAP d, TypeExpr *e)
 {
-    int32 size = d & (bitofstg_(s_virtual)|b_globalregvar) ?
+    int32 size = d & (bitofstg_(s_virtual)|b_globalregvar|bitofstg_(s_auto)) ?
                      sizeof(Binder) : SIZEOF_NONAUTO_BINDER;
     Binder *p = (Binder*) GlobAlloc(SU_Bind, size);
  /*
@@ -257,21 +207,21 @@ Binder *global_mk_binder(Binder *b, Symstr *c, SET_BITMAP d, TypeExpr *e)
     h0_(p) = s_binder;
     bindcdr_(p)=b;
     bindsym_(p)=c;
-    bindsegsym_(p)=0;
     attributes_(p) = A_GLOBALSTORE;
-    p->bindstg=d;
-    p->bindtype=e;
-    p->bindaddr.i = 0;  /* soon BINDADDR_UNSET - remember 'datasegment' */
-#ifdef CPLUSPLUS
+    bindstg_(p) = d;
+    bindtype_(p) = e;
+    bindaddr_(p) = 0;  /* soon BINDADDR_UNSET - remember 'datasegment' */
     bindparent_(p) = 0;         /* local_scope->class_tag? */
     bindconst_(p) = 0;
-#endif
+    bindinline_(p) = 0;
 #ifdef PASCAL /*ECN*/
     p->bindlevel = 0;
     p->synflags = 0;
 #endif
     if (size == sizeof(Binder))
         bindxx_(p) = GAP;
+    if (d & bitofstg_(s_auto))
+        bindmcrep_(p) = NOMCREPCACHE;
     return p;
 }
 
@@ -284,87 +234,67 @@ Binder *mk_binder(Symstr *c, SET_BITMAP d, TypeExpr *e)
     h0_(p) = s_binder;
     bindcdr_(p)=0;
     bindsym_(p)=c;
-    bindsegsym_(p)=0;
     attributes_(p) = A_LOCALSTORE;
-    p->bindstg = d;
-    p->bindtype=e;
-    p->bindaddr.i = BINDADDR_UNSET;
-#ifdef CPLUSPLUS
+    bindstg_(p) = d;
+    bindtype_(p) = e;
+    bindaddr_(p) = BINDADDR_UNSET;
     bindparent_(p) = 0;         /* local_scope->class_tag? */
     bindconst_(p) = 0;
-#endif
+    bindinline_(p) = 0;
 #ifdef PASCAL /*ECN*/
     p->bindlevel = 0;
     p->synflags = 0;
 #endif
     if (d & bitofstg_(s_auto))
-    {   p->bindxx=GAP;
-        p->bindmcrep = NOMCREPCACHE;
+    {   bindxx_(p) = GAP;
+        bindmcrep_(p) = NOMCREPCACHE;
     }
     return p;
 }
 
 TagBinder *global_mk_tagbinder(TagBinder *b, Symstr *c, AEop d)
-{   SET_BITMAP attr = bitoftype_(d);
+{   SET_BITMAP bits = bitoftype_(d);
     TagBinder *p = (TagBinder*) GlobAlloc(SU_Bind, sizeof(TagBinder));
     h0_(p) = s_tagbind;
     tagbindcdr_(p)=b;
     tagbindsym_(p)=c;
-    attributes_(p) = attr | A_GLOBALSTORE;
+    attributes_(p) = A_GLOBALSTORE;
+    tagbindbits_(p) = bits;
     tagbindmems_(p) = 0;
-    tagbindtype_(p) = globalize_typeexpr(primtype2_(attr, p));
-#ifdef CPLUSPLUS
-    p->friends = NULL;
-    p->tagparent = current_member_scope();
-#endif
+    tagbindtype_(p) = globalize_typeexpr(primtype2_(bits, p));
+    if (LanguageIsCPlusPlus)
+    {   p->friends = NULL;
+        p->tagparent = current_member_scope();
+    } else
+        p->tagparent = NULL;
+    p->tagtext = -1;
 #ifdef TARGET_HAS_DEBUGGER
     p->tagbinddbg = 0;
 #endif
     return p;
 }
-
-#ifdef CPLUSPLUS
-/* used for C++ 'core' members.                                         */
-TagBinder *clone_tagbinder(Symstr *newname, TagBinder *b)
-{   SET_BITMAP attr = attributes_(b) & ENUMORCLASSBITS;
-    TagBinder *p = (TagBinder*) GlobAlloc(SU_Bind, sizeof(TagBinder));
-    h0_(p) = s_tagbind;
-    tagbindcdr_(p) = 0;
-    tagbindsym_(p) = newname;
-    attributes_(p) = attr | A_GLOBALSTORE;
-    tagbindmems_(p) = 0;
-    tagbindtype_(p) =
-        globalize_typeexpr(primtype2_(attr, p)); /* or tagbindtype_(b)? */
-#ifdef CPLUSPLUS
-    p->friends = NULL;
-    p->tagparent = b->tagparent;
-#endif
-#ifdef TARGET_HAS_DEBUGGER
-    p->tagbinddbg = 0;
-#endif
-    return p;
-}
-#else
 
 static TagBinder *mk_tagbinder(Symstr *c, AEop d)
-{   SET_BITMAP attr = bitoftype_(d);
+{   SET_BITMAP bits = bitoftype_(d);
     TagBinder *p = (TagBinder*) SynAlloc(sizeof(TagBinder));
     h0_(p) = s_tagbind;
     tagbindcdr_(p)=0;
     tagbindsym_(p)=c;
-    attributes_(p) = attr | A_LOCALSTORE;
+    attributes_(p) = A_LOCALSTORE;
+    tagbindbits_(p) = bits;
     tagbindmems_(p) = 0;
-    tagbindtype_(p) = primtype2_(attr, p);
-#ifdef CPLUSPLUS
-    p->friends = NULL;
-    p->tagparent = current_member_scope();
-#endif
+    tagbindtype_(p) = primtype2_(bits, p);
+    if (LanguageIsCPlusPlus)
+    {   p->friends = NULL;
+        p->tagparent = current_member_scope();
+    } else
+        p->tagparent = NULL;
+    p->tagtext = -1;
 #ifdef TARGET_HAS_DEBUGGER
     p->tagbinddbg = 0;
 #endif
     return p;
 }
-#endif
 
 extern LabBind *mk_labbind(LabBind *b, Symstr *c)
 {
@@ -377,124 +307,13 @@ extern LabBind *mk_labbind(LabBind *b, Symstr *c)
     return p;
 }
 
-/* comments re globalisation:
-   Binders are globalized or not on creation, the only need for
-   globalize routines is for the type expressions (see globalize_typeexpr()
-   below) which hang from them.
-*/
-
-Expr *globalize_int(int32 n)
-{   return (Expr*)global_list5(SU_Const, s_integer,te_int,(FileLine *)0,n,0);
-}
-
-static FormTypeList *globalize_formals(FormTypeList *d)
-{   FormTypeList *d1;
-    if (d == NULL) return NULL;
-    d1 = g_mkFormTypeList(0, d->ftname,
-                             globalize_typeexpr(d->fttype),
-#ifdef CPLUSPLUS
-                             d->ftdefault ? globalize_expr(d->ftdefault) :
-#endif
-                                            0);
-    d1->ftcdr = globalize_formals(d->ftcdr);
-    return d1;
-}
-
-static struct te_memo { struct te_memo *cdr; TypeExpr te; }
-    *glob_typeexpr_memo;
-
-static TypeExpr *globalize_memo(TypeExpr *t)
-{   struct te_memo *p;
-    for (p = glob_typeexpr_memo; p != 0; p = p->cdr)
-        if (EQtype_(t, &p->te)) break;
-    if (p == 0)
-        p = glob_typeexpr_memo =
-            (struct te_memo*) global_list5(SU_Type, glob_typeexpr_memo,
-                         h0_(t), typespecmap_(t), typespecbind_(t), 0);
-    return &p->te;
-}
-
-/* globalize_typeexpr caches only basic types (including structs/typedefs) */
-/* and pointers/refs to things already cached.  Tough ched arrays/fns.     */
-/* N.B. we should never cache empty arrays as size may get updated.        */
-
-TypeExpr *globalize_typeexpr(TypeExpr *t)
-{   static bool glob_incache;
-    TypeExpr *ans;
-#ifdef PASCAL /*ECN*/
-    assert(0);
-#else
-    switch (h0_(t))
-    {
-case t_content:
-case t_ref:
-        {   TypeExpr *gt = globalize_typeexpr(typearg_(t));
-            if (glob_incache)
-            {   TypeExpr temp;
-                h0_(&temp) = h0_(t), typearg_(&temp) = gt,
-                typeptrmap_(&temp) = typeptrmap_(t);
-                /* dbglanginfo field?  Doesn't matter for C! */
-                return globalize_memo(&temp);
-            }
-            return (TypeExpr *)global_list4(SU_Type,
-                                            h0_(t), gt, typeptrmap_(t), 0);
-            /* note that glob_incache is set correctly */
-        }
-case t_subscript:
-            ans = (TypeExpr*) global_list4(SU_Type, t_subscript,
-                                globalize_typeexpr(typearg_(t)),
-                                typesubsize_(t)==0 ? (Expr *)0 :
-                                    globalize_int(evaluate(typesubsize_(t))),
-                                0);
-            glob_incache = 0;
-            return ans;
-case t_fnap:
-            /* the DeclRhsList of formals could well become a ClassMember */
-            ans = g_mkTypeExprfn(t_fnap,
-                               globalize_typeexpr(typearg_(t)),
-                               typeptrmap_(t),
-                               globalize_formals(typefnargs_(t)),
-                               &typefnaux_(t));
-            glob_incache = 0;
-            return ans;
-case t_coloncolon:
-            ans = (TypeExpr *)global_list4(SU_Type, t_coloncolon,
-                                           globalize_typeexpr(typearg_(t)),
-                                           typespectagbind_(t),
-                                           0);
-            glob_incache = 0;
-            return ans;
-case s_typespec:
-            /* N.B. any binder in typespecbind_(t) is assumed globalised */
-            if (typespecmap_(t) & (bitoftype_(s_typedefname)|ENUMORCLASSBITS)
-                 && (!(typespecmap_(t) & ENUMORCLASSBITS ?
-                         attributes_(typespectagbind_(t)) :
-                         attributes_(typespecbind_(t))) & A_GLOBALSTORE))
-                syserr("globalization failure: $b", typespecbind_(t));
-            glob_incache = 1;
-            return typespecmap_(t) == typespecmap_(te_void) ? te_void :
-                   typespecmap_(t) == typespecmap_(te_int) ? te_int :
-                   typespecmap_(t) == typespecmap_(te_lint) ? te_lint :
-                   typespecmap_(t) == typespecmap_(te_uint) ? te_uint :
-                   typespecmap_(t) == typespecmap_(te_ulint) ? te_ulint :
-                   typespecmap_(t) == typespecmap_(te_float) ? te_float :
-                   typespecmap_(t) == typespecmap_(te_double) ? te_double :
-                   typespecmap_(t) == typespecmap_(te_ldble) ? te_ldble :
-                   globalize_memo(t);
-default:
-            syserr(syserr_globalize1, (VoidStar)t, (long)h0_(t));
-            return t;
-    }
-#endif
-}
-
 /* Binding:
    There are 5 overloading classes, of which 3 (labels, vars, struct tags)
    are bindings in the traditional sense.  All code concerning binding
    and unbinding is in this file.  Access routes are the procedures below:
      Labels:  label_xxx;
      Vars:    instate_declaration, findbinding.
-     Tags:    instate_tagbinding, findtagbinding, settagmems.
+     Tags:    instate_tagbinding, findtagbinding.
      Scopes:  push_scope, pop_scope, clear_stacked_scopes.
 
    Note that typedef names share the same binding space with variables.
@@ -506,14 +325,13 @@ default:
 
    Local scopes for Binders and TagBinders are implemented using the 'deep
    binding' strategy, as are C++ class scopes. For each scope there is a
-   list of Binders and a list of TagBinders which can be searched for the
-   matching Symstr. If the search fails in each local scope then the global
+   list of Binders/ TagBinders which can be searched for the matching
+   Symstr. If the search fails in each local scope then the global
    binding (if any) is found in O(1) time.
 
-   In local scopes, Binders and TagBinders are segregated on separate lists
-   for faster searching. In a C++ class scope, class members, class-scope
-   Binders and class-scope TagBinders exist on a single list, discrimiated
-   by the leading AEop field of each entry (s_binder, s_tagbind, s_member).
+   In a C++ class scope, class members, class-scope Binders and class-scope
+   TagBinders exist on a single list, discrimiated by the leading AEop field
+   of each entry (s_binder, s_tagbind, s_member).
 
    APOLOGY: This assumes that Binder, TagBinder and ClassMember all begin:
    {AEop sort;  SelfType *cdr;  Symstr *sv; ...} so we can pun. It can be
@@ -551,6 +369,7 @@ typedef struct Scope {
                                 /* and members too (class scope).       */
                                 /* (unused if class_tag != 0).          */
     TagBinder *class_tag;
+    bool arg_scope;
 } Scope;
 
 static Scope *local_scope, *freeScopes;
@@ -558,7 +377,8 @@ static bool tag_found_in_local_scope;
         /* used to avoid searching twice in instate_xxx... */
 static int scope_level;
 
-static int push_init_scope(TagBinder *class_tag, ScopeSaver init)
+static int push_init_scope(TagBinder *class_tag, ScopeSaver init,
+        bool arg_scope)
 {   Scope *scope = freeScopes;
     if (scope != NULL)
         freeScopes = freeScopes->prev;
@@ -570,15 +390,16 @@ static int push_init_scope(TagBinder *class_tag, ScopeSaver init)
     scope->prev = local_scope;
     local_scope = scope;
     scope->class_tag = class_tag;
+    scope->arg_scope = arg_scope;
     return scope_level++;
 }
 
-int push_scope(TagBinder *class_tag)
-{   return push_init_scope(class_tag, 0);
+int push_scope(TagBinder *class_tag, bool arg_scope)
+{   return push_init_scope(class_tag, 0, arg_scope);
 }
 
 int push_var_scope(ScopeSaver init)
-{   return push_init_scope(0, init);
+{   return push_init_scope(0, init, NO);
 }
 
 /* The pop_scope routines return values giving the (last) popped        */
@@ -597,15 +418,26 @@ static ScopeSaver pop_scope_1(int level, bool check_unrefd)
     {   /* Check for unreferenced names in local scopes */
         Symstr *sv;
         for (p = poppling;  p != 0;  p = bindcdr_(p))
-        {   if (h0_(p) != s_binder) continue;
+        {   if (h0_(p) != s_binder || h0_(bindtype_(p)) == t_ovld) continue;
             sv = bindsym_(p);
             /* do a bit more in the next line for used/set */
             /* suppress warning for gensym'd vars, which patch up user errs */
             if (!(binduses_(p) & u_referenced) &&
                 !isgensym(sv) &&
                 !(bindstg_(p) & b_pseudonym))
-                cc_warn(bind_warn_not_used(bindstg_(p) & bitofstg_(s_typedef),
-                                       bindstg_(p) & b_fnconst, p));
+            {
+#ifdef CPLUSPLUS
+                if (sv == thissym)
+                    cc_warn(bind_warn_unused_this_in_member);
+                else
+#endif
+                  if (bindstg_(p) & bitofstg_(s_typedef))
+                    cc_warn(bind_warn_typedef_not_used, p);
+                  else if (bindstg_(p) & b_fnconst)
+                    cc_warn(bind_warn_function_not_used, p);
+                  else
+                    cc_warn(bind_warn_variable_not_used, p);
+            }
         }
     }
     else
@@ -614,10 +446,10 @@ static ScopeSaver pop_scope_1(int level, bool check_unrefd)
     /* outer setting and so recovering to "struct d { int a; }.         */
     {   TagBinder *b = scope->class_tag;
         scope->class_tag = NULL;                /* @@@ kill... */
-        if (b != NULL && (attributes_(b) & TB_BEINGDEFD))
-        {   attributes_(b) &= ~TB_BEINGDEFD;
-            attributes_(b) |= TB_DEFD;
-        }
+        /* This is only for C: C++ has already closed the class (in     */
+        /* cpp_end_strdecl). Hence no need to do this for the core class*/
+        if (b != NULL && (tagbindbits_(b) & TB_BEINGDEFD))
+            tagbindbits_(b) = (tagbindbits_(b) & ~TB_BEINGDEFD) | TB_DEFD;
     }
     local_scope = scope->prev;
     scope->prev = freeScopes;
@@ -636,12 +468,27 @@ ScopeSaver pop_scope_no_check(int level)
 {   return pop_scope_1(level, NO);
 }
 
+static Scope *set_local_block_scope(void)
+{   Scope *scope0 = local_scope;
+    if (!LanguageIsCPlusPlus)
+    {   Scope *scope;
+        for (scope = scope0;  scope != 0;  scope = scope->prev)
+            if (scope->class_tag == 0) break;
+        /* Intentionally, if local_scope is 0, instate_declaration_1()  */
+        /* will syserr(). Note: this is the ONLY caller...              */
+        local_scope = scope;
+    }
+    return scope0;
+}
+
 static TagBinder *findtag_in_members(Symstr *sv, ClassMember *ll)
 {   TagBinder *l = (TagBinder *)ll;
     for (; l != NULL;  l = tagbindcdr_(l))
     {   if (debugging(DEBUG_BIND))
             cc_msg("findtag try $r %lx\n", memsv_(l), (long)attributes_(l));
-        if (bindsym_(l) == sv && h0_(l) == s_tagbind) break;
+        if (h0_(l) == s_tagbind &&
+            (h0_(sv)==s_tagbind && l == (TagBinder *)sv || bindsym_(l)==sv))
+                break;
     }
     return l;
 }
@@ -653,21 +500,19 @@ TagBinder *findtagbinding(Symstr *sv, TagBinder *cl, int fbflags)
     /* assert: cl != 0 <=> fbflags == INCLASSONLY.                      */
     /* @@@ note that we don't inherit classes via bases!                */
     if (cl != NULL)
-#ifdef CPLUSPLUS
-        return findtag_in_members(sv, tagbindmems_(core_class(cl)));
-#else
-        return findtag_in_members(sv, tagbindmems_(cl));
-#endif
+        return
+            findtag_in_members(sv, tagbindmems_(core_class(cl)));
+
     if (fbflags == ALLSCOPES)
         for (scope = local_scope;  scope != NULL;  scope = scope->prev)
         {   ClassMember *l;
             TagBinder *b;
             if ((cl = scope->class_tag) != NULL)
-#ifdef CPLUSPLUS
-                l = tagbindmems_(core_class(cl));
-#else
-                continue;               /* C class scopes don't nest.   */
-#endif
+            {   if (LanguageIsCPlusPlus)
+                    l = tagbindmems_(core_class(cl));
+                else
+                    continue;           /* C class scopes don't nest.   */
+            }
             else
                 l = scope->scopemems;
             if ((b = findtag_in_members(sv, l)) != 0)
@@ -694,27 +539,24 @@ static ClassMember *find_scopemember(Symstr *sv, ClassMember *p)
     return 0;
 }
 
-#ifdef CPLUSPLUS
-static Expr *path_to_member_2(ClassMember *mem, TagBinder *b, int flags,
-        ClassMember *vbases);
-static Expr *path_to_base_member(ClassMember *mem, TagBinder *b, int flags,
-        ClassMember *vbases);
-static bool accessor_is_friendof(TagBinder *ofclass);
-
-static bool accessOK;                /* local to path_to_member... */
-static TagBinder *accessing_class;   /* local to path_to_member... */
-static Binder *accessing_fn;
-#endif
+static TagBinder *qualifyingBase;   /* extra IN arg to path_to_member_1 */
 
 static Expr *path_to_member_1(ClassMember *member, TagBinder *tb, int flags,
-        ClassMember *vbases)
+        ClassMember *vbases, TagBinder *privately_deriving_class)
 {   ClassMember *l;
-    int32 sort = attributes_(tb) & CLASSBITS;
-    StructPos p; memset((void *)&p, 0, sizeof(p));
+    int32 sort = tagbindbits_(tb) & CLASSBITS;
+
+    /* This can never happen C-only... */
+    if (qualifyingBase != 0 &&
+        (qualifyingBase == tb || core_class(qualifyingBase) == tb))
+            flags &= ~FB_NOTYET;
+
+if (!(flags & FB_NOTYET))
+{   if ((tagbindbits_(tb) & TB_DEFD) && !(tagbindbits_(tb) & TB_SIZECACHED))
+        (void)sizeofclass(tb, NULL);
 
     for (l = tagbindmems_(tb);  l != NULL;  l = memcdr_(l))
-    {   structfield(l, sort, &p);
-        if (debugging(DEBUG_BIND))
+    {   if (debugging(DEBUG_BIND))
             cc_msg("see $r %lx\n", memsv_(l), (long)attributes_(l));
         if (h0_(member) == s_identifier)
         {   Symstr *sv = (Symstr *)member;
@@ -722,62 +564,55 @@ static Expr *path_to_member_1(ClassMember *member, TagBinder *tb, int flags,
         }
         else if (l != member)
             continue;
-#ifdef CPLUSPLUS
+
 /* The next line avoids spurious errors for class-within-class defn.    */
 /* (path_to_member() ignores s_tagbind's.)                              */
         if (h0_(l) == s_tagbind) continue;
-/*/* LDS/AM 19-Jul: Do we need core_member(a) == core_member(b) below??? */
-#define derived_fromeq(a,b) ((a) == (b) || derived_from(a,b))
-/* Note that access is maximal, so the following does just fine...      */
-        if (!accessOK)
-        {   if (attributes_(l) & bitofaccess_(s_public))
-                accessOK = 1;
-            else
-            {   if ((attributes_(l) & bitofaccess_(s_private)) &&
-                        tb == accessing_class ||
-                    (attributes_(l) & bitofaccess_(s_protected)) &&
-                        accessing_class != NULL &&
-                        derived_fromeq(tb, accessing_class) ||
-                    accessor_is_friendof(tb))
-                    accessOK = 1;
+
+        curlex_member = l;  /* this saves some searching and helps with */
+                            /* diagnosing access faults.                */
+        if (LanguageIsCPlusPlus)
+        {   if (memtype_(l) == ACCESSADJ) /* access decl */
+            {   accessOK = 1;
+                continue;
+            }
+            check_access(l, privately_deriving_class);
+        }
+        /* the following save store when searching for tyenames...      */
+        if (flags & (FB_CLASSNAME|FB_TYPENAME|FB_FNBINDER))
+            return (Expr *)l;
+
+        if (LanguageIsCPlusPlus)
+        {   if (h0_(l) == s_binder)
+            {   Binder *b = (Binder *)l;
+                if (bindstg_(b) & b_pseudonym) b = realbinder_(b);
+                if (!(flags & FB_FNBINDER)
+                    &&
+                    /* BEWARE: a local memfn_a is static... */
+                    ( (bindstg_(b) & b_memfna) ||
+                     !(bindstg_(b) & (bitofstg_(s_static)|bitofstg_(s_typedef)))
+                    )
+                    &&
+                /* overloaded fns can't be typedefs; use ovld-stg bit?  */
+                /* match both generic and specific functions.           */
+                    (h0_(bindtype_(b)) == t_ovld || h0_(bindtype_(b)) == t_fnap)
+                   )
+                    /* exprdotmemfn_() */
+                    return mk_exprwdot(s_dot, bindtype_(b),
+                        nullbinder(bindparent_(b)), (IPtr)b);
+                /* Otherwise: a typedef name, static member, enumerator */
+                /* or a function binder was requested via FB_FNBINDER.  */
+                return (Expr *)b;
             }
         }
-        if (memtype_(l) == ACCESSADJ) /* access declaration */ continue;
-        if (flags & FB_MEMBER) return (Expr *)l;
-        if (h0_(l) == s_member)
-#endif
-        {   p.boffset = target_lsbitfirst ?
-                MAXBITSIZE-p.bsize - p.boffset : p.boffset;
-            return mk_exprbdot(s_dot, memtype_(l), 0, p.woffset/sizeof_char,
-                p.bsize, p.boffset);
-        }
-#ifdef CPLUSPLUS
-        else if (h0_(l) == s_binder)
-        {   Binder *b = (Binder *)l;
-            if (bindstg_(b) & b_pseudonym) b = realbinder_(b);
-            if (!(bindstg_(b) & (bitofstg_(s_static)|bitofstg_(s_typedef))) &&
-                /* overloaded fns can't be typedefs; use ovld-stg bit? */
-                /* match both generic and specific functions.          */
-                (h0_(bindtype_(b)) == t_ovld || h0_(bindtype_(b)) == t_fnap))
-                /* exprdotmemfn_() */
-                return mk_exprwdot(s_dot, bindtype_(b), 0, (int32)(Expr *)b);
-            /* Otherwise a typedef name, static member or enumerator */
-            return (Expr *)b;
-        }
-        else if (h0_(l) == s_tagbind)
-            return (Expr *)l;
-/* The following should never happen - paranoia during development...   */
-        {   Symstr *sv = h0_(member) == s_identifier ?
-               (Symstr *)member : memsv_(member);
-            syserr("h0_(path_to_member($r,,$r,)) == %ld",
-                sv, tagbindsym_(tb), h0_(l));
-        }
-#endif
+        /* Assert: h0_(l) == s_member, whether C or C++ */
+        return mk_exprbdot(s_dot, memtype_(l), nullbinder(tb), memwoff_(l), membits_(l),
+            target_lsbitfirst ? MAXBITSIZE-membits_(l)-memboff_(l) : memboff_(l));
     }
-#ifdef CPLUSPLUS
-    if (flags & FB_INHERIT)
-        return path_to_base_member(member, tb, flags, vbases);
-#endif
+}
+    if (LanguageIsCPlusPlus && (flags & FB_INHERIT))
+        return path_to_base_member(member, tb, flags, vbases,
+                    privately_deriving_class);
     return NULL;
 }
 
@@ -785,52 +620,64 @@ Expr *path_to_member(ClassMember *member, TagBinder *b, int flags)
 {   Expr *e;
     if (b == 0) syserr("path_to_member(0,...)");
     if (member == NULL) return NULL;
-#ifdef CPLUSPLUS
-    accessOK = (flags & FB_ACCESSOK);
-    {   ClassMember *l = tagbindmems_(b);
-        if (l != NULL && !(attributes_(l) & CB_CORE)) l = NULL;
-        e = path_to_member_2(member, b, flags, l);
+    if (debugging(DEBUG_BIND))
+    {   Symstr *sv = h0_(member) == s_identifier ?
+            (Symstr *)member : memsv_(member);
+        cc_msg("path_to_member($r, $b, 0x%.3x) at $l\n", sv, b, flags);
     }
-    if (e != NULL)
-    {   /*/* need to do better here... */
-        if (h0_(e) == s_invisible && !(flags & FB_KEEPI)) e = arg2_(e);
-        if (!accessOK &&
-            ((flags & FB_TYPEDEF) == 0 ||
-              h0_(e) == s_binder &&
-              (bindstg_((Binder *)e) & bitofstg_(s_typedef))
-            )
-           )
-        {   Symstr *sv = h0_(member) == s_identifier ?
-                (Symstr *)member : memsv_(member);
-            cc_rerr(sem_rerr_nonpublic, sv, b);
+    if (LanguageIsCPlusPlus)
+    {   accessOK = 0;
+        curlex_member = 0;
+        {   ClassMember *l = tagbindmems_(b);
+            if (l != NULL && !(attributes_(l) & CB_CORE)) l = NULL;
+            e = path_to_member_2(member, b, flags, l, NULL);
         }
+        if (e != 0 && h0_(e) == s_invisible && !(flags & FB_KEEPI))
+            e = arg2_(e);
     }
-#else
-    e = path_to_member_1(member, b, flags, NULL);
-#endif
+    else
+        e = path_to_member_1(member, b, flags, NULL, NULL);
     return e;
 }
 
-Binder *findbinding(Symstr *sv, TagBinder *cl, int flags)
+Expr *findpath(Symstr *sv, TagBinder *cl, int flags, TagBinder *inBase)
 {   Scope *scope;
     ClassMember *member = (ClassMember *)sv;
-    flags += FB_MEMBER;
+    if ((qualifyingBase = inBase) != NULL) flags |= FB_NOTYET;
     if (cl != NULL)
-        return (Binder *)path_to_member(member, cl, flags);
+    {   Expr *e;
+        e = path_to_member(member, cl, flags);
+        return e;
+    }
     for (scope = local_scope;  scope != NULL;  scope = scope->prev)
     {   Binder *b = NULL;
         cl = scope->class_tag;
-        if (cl != NULL && (flags & (FB_CLASSES+FB_THISSCOPE)))
-#ifdef CPLUSPLUS
+        if (cl != NULL && (flags & FB_CLASSES))
             b = (Binder *)path_to_member(member, cl, flags);
-#else
-            b = 0;
-#endif
-        else if (cl == NULL && (flags & (FB_LOCALS+FB_THISSCOPE)))
+        else if (cl == NULL && (flags & FB_LOCALS))
             b = find_scopemember(sv, scope->scopemems);
-        if (b != NULL || (flags & FB_THISSCOPE)) return b;
+        if ((flags & FB_THISSCOPE)
+            ||
+            b != NULL && (
+             LanguageIsCPlusPlus &&
+             ((flags & FB_CLASSNAME) == 0 ||
+               h0_(b) == s_binder && (bindstg_(b) & bitofstg_(s_typedef)) &&
+               isclasstype_(princtype(bindtype_(b)))
+             )
+             ||
+            !LanguageIsCPlusPlus &&
+             ((flags & FB_TYPENAME) == 0 ||
+              (cl == NULL) ||
+              h0_(b) == s_binder && (bindstg_(b) & bitofstg_(s_typedef))
+             )
+           ))
+           return (Expr *)b;
     }
-    return bind_global_(sv);
+    return (Expr *)bind_global_(sv);
+}
+
+Binder *findbinding(Symstr *sv, TagBinder *cl, int flags)
+{   return (Binder *)findpath(sv, cl, flags | FB_FNBINDER, 0);
 }
 
 void add_toplevel_binder(Binder *b)
@@ -851,15 +698,11 @@ static Binder **insertionpoint(Scope *scope)
     if (cl == 0)
         return &scope->scopemems;
     else
-    {   ClassMember **q = &tagbindmems_(cl), *l;
-        if (!(attributes_(cl) & TB_BEINGDEFD))
+    {   ClassMember **q, *l;
+        if (!(tagbindbits_(cl) & TB_BEINGDEFD))
             syserr("adding to completed scope $c", cl);
-        if ((l = *q) != NULL && attributes_(l) & CB_CORE)
-        {   TypeExpr *t = memtype_(l);
-            if (!(h0_(t) == s_typespec && typespecmap_(t) & CLASSBITS))
-                syserr("insertionpoint");
-            q = &tagbindmems_(typespectagbind_(t));
-        }
+        cl = core_class(cl);
+        q = &tagbindmems_(cl);
         while ((l = *q) != NULL) q = &bindcdr_(l);
         return q;
     }
@@ -879,28 +722,29 @@ static void add_local_binder(Binder *b)
 
 static void add_local_tagbinder(TagBinder *b, bool implicit)
 /* Note that in C, class scopes don't nest; see also findtagbinding().  */
-/* 'implicit' is set when we have a declaration (but not definition)    */
-/* of a class tag within another class (or a formal parameter list).    */
-/* Lift to first unnamed scope for consistency with C.                  */
-/* NOTE (C++) that we do not add a typedef for 'b', differing in        */
-/* recovery from such odd behaviour with cfront.                        */
+/* 'implicit' is set when we have a non-explicit declaration which is   */
+/* not a definition of a class tag, within another class or a formal    */
+/* parameter list. Lift to first unnamed scope.                         */
 {   Scope *scope = local_scope;
-#ifdef CPLUSPLUS
-    if (implicit)
-        while (scope && scope->class_tag != NULL) scope = scope->prev;
-#else
-    while (scope && scope->class_tag != NULL) scope = scope->prev;
-    if (scope == 0) syserr("add_local_tagbinder");
-    IGNORE(implicit);
-#endif
+    if (implicit || !LanguageIsCPlusPlus)
+        while (scope && (scope->class_tag != NULL ||
+                         scope->arg_scope && LanguageIsCPlusPlus))
+            scope = scope->prev;
     if (scope == NULL)
-    {   tagbindcdr_(b) = toptagbindchain;
+    {   if (!LanguageIsCPlusPlus) syserr("add_local_tagbinder");
+        tagbindcdr_(b) = toptagbindchain;
         tag_global_(tagbindsym_(b)) = toptagbindchain = b;
     }
     else
     {   TagBinder **p = (TagBinder **)insertionpoint(scope);
         tagbindcdr_(b) = *p;
         *p = b;
+    }
+    if (LanguageIsCPlusPlus)
+    {   /* local classes MUST have INTERNAL linkage... */
+        while (scope && (scope->class_tag != NULL || scope->arg_scope))
+            scope = scope->prev;
+        if (scope != NULL) set_linkage((Binder *)b, A_NOLINKAGE, NULL);
     }
 }
 
@@ -913,58 +757,61 @@ static void add_member(ClassMember *m)
     *p = m;
 }
 
-#ifdef CPLUSPLUS
-static Binder *instate_member_binder(DeclRhsList *d, int bindflg);
-#endif
-
 static ClassMember *instate_member_1(DeclRhsList *d, int bindflg)
 {   ClassMember *m;
-    Expr *bitsize;
+    int32 bitsize;
     TypeExpr *t;
     Symstr *sv = d->declname;
     SET_BITMAP access = attribofstgacc_(d->declstg);
 /* note: other users of d->declstg should use killstgacc_(d->declstg).  */
     if (access==0) syserr("instate_member(access==0)");
-
-    if (sv != NULL &&
-        findbinding(sv, local_scope->class_tag, INCLASSONLY) != NULL)
-    {   cc_rerr(syn_rerr_duplicate_member(sv, local_scope->class_tag));
-        sv = gensymval(1);
+    m = (sv == NULL) ? NULL :
+        find_scopemember(sv, tagbindmems_(local_scope->class_tag));
+        /* LDS: 29-Mar-95: Changed (O(N**2) performance reasons) from:  */
+        /*      findbinding(sv, local_scope->class_tag, INCLASSONLY);   */
+    if (m != NULL)
+    {   if (bindstg_(m) & d->declstg & bitofstg_(s_typedef))
+        {   if ((d->declstg & bitofstg_(s_typedef)) &&
+                (d->declstg & u_implicitdef))
+                return NULL;
+            else if ((bindstg_(m) & bitofstg_(s_typedef)) &&
+                     (bindstg_(m) & u_implicitdef))
+                /* supercede it... */
+                bindstg_(m) |= u_referenced;
+            else
+                syserr("instate_member_1");
+        } else
+        {   cc_rerr(syn_rerr_duplicate_member(sv, local_scope->class_tag));
+            d->declname = gensymval(1);
+        }
     }
-#ifdef CPLUSPLUS
-    if ((d->declstg & STGBITS) || isfntype(d->decltype))
-        /* catch member fns, statics, typedef, enum constant, */
-        /* inline, virtual and friend.                        */
-        return instate_member_binder(d, bindflg);
-#endif
 /* bindflg is set so that all structs are globalized except within fns. */
 /* This includes structs declared in formal parameter lists whose scope */
 /* is only the function.                                                */
-    bitsize = declbits_(d);
     t = d->decltype;
-#ifndef CPLUSPLUS
-    if (!(bindflg & (GLOBALSCOPE|TOPLEVEL)))
+/*/* @@@ LDS 05-Oct-94: the first ! was missing - what is really meant? */
+/* Do we still need to globalize for local classes??                    */
+    if (!LanguageIsCPlusPlus && !(bindflg & (GLOBALSTG|TOPLEVEL)))
     {   m = (ClassMember *)BindAlloc(SIZEOF_CLASSMEMBER);
-        if (bitsize != 0 && h0_(bitsize) != s_integer)
-            bitsize = mkintconst(te_int, evaluate(bitsize), 0);
     }
     else
-#endif
     /* always allocate globally for C++ local class memfns.             */
-    {   m = (ClassMember *)GlobAlloc(SU_Type, SIZEOF_CLASSMEMBER);
+    {   m = (ClassMember *)GlobAlloc(SU_Bind, SIZEOF_CLASSMEMBER);
         t = globalize_typeexpr(t);
-        bitsize = bitsize == 0 ? 0 : globalize_int(evaluate(bitsize));
     }
+    /* We now evaluate a bitfield's size here, rather than later: by so */
+    /* doing, membits no longer tells us whether a member is a bitfield */
+    /* but this is only a consistency check since memtype & BITFIELD is */
+    /* what really distinguishes bitfields.                             */
+    bitsize = (declbits_(d) == NULL) ? 0 : evaluate(declbits_(d));
     h0_(m) = s_member;
-    memcdr_(m) = 0,
+    memcdr_(m) = NULL;
     memsv_(m) = sv;                    /* 0 for padding (:0) bit fields */
     memtype_(m) = t;
-    membits_(m) = bitsize;
+    memwoff_(m) = OFFSET_UNSET; memboff_(m) = 0; membits_(m) = bitsize;
     attributes_(m) = access;
     bindstg_(m) = 0;                    /* b_member? */
-#ifdef CPLUSPLUS
     bindparent_(m) = local_scope->class_tag;
-#endif
     add_member(m);
     return m;
 }
@@ -972,12 +819,13 @@ static ClassMember *instate_member_1(DeclRhsList *d, int bindflg)
 /* struct/union/enum tag bindings ... */
 
 TagBinder *instate_tagbinding(Symstr *sv, AEop s, TagDefSort defining,
-            int bindflg)
+            int bindflg, bool *newtag)
 {   TagBinder *b;
     if (sv == 0)
     {   sv = gensymval(1);
         defining = TD_ContentDef;
     }
+    *newtag = NO;
     if (bindflg & TOPLEVEL)
     {   b = tag_global_(sv);
         if (b == 0 || defining != TD_NotDef)
@@ -986,15 +834,19 @@ TagBinder *instate_tagbinding(Symstr *sv, AEop s, TagDefSort defining,
                 cc_msg("top level struct $r@%p\n", sv, (VoidStar)b);
             if (b == 0)
                 /* introduction of new tag */
-            {   tag_global_(sv) = toptagbindchain = b =
+            {   *newtag = YES;
+                tag_global_(sv) = toptagbindchain = b =
                     global_mk_tagbinder(toptagbindchain,sv,s);
-#ifdef CPLUSPLUS
                 if (b->tagparent != 0) syserr("instate_tagbinding($b)", b);
-#endif
+                if (!LanguageIsCPlusPlus &&
+                    defining != TD_NotDef &&
+                    local_scope != 0 &&
+                    !isgensym(sv))
+                    cc_warn(bind_warn_cpp_scope_differ, b);
             }
-            else if (((attributes_(b) & TB_DEFD) && defining != TD_Decl) ||
+            else if (((tagbindbits_(b) & TB_DEFD) && defining != TD_Decl) ||
                       /* re-definition */
-                     (attributes_(b) & TB_BEINGDEFD))
+                     (tagbindbits_(b) & TB_BEINGDEFD))
                 cc_err(bind_err_duplicate_tag, tagbindsort(b),b);
         }
     }
@@ -1006,59 +858,49 @@ TagBinder *instate_tagbinding(Symstr *sv, AEop s, TagDefSort defining,
             if (debugging(DEBUG_BIND))
                 cc_msg("local struct $r@%p\n", sv, (VoidStar)b);
             if (b != 0 && tag_found_in_local_scope &&
-                (((attributes_(b) & TB_DEFD) && defining != TD_Decl)
+                (((tagbindbits_(b) & TB_DEFD) && defining != TD_Decl)
                  ||  /* re-definition */
-                 (attributes_(b) & TB_BEINGDEFD)))
+                 (tagbindbits_(b) & TB_BEINGDEFD)))
             {
                 cc_err(bind_err_duplicate_tag, tagbindsort(b), b);
                 b = 0;
             }
             if (b == 0 ||
                 defining == TD_ContentDef && !tag_found_in_local_scope)
-            {
-#ifdef CPLUSPLUS
-/* Always allocate even local structs in global store since they may    */
-/* have member fns.                                                     */
-                b = global_mk_tagbinder(0, sv, s);
-/* The next line avoids 'true' scoping as a hack to make B=B in:        */
-/*      class A { class B *p; }; class B { whatever };                  */
-                if (defining == TD_NotDef && b->tagparent != 0)
-                    implicit = 1,
-                    b->tagparent = 0,
-                    cc_warn("C++ scope may differ: $c", b);
-#else
-/* bindflg & GLOBALSCOPE refers to tags in formals: these need careful  */
+            {   *newtag = YES;
+/* bindflg & GLOBALSTG refers to tags in formals: these need careful    */
 /* treatment in that they are somewhat visible.  e.g. equivtype needs   */
 /* to see "f(struct a { int b,c;})" differing from g of similar type.   */
-                b = bindflg & GLOBALSCOPE ?
+/* For C++, always allocate even local structs in global store since    */
+/* they may have member fns.                                            */
+                b = (bindflg & GLOBALSTG) || LanguageIsCPlusPlus ?
                     global_mk_tagbinder(0, sv, s) : mk_tagbinder(sv, s);
-#endif
+/* The next lines avoids 'true' scoping as a hack to make B=B in:       */
+/*      class A { class B *p; }; class B { whatever };                  */
+/* Also in class A {friend class B; }; class B { whatever };            */
+                if (defining == TD_NotDef)
+                    implicit = 1;
+                else if (!LanguageIsCPlusPlus)
+                {   if (!isgensym(sv) && current_member_scope() != 0)
+                        cc_warn(bind_warn_cpp_scope_differ, b);
+                    implicit = 1;
+                }
+                if (implicit) b->tagparent = 0;
                 add_local_tagbinder(b, implicit);
             }
         }
     }
-    if ((attributes_(b) & ENUMORCLASSBITS) != bitoftype_(s) &&
-        /* LDS: 22-Oct-93: allow class and struct equivalence */
-        ((attributes_(b) & (bitoftype_(s_union)|bitoftype_(s_enum)))
+    if ((tagbindbits_(b) & ENUMORCLASSBITS) != bitoftype_(s) &&
+        ((tagbindbits_(b) & (bitoftype_(s_union)|bitoftype_(s_enum)))
          || s == s_union || s == s_enum))
         cc_err(bind_err_reuse_tag, tagbindsort(b), b, s);
     if (defining == TD_ContentDef)
-        attributes_(b) = (attributes_(b) &~ ENUMORCLASSBITS) | bitoftype_(s);
-    if (defining != TD_NotDef) attributes_(b) |= TB_BEINGDEFD;
+        tagbindbits_(b) = (tagbindbits_(b) & ~ENUMORCLASSBITS) | bitoftype_(s);
+/* AM: the next test was != TD_NotDef but BEINGDEFD should not be set   */
+/* after "struct A;" (to match with "struct A *p").                     */
+/* Has anyone started using TB_BEINGDEFD to distinguish?                */
+    if (defining == TD_ContentDef) tagbindbits_(b) |= TB_BEINGDEFD;
     return b;
-}
-
-void settagmems(TagBinder *b, ClassMember *l)
-/* dying...? */
-{   /* We should have already given an error on redefinition.           */
-    /* The next line fixes nasties like:                                */
-    /* "struct d { struct d { int a; } c; } x;"  by inhibiting the      */
-    /* outer setting and so recovering to "struct d { int a; }.         */
-    if (attributes_(b) & TB_BEINGDEFD)
-    {   attributes_(b) &= ~TB_BEINGDEFD;
-        attributes_(b) |= TB_DEFD;
-        tagbindmems_(b) = l;
-    }
 }
 
 /* variable and typedef bindings... */
@@ -1071,7 +913,7 @@ Binder *implicit_decl(Symstr *a, int32 fn)
     TypeExprFnAux s;
     if (fn)
         t = g_mkTypeExprfn(t_fnap, t, 0, 0,
-            packTypeExprFnAux(s, 0, 999, 0, 0,
+            packTypeExprFnAux(s, 0, LanguageIsCPlusPlus ? 1999 : 999, 0, 0,
                 fpregargs_disabled ? f_nofpregargs : 0));   /* minargs_ */
     topbind2(a, (fn ? bitofstg_(s_extern)|b_undef|b_fnconst :
                 bitofstg_(s_extern)|b_undef), t);
@@ -1090,18 +932,22 @@ typedef struct TentativeDefn
     struct TentativeDefn *next;
     DataDesc   data;
     int32      size, align;
+    int32      elt_size;                              /* for open array */
 /* When TARGET_HAS_BSS is NOT set, maybebss=1 <==> size=0.              */
     bool       maybebss;
-    SET_BITMAP stg;     /* only bitofstg_(s_static)+u_zeropage used.    */
+    bool       statik;
     Symstr     *sv;
 } TentativeDefn;
 
 static TentativeDefn *tentative_defs;     /* also init'd by bind_init */
+#ifndef TARGET_IS_INTERPRETER
 static DataInit *datahead,
                 *datasplice,
                 *datatail;
 static TentativeDefn saved_vg_state;
+#endif
 
+#ifndef TARGET_IS_INTERPRETER
 static void save_vargen_state(TentativeDefn *td)
 {
     td->data.head = datap->head; td->data.tail = datap->tail;
@@ -1113,6 +959,7 @@ static void restore_vargen_state(TentativeDefn *td)
     datap->head = td->data.head; datap->tail = td->data.tail;
     datap->size = td->data.size;
 }
+#endif
 
 /*
  * Used to make a tentative defns list for the following routines.
@@ -1121,9 +968,9 @@ static void restore_vargen_state(TentativeDefn *td)
  * static is processed.
  * It also holds whether we hope to allocate a top-level variable in bss.
  */
-static bool addTentativeDefn(Symstr *sv, int32 size, int32 align,
-                             SET_BITMAP stg)
-{   TentativeDefn *td = NULL;
+static bool addTentativeDefn(Symstr *sv, int32 size, int32 elt_size, int32 align, bool statik)
+{
+    TentativeDefn *td = NULL;
     for (td = tentative_defs; td != NULL; td = td->next)
         if (td->sv == sv) break;
     if (td == NULL)
@@ -1132,48 +979,40 @@ static bool addTentativeDefn(Symstr *sv, int32 size, int32 align,
         td->data.size = 0;
         td->next      = tentative_defs;
         td->size      = 0;
-        td->align     = 0;
+        td->elt_size  = elt_size;
+        td->align     = align;
         td->sv        = sv;
         td->maybebss  = YES;
-        td->stg       = stg;
+        td->statik    = statik;
         tentative_defs= td;
     }
 /* The following test fills in the size details in:  int a[],a[100];    */
     if (size != 0)
     {   td->size = size;
-        td->align = align;
 #ifdef TARGET_HAS_BSS
-        td->maybebss =
-#ifdef TARGET_IS_NEC
-                       (pp_pragmavec['s'-'a'] == 5 ||         /* .sbss  */
-#ifdef TARGET_HAS_NEC_SECTS
-                        pp_pragmavec['s'-'a'] == 10 ||        /* .sebss */
-#endif
-#ifdef TARGET_HAS_C4P_SECTS
-                        pp_pragmavec['s'-'a'] == 9 ||         /* .ibss */
-#endif
-                        pp_pragmavec['s'-'a'] == 6) ? 1 :     /* .bss   */
-                       (pp_pragmavec['s'-'a'] >= 0) ? 0 :     /* .other  */
-#endif
-                       ((feature & FEATURE_PCC) ||
-                        (size > BSS_THRESHOLD && !(stg & u_constdata)));
+        td->maybebss = (feature & FEATURE_PCC) || (size > BSS_THRESHOLD);
 #else
         td->maybebss = 0;
 #endif
+#ifndef TARGET_IS_INTERPRETER
         save_vargen_state(td); /* size = 0 => tentative foo[] */
+#endif
     }
-if (debugging(DEBUG_DATA)) cc_msg(
+#ifdef DEBUG_TENTATIVE_DEFS
+if (debugging(DEBUG_BIND)) cc_msg(
 "addTentativeDefn %lx, %lx next %lx (%s) head %lx tail %lx loc %ld name %s size %ld\n",
     (int32)datap,
     (int32) td, (int32) td->next, (td->next) ? symname_(td->next->sv) : "",
     (int32)datap->head, (int32)datap->tail, (int32)datap->size, symname_(sv), size);
+#endif
     return td->maybebss;
 }
 
-#ifdef ENABLE_DATA
+#ifdef DEBUG_TENTATIVE_DEFS
 
 static void show_vargen_state(char *when)
 {
+    if (debugging(DEBUG_BIND))
     {   DataInit *tmpdataq;
         cc_msg("vargen state %lx %s restoration:-\n", (int32)datap, when);
         for (tmpdataq = datap->head; tmpdataq != 0; tmpdataq = tmpdataq->datacdr)
@@ -1199,8 +1038,9 @@ static bool is_tentative(Symstr *sv)
     TentativeDefn *td = tentative_defs, *prev;
 
     for (prev = NULL;  td != NULL;  prev = td, td = td->next)
-      if (td->sv == sv)
+    {   if (td->sv == sv)
         {   /* we are going to return TRUE at the end of this iteration.  */
+#ifndef TARGET_IS_INTERPRETER
             int32 count=0;
             DataInit *tmpdataq;
             /*
@@ -1210,11 +1050,15 @@ static bool is_tentative(Symstr *sv)
              */
             if (td->size != 0 && !td->maybebss)
             {   save_vargen_state(&saved_vg_state);
-if (debugging(DEBUG_DATA)) show_vargen_state("before");
+#ifdef DEBUG_TENTATIVE_DEFS
+if (debugging(DEBUG_BIND)) show_vargen_state("before");
+#endif
                 /* Restore vg's state to that before reading the initialiser */
                 restore_vargen_state(td);
                 datahead = td->data.head;
-if (debugging(DEBUG_DATA)) show_vargen_state("after");
+#ifdef DEBUG_TENTATIVE_DEFS
+if (debugging(DEBUG_BIND)) show_vargen_state("after");
+#endif
                 /*
                  *  Throw away old tentative (zero) initialiser ready for
                  *  replacement by genstaticparts().
@@ -1223,19 +1067,27 @@ if (debugging(DEBUG_DATA)) show_vargen_state("after");
                     tmpdataq = saved_vg_state.data.head;
                 else
                 {
-                    tmpdataq = datap->tail->datacdr;
+                    tmpdataq = data.tail->datacdr;
                     datap->tail->datacdr = 0;
                 }
-                for (; count < td->size; tmpdataq = tmpdataq->datacdr)
+                while (count < td->size)
                 {
-                    if (tmpdataq == NULL) syserr(syserr_tentative);
-                    if (tmpdataq->sort == LIT_ADCON) syserr(syserr_tentative1);
+                    if (tmpdataq == NULL)
+                        syserr(syserr_tentative);
                     /* skip labels in static init chain */
-                    if (tmpdataq->sort == LIT_LABEL) continue;
-                    count += tmpdataq->rpt * tmpdataq->len;
-                    datasplice = tmpdataq;
+                    if (tmpdataq->sort != LIT_LABEL)
+                    {
+/* AM: insert check for ->len field being valid (i.e. not LABEL/ADCON   */
+/* maybe this cannot happen, but AM gets very worried by this sort      */
+/* of 'if not LABEL then nice' reasoning.                               */
+                        if (tmpdataq->sort == LIT_ADCON)
+                            syserr(syserr_tentative1);
+                        count += tmpdataq->rpt * tmpdataq->len;
+                        datasplice = tmpdataq;
+                    }
+                    tmpdataq = tmpdataq->datacdr;
                 }
-                if (count != padsize(td->size,alignof_tophack))
+                if (count != padsize(td->size,alignof_toplevel_static))
                     syserr(syserr_tentative2);
                 datatail = tmpdataq;
                 /* set flag for reset_vg_after_init_of_tentative_defn() */
@@ -1243,8 +1095,9 @@ if (debugging(DEBUG_DATA)) show_vargen_state("after");
             }
             else
             {
-if (debugging(DEBUG_DATA)) cc_msg("maybebss found\n");
+if (debugging(DEBUG_BIND)) cc_msg("maybebss found\n");
             }
+#endif
             /* remove entry from tentative list */
             if (prev == NULL)
                 tentative_defs = td->next;
@@ -1252,14 +1105,15 @@ if (debugging(DEBUG_DATA)) cc_msg("maybebss found\n");
                 prev->next = td->next;
             return YES;
         }
+    }
     return NO;
 }
 
+#ifndef TARGET_IS_INTERPRETER
 void reset_vg_after_init_of_tentative_defn(void)
 {
     TentativeDefn *td;
     if (saved_vg_state.size == 0) return;
-if (debugging(DEBUG_DATA)) cc_msg("reset_vg_after_tentative\n");
     /*
      * Vargen has now inserted the new initialiser just where we want it.
      * Hum, however I might have removed an item from the list which I
@@ -1281,16 +1135,25 @@ if (debugging(DEBUG_DATA)) cc_msg("reset_vg_after_tentative\n");
 
     saved_vg_state.size = 0; /* unset flag to prevent recall */
 }
+#endif
 
 static void check_for_incomplete_tentative_defs(TentativeDefn *td)
 {
-    for (; td != NULL;  td = td->next)
-        if (td->size == 0)
-            cc_err(bind_err_incomplete_tentative, td->sv);
+    for (; td != NULL;  td = td->next) {
+        if (td->size == 0) {
+            if (td->statik) {
+                cc_err(bind_err_incomplete_tentative, td->sv);
+                continue;
+            }
+            td->maybebss = YES; /* Bodge: need to sort out allocation into
+                                   data area (for fwd-refd struct too) */
+            td->size = td->elt_size;
+        }
 #ifdef TARGET_HAS_BSS
-        else if (td->maybebss && !(td->stg & u_constdata))
-            addbsssym(td->sv, td->size, td->align, td->stg, 0);
+        if (td->maybebss)
+            addbsssym(td->sv, td->size, td->align, td->statik, 0);
 #endif
+    }
 }
 
 static void check_for_fwd_static_decl(Binder *b, Symstr *sv)
@@ -1307,29 +1170,45 @@ static void check_ansi_linkage(Binder *b, DeclRhsList *d)
 {
     if ((bindstg_(b) ^ d->declstg) & PRINCSTGBITS)
     {   /* Linkage clash, but do not moan about stray 'extern type name's */
-        if (d->declstg & (b_omitextern | b_globalregvar | bitofstg_(s_static)))
+        if ((d->declstg & b_globalregvar) ||
+            (d->declstg & bitofstg_(s_static)) &&
+                 !(d->declstg & b_implicitstg) ||
+            (d->declstg & bitofstg_(s_extern)) &&
+                   (d->declstg & b_implicitstg))
         {   /* Oldest linkage wins... */
-            cc_rerr(bind_rerr_linkage_disagreement,
-                    d->declname, bindstg_(b) & PRINCSTGBITS);
+/* ECN - convert errors about different linkage types to warnings */
+            if (suppress & D_LINKAGE)
+              cc_warn(bind_rerr_linkage_disagreement,
+                      d->declname, bindstg_(b) & PRINCSTGBITS);
+            else
+              cc_rerr(bind_rerr_linkage_disagreement,
+                      d->declname, bindstg_(b) & PRINCSTGBITS);
             /* patch d->declstg to a compatible tentative type... */
-            d->declstg = (d->declstg &~ b_omitextern) ^
+            d->declstg = (d->declstg &~ b_implicitstg) ^
                          (bitofstg_(s_static) | bitofstg_(s_extern));
 
         } else if (bindstg_(b) & bitofstg_(s_static))
             /* test is needed because of global register variables */
             /* /* Explicit extern here, previous was static.
-                  Change d to say static.
+                  Change d to say static and no longer extern, implicit nor C linkage
+                  Check OK for C++ */
+            d->declstg = (d->declstg & ~(b_implicitstg|b_clinkage)) ^
+                         (bitofstg_(s_static) | bitofstg_(s_extern));
+        else if (bindstg_(b) & bitofstg_(s_extern))
+            /* test is needed because of global register variables */
+            /* /* Implicit static here, previous was extern.
+                  Change d to say extern and no longer static.
                   Check OK for C++ */
             d->declstg ^= (bitofstg_(s_static) | bitofstg_(s_extern));
     }
     else check_for_fwd_static_decl(b, d->declname);
 }
 
-static bool is_openarray(TypeExpr *t)
+static TypeExpr *is_openarray(TypeExpr *t)
 {
     t = princtype(t);                          /* skip leading typedefs */
-    if ((h0_(t) == t_subscript) && (typesubsize_(t) == 0)) return YES;
-    return NO;
+    if (h0_(t) == t_subscript && typesubsize_(t) == 0) return typearg_(t);
+    return NULL;
 }
 
 void instate_alias(Symstr *a, Binder *b)
@@ -1347,6 +1226,26 @@ void instate_alias(Symstr *a, Binder *b)
         (bindstg_(b) & b_pseudonym) ? realbinder_(b) : b;
     add_local_binder(pseudonym);
 }
+
+#ifdef FOR_ACORN
+#ifndef PASCAL
+#ifndef FORTRAN
+static int cfront_special_name(Binder *b)
+{   char *s;
+    s = symname_(bindsym_(b));
+    if (s[0] == '_' && s[1] == '_')
+    {   s += 2;
+        if (isdigit(*s))
+        {   while (isdigit(*++s));
+            if (s[0] == '_' && s[1] == '_') return 1;
+        }
+        else if (strcmp(s, "link") == 0) return 1;
+    }
+    return 0;
+}
+#endif
+#endif
+#endif
 
 static Binder *instate_declaration_1(DeclRhsList *d, int declflag)
 /* only the TOPLEVEL and DUPL_OK bits of declflag are examined */
@@ -1371,9 +1270,9 @@ static Binder *instate_declaration_1(DeclRhsList *d, int declflag)
     {   cc_msg("instate_declaration(%x, %lx): $r\n", declflag, d->declstg, sv);
         pr_typeexpr(d->decltype, sv); cc_msg("\n");
     }
-#ifdef CPLUSPLUS
 /* No need to prunetype as inner typedef would have already been used:  */
-    if ((d->declstg & bitofstg_(s_typedef)) &&
+    if (LanguageIsCPlusPlus &&
+        (d->declstg & bitofstg_(s_typedef)) &&
             isprimtypein_(d->decltype, ENUMORCLASSBITS))
     {   TagBinder *tb = typespectagbind_(d->decltype);
         if (isgensym(tagbindsym_(tb)))
@@ -1381,8 +1280,7 @@ static Binder *instate_declaration_1(DeclRhsList *d, int declflag)
             if (declflag & TOPLEVEL) tag_global_(sv) = tb;
         }
     }
-#endif
-    if (declflag&TOPLEVEL)
+    if (declflag & TOPLEVEL)
 /* Top level declarations may only surplant previous top level extern decls */
 /* Really we should also unify 'local' extern decls.  @@@ not done yet.     */
     {   TypeExpr *glotype = 0;
@@ -1390,17 +1288,26 @@ static Binder *instate_declaration_1(DeclRhsList *d, int declflag)
 #ifdef PASCAL /*ECN*/
         if (b && (bindstg_(b) & b_synbit1)) b = 0;
 #endif
+        if (b != 0 && (bindstg_(b) & bitofstg_(s_typedef)) &&
+            (bindstg_(b) & u_implicitdef))
+        {   if (LanguageIsCPlusPlus && d->declstg & bitofstg_(s_typedef) &&
+                !(d->declstg & u_implicitdef) &&
+                equivtype(bindtype_(b), d->decltype) != 2)
+                cc_err(bind_err_type_disagreement, sv);
+            b = 0;
+        }
+
         if (b != 0)
         {   bool discardb = NO;
             olduses = binduses_(b);
             /* check the types match */
-            if (h0_(b->bindtype) == t_fnap && h0_(d->decltype) == t_fnap)
+            if (h0_(bindtype_(b)) == t_fnap && h0_(d->decltype) == t_fnap)
             {   /* propagate #pragma -v and -y info from decl to defn */
                 if (typefnaux_(d->decltype).variad == 0)
                     typefnaux_(d->decltype).variad =
-                        typefnaux_(b->bindtype).variad;
+                        typefnaux_(bindtype_(b)).variad;
                 typefnaux_(d->decltype).flags |=
-                    typefnaux_(b->bindtype).flags &
+                    typefnaux_(bindtype_(b)).flags &
                     ~typefnaux_(d->decltype).flags;
                 if ((d->declstg & bitofstg_(s_inline)) &&
                     (bindstg_(b) & b_maybeinline))
@@ -1409,19 +1316,15 @@ static Binder *instate_declaration_1(DeclRhsList *d, int declflag)
                 bindstg_(b) &= ~b_maybeinline;
 /* /* @@@ old-style bit here. */
             }
-            switch (equivtype(b->bindtype, d->decltype))
+            switch (equivtype(bindtype_(b), d->decltype))
             {   default:
-#ifdef TARGET_IS_ARM /* <============================================== */
-/* @@@ AM is very worried about the implications of the next line. Does */
-/* it allows illegal code to survive with a warning?  Bad for teaching! */
-/* Yes, it allows 'extern f(char), f(int);'  Boooo.                     */
-/* Not good for C++ either!                                             */
-/* Autumn 1993: it also causes the C validation suite to whinge.        */
-                         if (widened_equivtype(b->bindtype, d->decltype))
+                         if ((suppress & D_MPWCOMPATIBLE) &&
+                             widened_equivtype(b->bindtype, d->decltype))
+                             /* f(char) incompatibility with f(int)     */
+                             /* (or f(c) char c; {}) gets just a warning*/
                              cc_warn(bind_err_type_disagreement, sv);
                          else
-#endif
-                         {   TypeExpr *bt = princtype(b->bindtype);
+                         {   TypeExpr *bt = princtype(bindtype_(b));
                              TypeExpr *dt = princtype(d->decltype);
 /* The next line helps the 'SPECMARK' suite...                          */
                              if (h0_(bt) == t_fnap && h0_(dt) == t_fnap)
@@ -1434,8 +1337,14 @@ static Binder *instate_declaration_1(DeclRhsList *d, int declflag)
                               */
                          }
                          break;
-                case 2:  glotype = b->bindtype;   /* IDENTICAL */
-                case 1:  break;
+                case 2:  glotype = bindtype_(b);  /* IDENTICAL */
+                case 1:
+                         if (LanguageIsCPlusPlus &&
+                             h0_(bindtype_(b)) == t_fnap &&
+                             merge_default_arguments(b->bindtype,
+                                                     d->decltype) == 2)
+                             glotype = bindtype_(b);  /* IDENTICAL */
+                         break;
             }
 /* It would be nice to merge the type/stgclass errors so we don't get   */
 /* 2 errors for 'typedef int a; extern double a;'                       */
@@ -1443,21 +1352,20 @@ static Binder *instate_declaration_1(DeclRhsList *d, int declflag)
             if ((bindstg_(b) | d->declstg) & bitofstg_(s_typedef))
             {   if ((bindstg_(b) & d->declstg) & bitofstg_(s_typedef))
                 {   /* can duplicate a typedef in C++, not in C */
-#ifndef CPLUSPLUS
-                    cc_rerr(bind_rerr_duplicate_typedef, sv);
-#endif
+                    if (!LanguageIsCPlusPlus)
+                        cc_rerr(bind_rerr_duplicate_typedef, sv);
                 }
                 else
-                    cc_err(bind_err_duplicate_definition, sv);
+                {   if ((d->declstg & bitofstg_(s_typedef)) &&
+                        (d->declstg & u_implicitdef))
+                        return NULL;
+                    else if ((bindstg_(b) & bitofstg_(s_typedef)) &&
+                             (bindstg_(b) & u_implicitdef))
+                        discardb = 1;
+                    else
+                        cc_err(bind_err_duplicate_definition, sv);
+                }
             }
-#ifdef TARGET_IS_XAP
-            else if (h0_(d->decltype) == t_fnap &&
-                     typefnaux_(d->decltype).flags & bitoffnaux_(s_swi) &&
-                     !(d->declstg & b_undef))
-            {
-                cc_err(bind_err_duplicate_definition, sv);
-            }
-#endif
 /* The next two tests are perhaps more natural the other way round --   */
 /* if we have two *definitions* then fault (unless one is tentative),   */
 /* otherwise essentially ignore one of the *declarations*.              */
@@ -1466,7 +1374,8 @@ static Binder *instate_declaration_1(DeclRhsList *d, int declflag)
             else if (bindstg_(b) & b_undef  &&
                      !(bindstg_(b) & u_bss) &&
                       (feature & FEATURE_PCC ||
-                        !(bindstg_(b) & b_omitextern &&
+                        !(bindstg_(b) & bitofstg_(s_extern) &&
+                          bindstg_(b) & b_implicitstg &&
                           is_openarray(bindtype_(b)))
                       ) || d->declstg & b_undef)
             {   /* At least one of the declarations has no initialiser. */
@@ -1479,11 +1388,18 @@ static Binder *instate_declaration_1(DeclRhsList *d, int declflag)
                 {   /* pcc/as faults b is static or initialised plain,  */
                     /* d is static or plain (whether or not init'd).    */
                     if (!(bindstg_(b) & b_undef) &&
-                         (d->declstg & (bitofstg_(s_static) | b_omitextern)))
+                         (d->declstg & bitofstg_(s_static) ||
+                          d->declstg & bitofstg_(s_extern) &&
+                          d->declstg & b_implicitstg))
                         cc_err(bind_err_duplicate_definition, sv);
                     else
                         check_for_fwd_static_decl(b, sv);
                 }
+                else if (LanguageIsCPlusPlus &&
+                         !(h0_(bindtype_(b)) == t_fnap) &&
+                         (bindstg_(b) & b_implicitstg) &&
+                         (d->declstg & b_implicitstg))
+                    cc_err(bind_err_duplicate_definition, sv);
                 else
                     check_ansi_linkage(b, d);
             }
@@ -1495,19 +1411,26 @@ static Binder *instate_declaration_1(DeclRhsList *d, int declflag)
             else
                 cc_err(bind_err_duplicate_definition, sv);
 
+            if (!(bindstg_(b) & b_clinkage) && (d->declstg & b_clinkage))
+                cc_rerr(bind_rerr_linkage_previously_c,b);
+
             if (discardb) {
                 binduses_(b) |= u_superceded;
                 b = 0;
             }
         }
-        else if (feature & FEATURE_PREDECLARE)
-        {   /* The following is a feature to enable policing of a software */
+        else
+        { if (feature & FEATURE_PREDECLARE)
+          { /* The following is a feature to enable policing of a software */
             /* quality policy which says "only objects previously DECLARED */
             /* as extern (presumably in a header) may be DEFINED extern".  */
             if ((d->declstg & bitofstg_(s_extern)) &&
-                (!(d->declstg & b_undef) | (d->declstg & b_omitextern)) &&
+                (!(d->declstg & b_undef) || (d->declstg & b_implicitstg)) &&
                 sv != mainsym)
                 cc_warn(bind_warn_not_in_hdr, sv);
+          }
+          if (LanguageIsCPlusPlus && h0_(d->decltype) == t_fnap)
+              (void) merge_default_arguments(d->decltype, d->decltype);
         }
         /* Maybe we wish to turn off the following for non-hosted system.  */
         if (sv == mainsym && (d->declstg & bitofstg_(s_extern)))
@@ -1522,8 +1445,9 @@ static Binder *instate_declaration_1(DeclRhsList *d, int declflag)
         {    if ((d->declstg &
                   (bitofstg_(s_static)|b_fnconst|b_globalregvar|bitofstg_(s_typedef))
                  ) == bitofstg_(s_static) && (d->declstg & b_undef))
-            {   maybebss = addTentativeDefn(sv, sizeoftype(d->decltype),
-                                   alignoftype(d->decltype), d->declstg)
+            {   maybebss = addTentativeDefn(sv, sizeoftype(d->decltype), 0,
+                                   alignoftype(d->decltype),
+                                   (d->declstg&bitofstg_(s_static)) != 0)
 #ifdef CONST_DATA_IN_CODE
                         && !(d->declstg & u_constdata)
 #endif
@@ -1535,21 +1459,25 @@ static Binder *instate_declaration_1(DeclRhsList *d, int declflag)
         {   if ((b == 0 || bindstg_(b) & b_undef)                  &&
                  !(d->declstg & (b_fnconst|b_globalregvar|bitofstg_(s_typedef))) &&
                  (d->declstg & b_undef)                            &&
-                 (d->declstg & (bitofstg_(s_static)|b_omitextern)))
+                 (d->declstg & bitofstg_(s_static) ||
+                  d->declstg & bitofstg_(s_extern) &&
+                  d->declstg & b_implicitstg))
             {
                 /* no pre-exisiting defn and not a function defn and    */
                 /* no initializer and (static blah... or plain blah...) */
-                /* 'static' and b_omitextern are mutually exclusive.    */
-                int32 size = is_openarray(d->decltype) ? 0 :
-                                                     sizeoftype(d->decltype);
-                maybebss = addTentativeDefn(sv, size,
-                                   alignoftype(d->decltype), d->declstg)
-/* @@@ should the next 2 conjuncts be anded with td->maybebss?          */
+                TypeExpr *elt_t = is_openarray(d->decltype);
+                int32 size, elt_size;
+                if (elt_t == NULL)
+                    size = sizeoftype(d->decltype), elt_size = 0;
+                else
+                    size = 0, elt_size = sizeoftype(elt_t);
+                maybebss = addTentativeDefn(sv, size, elt_size,
+                                   alignoftype(d->decltype),
+                                   (d->declstg&bitofstg_(s_static)) != 0)
 #ifdef CONST_DATA_IN_CODE
-/* @@@ added size>0 to stop spurious error on "const a[];"              */
-                        && !(d->declstg & u_constdata && size>0)
+                        && !(d->declstg & u_constdata)
 #endif
-                        && !(size == 0 && d->declstg & bitofstg_(s_static));
+                           ;
                 if (!maybebss) d->declstg &= ~b_undef;
             }
         }
@@ -1590,7 +1518,8 @@ static Binder *instate_declaration_1(DeclRhsList *d, int declflag)
             else if (!(bindstg_(b) & b_globalregvar))
             {   /* Assert: !(d->declstg & b_undef) */
                 bindstg_(b) = d->declstg |
-                  (bindstg_(b) & (bitofstg_(s_virtual)|bitofstg_(s_inline)));
+                  (bindstg_(b) &
+                   (bitofstg_(s_virtual)|bitofstg_(s_inline)|b_impl|b_purevirtual));
                 bindtype_(b) = gt;      /* @@@ bindstg/bindconst too?   */
             }
 #else /* !OLD_VSN */
@@ -1610,32 +1539,58 @@ static Binder *instate_declaration_1(DeclRhsList *d, int declflag)
     else
     {   /* NOT a top-level declaration */
         Binder *bnew;
+        Scope *saved_local_scope = set_local_block_scope();
         if (local_scope == NULL)
-            syserr("instate_declaration_1 - no local scope");
+            syserr("instate_declaration_1 - no local scope/local block scope");
         if ((b = find_scopemember(sv, local_scope->scopemems)) != NULL)
-        {   if (!(declflag & DUPL_OK ||
-                   (bindstg_(b) & d->declstg & bitofstg_(s_extern)
-#ifdef CPLUSPLUS
-                 || bindstg_(b) & d->declstg & bitofstg_(s_typedef)
-#endif
-                   ) && equivtype(d->decltype,bindtype_(b))))
-                cc_err(bind_err_duplicate_definition, sv);
+        {   if ((bindstg_(b) | d->declstg) & bitofstg_(s_typedef))
+            {   if ((d->declstg & bitofstg_(s_typedef)) &&
+                    (d->declstg & u_implicitdef))
+                {   if (!(d->declstg & b_undef))
+                    {   bindstg_(b) = d->declstg | (bindstg_(b) &
+                                (bitofstg_(s_virtual)|bitofstg_(s_inline)));
+                        bindtype_(b) = globalize_typeexpr(d->decltype);
+                    }
+                    return NULL;
+                }
+                else if ((bindstg_(b) & bitofstg_(s_typedef)) &&
+                         (bindstg_(b) & u_implicitdef))
+                    declflag |= DUPL_OK;
+            }
+            if (!(declflag & DUPL_OK))
+            {   if (!(bindstg_(b) & d->declstg & bitofstg_(s_extern) ||
+                      (LanguageIsCPlusPlus &&
+                       bindstg_(b) & d->declstg & bitofstg_(s_typedef))))
+                    cc_err(bind_err_duplicate_definition, sv);
+                else if (equivtype(d->decltype, bindtype_(b)) == 0)
+                    cc_err(bind_err_duplicate_definition, sv);
+                else if (LanguageIsCPlusPlus && h0_(bindtype_(b)) == t_fnap)
+                    merge_default_arguments(bindtype_(b), d->decltype);
+            }
             /* flag old one as referenced to avoid spurious warns:  */
             binduses_(b) |= u_referenced;
         }
+        else
+          if (LanguageIsCPlusPlus && h0_(d->decltype) == t_fnap)
+              (void) merge_default_arguments(d->decltype, d->decltype);
 /* AM: at some time we may wish to check or export C 'local' extern     */
 /* decls for checking purposes.  At that point we must ensure           */
 /* that d->decltype is globalize()d.                                    */
-#ifdef CPLUSPLUS
-        if (declflag & GLOBALSCOPE)     /* TOPLEVEL doesn't come here.  */
-            bnew = global_mk_binder(NULL, sv, d->declstg,
-                d->decltype = globalize_typeexpr(d->decltype));
+        if (b != NULL && !(declflag & DUPL_OK))
+            bnew = b;
         else
-#endif
-            bnew = mk_binder(sv, d->declstg, d->decltype);
-        add_local_binder(bnew);
+        {   if (declflag & GLOBALSTG)     /* TOPLEVEL doesn't come here.  */
+                bnew = global_mk_binder(NULL, sv, d->declstg,
+                           d->decltype = globalize_typeexpr(d->decltype));
+            else
+                bnew = mk_binder(sv, d->declstg, d->decltype);
+            add_local_binder(bnew);
+/* stop regalloc moan about typefnaux */
+            if (d->declstg & bitofstg_(s_extern) && isfntype(bindtype_(bnew)))
+                bindtype_(bnew) = globalize_typeexpr(bindtype_(bnew));
+        }
 /* If a local extern is already bound, try to find on topbindingchain:  */
-        if (b && (d->declstg & b_undef) &&
+        if ((d->declstg & b_undef) &&
             ((d->declstg & (bitofstg_(s_extern))) ||
              ((d->declstg & (bitofstg_(s_static))) &&
                (h0_(d->decltype) == t_fnap))))
@@ -1654,18 +1609,18 @@ static Binder *instate_declaration_1(DeclRhsList *d, int declflag)
             {   if (!equivtype(bindtype_(btop), d->decltype) ||
                         bindstg_(btop) & bitofstg_(s_typedef))
                     /* warn about above ambiguities?                    */
-                    cc_rerr(bind_rerr_local_extern, sv);
+                    cc_rerr_cppwarn(bind_rerr_local_extern, sv);
 /* The following lines specifically please INMOS, but are otherwise OK. */
 /* Update the storage class/bindaddr field, but NOT type (ambiguity):   */
 /* @@@ what about local externs to register globals (extension)?        */
                 else
                 {   /* Inherit old storage class:                       */
-                    bnew->bindstg = bnew->bindstg & ~(STGBITS | u_loctype) |
-                                    btop->bindstg & (STGBITS | u_loctype);
-                    if (!(btop->bindstg & b_undef))
+                    bindstg_(bnew) = bindstg_(bnew) & ~(STGBITS | u_loctype) |
+                                     bindstg_(btop) & (STGBITS | u_loctype);
+                    if (!(bindstg_(btop) & b_undef))
                     {   /* change undef extern to this-module-defd.     */
-                        bnew->bindaddr.i = btop->bindaddr.i;
-                        bnew->bindstg &= ~b_undef;
+                        bindaddr_(bnew) = bindaddr_(btop);
+                        bindstg_(bnew) &= ~b_undef;
                     }
                 }
             }
@@ -1676,40 +1631,21 @@ static Binder *instate_declaration_1(DeclRhsList *d, int declflag)
 /* Note that that this BSS_THRESHOLD applies in PCC mode too.           */
             if ( (d->declstg & b_undef) &&
                  sizeoftype(d->decltype) > BSS_THRESHOLD &&
-#ifdef TARGET_IS_NEC
-                 /* @@@ re-check this piece of code.                    */
-                 (pp_pragmavec['s'-'a'] == 5 ||         /* .sbss  */
-#ifdef TARGET_HAS_NEC_SECTS
-                  pp_pragmavec['s'-'a'] == 10 ||        /* .sebss */
-#endif
-#ifdef TARGET_HAS_C4P_SECTS
-                  pp_pragmavec['s'-'a'] == 9 ||         /* .ibss */
-#endif
-                  pp_pragmavec['s'-'a'] == 6) &&        /* .bss   */
-#endif
                  !(d->declstg & u_constdata) )
                 maybebss = YES;
             else
 #endif
-                d->declstg &= ~b_undef, bnew->bindstg &= ~b_undef;
+                d->declstg &= ~b_undef, bindstg_(bnew) &= ~b_undef;
         }
         b = bnew;
 #ifdef TARGET_HAS_BSS
         if (maybebss)
-        {   /* The next bit is also set at end-of-routine, but we need  */
-            /* to set it now to avoid a syserr() check.                 */
-            binduses_(b) |= u_bss;
-#ifdef TARGET_IS_XAP_OR_NEC
-            addlocalbss(b, sizeoftype(bindtype_(b)));
-            /* this could, one day, just be a call to genstaticparts?   */
-#else
-            {   TypeExpr *t = bindtype_(b);
-                bindaddr_(b) = addbsssym(sv, sizeoftype(t), alignoftype(t),
-                                         bindstg_(b), YES);
-            }
-#endif
+        {   TypeExpr *t = bindtype_(b);
+            bindaddr_(b) = addbsssym(sv, sizeoftype(t), alignoftype(t),
+                                (bindstg_(b) & bitofstg_(s_static)) != 0, YES);
         }
-#endif /* TARGET_HAS_BSS */
+#endif
+        local_scope = saved_local_scope;
     }
     /*
      * Make sure information about old definitions and previous references
@@ -1720,35 +1656,32 @@ static Binder *instate_declaration_1(DeclRhsList *d, int declflag)
     b->bindlevel = level;
     b->synflags = d->synflags;
 #endif
-    binduses_(b) |= olduses & u_referenced |
-#ifdef TARGET_HAS_NEC_SECTS
-                    (d->declstg & (u_constdata|u_zeropage|u_zeropage2))
-#else
-#ifdef TARGET_HAS_C4P_SECTS
-                    (d->declstg & (u_constdata|u_zeropage|u_immpage2))
-#else
-                    (d->declstg & (u_constdata|u_zeropage))
-#endif
-#endif
+    binduses_(b) |= olduses & u_referenced | (d->declstg & u_constdata)
 #ifdef TARGET_HAS_BSS
 /* @@@ Dec 90: when does the u_bss get removed if later init'ed?        */
                                           | (maybebss ? u_bss : 0)
 #endif
                                           ;
+#ifdef  FOR_ACORN
+#ifndef PASCAL
+#ifndef FORTRAN
+    if (cplusplus_flag && cfront_special_name(b)) binduses_(b) |= u_referenced;
+#endif
+#endif
+#endif
+
     return b;
 }
 
-#ifndef CPLUSPLUS
-
 ClassMember *instate_member(DeclRhsList *d, int bindflg)
-{   return instate_member_1(d, bindflg);
+{   return LanguageIsCPlusPlus ? instate_member_cpp(d, bindflg) :
+                                 instate_member_1(d, bindflg);
 }
 
 Binder *instate_declaration(DeclRhsList *d, int declflag)
-{   return instate_declaration_1(d, declflag);
+{   return LanguageIsCPlusPlus ? instate_declaration_cpp(d, declflag) :
+                                 instate_declaration_1(d, declflag);
 }
-
-#endif
 
 /* label bindings... */
 
@@ -1806,7 +1739,7 @@ void bind_cleanup(void)
                 sv, (VoidStar)tag_global_(sv));
         tag_global_(sv) = 0;             /* restore previous binding */
         /* warning on undefined struct/union now removed */
-        /*if (!(attributes_(b) & TB_DEFD) && !(suppress & D_STRUCTWARN))
+        /*if (!(tagbindbits_(b) & TB_DEFD) && !(suppress & D_STRUCTWARN))
             { cc_warn(bind_rerr_undefined_tag, tagbindsort(p), p); }
          */
     }
@@ -1817,95 +1750,50 @@ void bind_cleanup(void)
 
     for (b = topbindingchain; b != 0; b = bindcdr_(b))
     {   Symstr *sv = bindsym_(b);
-#ifndef TARGET_IS_XAP
-        /* for asm decoding structs */
         bind_global_(sv) = 0;            /* restore previous binding */
-#endif
         if (binduses_(b) & u_superceded);
         else if (bindstg_(b) & bitofstg_(s_static))
-            {   if (bindstg_(b) & b_generated);
-                else if (bindstg_(b) & b_undef)
-                {   /* surely b_undef static MUST be fnconst after      */
-                    /* tentative resolution?  u_bss?                    */
-                    /* @@@ check_for_imcomplete_tentative_defs() does   */
-                    /* not unset b_undef for [] nor bss!                */
-                    if (bindstg_(b)&b_fnconst)
-                        cc_pccwarn(bind_err_undefined_static, b);
+        {   if (!(bindstg_(b) & b_generated))
+            {   if (binduses_(b) & u_referenced)
+                {   if (bindstg_(b) & b_undef)
+                    {   /* surely b_undef static MUST be fnconst after  */
+                        /* tentative resolution?  u_bss?                */
+                        /* @@@ check_for_imcomplete_tentative_defs()    */
+                        /* does not unset b_undef for [] nor bss!       */
+                        if (bindstg_(b) & b_fnconst)
+                        {   if (suppress & D_LINKAGE) /* @@@ this should probably be removed now */
+                                cc_warn(bind_err_undefined_static, b);
+                            else
+                                cc_pccwarn(bind_err_undefined_static, b);
+                        }
+                    }
                 }
-                else if (!(binduses_(b) & u_referenced) &&
-                         !(bindstg_(b) & bitofstg_(s_inline)))
+                else if (!(bindstg_(b) & bitofstg_(s_inline)) &&
 /* @@@ of course we shouldn't generate unreferenced inline fns!         */
+                         !(issimpletype_(princtype(bindtype_(b))) &&
+                           (qualifiersoftype(bindtype_(b)) &
+                            bitoftype_(s_const))))
+/* @@@ of course we shouldn't generate unreferenced static consts!      */
                     cc_warn(bind_warn_static_not_used, b);
             }
+        }
         else if (feature & FEATURE_NOUSE)
         {   if (!(binduses_(b) & u_referenced) &&
-                !(bindstg_(b) & bitofstg_(s_typedef)))
-                    cc_warn(bind_warn_not_used(0, b->bindstg & b_fnconst, b));
+                !(bindstg_(b) & bitofstg_(s_typedef))) {
+              if (bindstg_(b) & b_fnconst) {
+                cc_warn(bind_warn_function_not_used, b);
+              } else {
+                cc_warn(bind_warn_variable_not_used, b);
+              }
+            }
         }
     }
     topbindingchain = 0;             /* just for tidyness */
 }
 
-/* AM does not believe init_sym_name_table should be in this file. How  */
-/* about its user (misc.c) or lex.c?                                    */
-static void init_sym_name_table(void)
-{   /* add entries for error messages for non-reserved words, e.g. block */
-    /* (currently) non-table driven... */
-    sym_name_table[s_error]       = errname_error;       /* <previous error> */
-    sym_name_table[s_invisible]   = errname_invisible;   /* <invisible> */
-    sym_name_table[s_let]         = errname_let;         /* <let> */
-    sym_name_table[s_character]   = errname_character;   /* <character constant> */
-    sym_name_table[s_wcharacter]  = errname_wcharacter;  /* <wide character constant> */
-    sym_name_table[s_integer]     = errname_integer;     /* <integer constant> */
-    sym_name_table[s_floatcon]    = errname_floatcon;    /* <floating constant> */
-    sym_name_table[s_string]      = errname_string;      /* <string constant> */
-    sym_name_table[s_wstring]     = errname_wstring;     /* <wide string constant> */
-    sym_name_table[s_identifier]  = errname_identifier;  /* <identifier> */
-    sym_name_table[s_pseudoid]    = errname_identifier;  /* <identifier> */
-    sym_name_table[s_binder]      = errname_binder;      /* <variable> */
-    sym_name_table[s_tagbind]     = errname_tagbind;     /* <struct/union tag> */
-    sym_name_table[s_cond]        = errname_cond;        /* _?_:_ */
-    sym_name_table[s_displace]    = errname_displace;    /* ++ or -- */
-    sym_name_table[s_postinc]     = errname_postinc;     /* ++ */
-    sym_name_table[s_postdec]     = errname_postdec;     /* -- */
-    sym_name_table[s_arrow]       = errname_arrow;       /* -> */
-#ifdef CPLUSPLUS
-    sym_name_table[s_arrowstar]   = "->*";
-    sym_name_table[s_dotstar]     = ".*";
-    sym_name_table[s_ctor]        = "<constructor>";
-    sym_name_table[s_dtor]        = "<destructor>";
+#ifdef __powerc
+typedef Symstr *((*PPCC_CHOKES_ON_CAST)[BIND_HASHSIZE]);
 #endif
-    sym_name_table[s_addrof]      = errname_addrof;      /* unary & */
-    sym_name_table[s_content]     = errname_content;     /* unary * */
-    sym_name_table[s_monplus]     = errname_monplus;     /* unary + */
-    sym_name_table[s_neg]         = errname_neg;         /* unary - */
-    sym_name_table[s_fnap]        = errname_fnap;        /* <function argument> */
-    sym_name_table[s_subscript]   = errname_subscript;   /* <subscript> */
-    sym_name_table[s_cast]        = errname_cast;        /* <cast> */
-    sym_name_table[s_sizeoftype]  = errname_sizeoftype;  /* sizeof */
-    sym_name_table[s_sizeofexpr]  = errname_sizeofexpr;  /* sizeof */
-    sym_name_table[s_ptrdiff]     = errname_ptrdiff;     /* - */   /*  for (a-b)=c msg */
-    sym_name_table[s_endcase]     = errname_endcase;     /* break */
-    sym_name_table[s_block]       = errname_block;       /* <block> */
-    sym_name_table[s_decl]        = errname_decl;        /* decl */
-    sym_name_table[s_fndef]       = errname_fndef;       /* fndef */
-    sym_name_table[s_typespec]    = errname_typespec;    /* typespec */
-    sym_name_table[s_typedefname] = errname_typedefname; /* typedefname */
-#ifdef EXTENSION_VALOF
-    sym_name_table[s_valof]       = errname_valof;       /* valof */
-#endif
-#ifdef EXTENSION_FRAC
-    sym_name_table[s_xtimes]      = "*"; /* sym_name_table[s_times] */
-    sym_name_table[s_xdiv]        = "/"; /* sym_name_table[s_div] */
-#endif
-    sym_name_table[s_ellipsis]    = errname_ellipsis;    /* ... */
-    sym_name_table[s_eol]         = errname_eol;         /* \\n */
-    sym_name_table[s_eof]         = errname_eof;         /* <eof> */
-#ifdef RANGECHECK_SUPPORTED
-    sym_name_table[s_rangecheck]  = errname_rangecheck;  /* <rangecheck> */
-    sym_name_table[s_checknot]    = errname_checknot;    /* <check> */
-#endif
-}
 
 void bind_init(void)
 {   int i;
@@ -1913,17 +1801,18 @@ void bind_init(void)
     freeScopes = local_scope = NULL;
     tag_found_in_local_scope = NO;
     scope_level = 0;
-    glob_typeexpr_memo = 0;
     tentative_defs = 0;
+#ifndef TARGET_IS_INTERPRETER
     saved_vg_state.size = 0;
+#endif
     gensymline = gensymgen = 0;
-    gensymlit = 0;
+#ifdef __powerc
+    hashvec = (PPCC_CHOKES_ON_CAST)
+#else
     hashvec = (Symstr *((*)[BIND_HASHSIZE]))
-                  GlobAlloc(SU_Other, sizeof(*hashvec));
+#endif
+        GlobAlloc(SU_Other, sizeof(*hashvec));
     for (i = 0; i < BIND_HASHSIZE; i++) (*hashvec)[i] = NULL;
-    /* This initialisation MUST precede the initialisation of lex... */
-    for (i = 0; i < s_NUMSYMS; i++) sym_name_table[i] = errname_unset;
-    init_sym_name_table();  /* language independent inits... */
 }
 
 /* end of bind.c */

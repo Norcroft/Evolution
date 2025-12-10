@@ -6,7 +6,7 @@
 
 /*
  * RCS $Revision: 1.4 $
- * Checkin $Date: 93/10/07 17:25:30 $
+ * Checkin $Date: 1993/10/07 17:25:30 $
  * Revising $Author: irickard $
  */
 

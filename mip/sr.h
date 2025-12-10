@@ -1,17 +1,13 @@
 /*
  * sr.h: binder live range splitting
  * Copyright (C) Advanced Risc Machines Ltd., 1993
- * Copyright (C) Codemist Ltd., 1996
  */
 
 /*
- * RCS $Revision: 1.2 $
- * Checkin $Date: 93/10/07 17:42:24 $
- * Revising $Author: irickard $
+ * RCS $Revision: 1.4 $
+ * Checkin $Date: 1995/02/06 15:22:02 $
+ * Revising $Author: enevill $
  */
-
-#ifndef _sr_h
-#define _sr_h 1
 
 struct SuperBinder {
   SuperBinder *cdr;
@@ -21,8 +17,6 @@ struct SuperBinder {
 
 extern SuperBinder *superbinders;
 
-extern BindList *splitranges(void);
+extern BindList *splitranges(BindList *local_binders, BindList *regvar_binders);
 
 extern void splitrange_init(void);
-
-#endif

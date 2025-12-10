@@ -6,9 +6,9 @@
  */
 
 /*
- * RCS $Revision: 1.5 $
- * Checkin $Date: 93/05/27 18:10:45 $
- * Revising $Author: hmeekings $
+ * RCS $Revision: 1.11 $
+ * Checkin $Date: 1995/07/06 14:40:35 $
+ * Revising $Author: amycroft $
  */
 
 #ifdef __STDC__
@@ -30,23 +30,87 @@ void ClearToNull(void **a, int32 n) {
   while (--n >= 0) a[n] = NULL;
 }
 
-static char *alloc_chain;    /* see alloc_init(), alloc_dispose() */
+#define STORE_TRASHING 0
+#define CHECKING_TRASH 0
+/* STORE_TRASHING and CHECKING_TRASH allow building a compiler that     */
+/* fills all allocations with trash, fills all disposed memory with     */
+/* trash and checks all allocations to make sure they still contain     */
+/* trash.  @@@ These are yet complete.  STORE_TRASHING works but does   */
+/* not trash memory freed by alloc_unmark and drop_local_store.  Also   */
+/* discard2 & discard3 trash their blocks in a different way.           */
+/* CHECKING_TRASH does not work because of the above problems with      */
+/* STORE_TRASHING                                                       */
+
+typedef struct AllocHeader AllocHeader;
+struct AllocHeader {
+        AllocHeader *next;
+#if STORE_TRASHING
+        int32 size;
+#endif
+};
+
+static AllocHeader *alloc_chain;    /* see alloc_init(), alloc_dispose() */
 
 static int32 stuse_total, stuse_waste;
 static int32 stuse[SU_Other-SU_Data+1];
 static int32 maxAEstore;
 
+#if STORE_TRASHING
+typedef struct Trasher Trasher;
+struct Trasher { int32 a[8]; };
+static const Trasher trash =
+    { { 0x50ff8001, 0x50ff8001, 0x50ff8001, 0x50ff8001,
+        0x50ff8001, 0x50ff8001, 0x50ff8001, 0x50ff8001 } };
+
+static void trash_block(VoidStar p, unsigned32 size) {
+    Trasher *t = (Trasher *)p;
+    while (sizeof(Trasher) < size)
+    {
+        *t++ = trash;
+        size -= sizeof(Trasher);
+    }
+    memcpy(t, &trash, size);
+}
+
+#if CHECKING_TRASH
+static void check_trashed(VoidStar p, unsigned32 size) {
+    Trasher *t = (Trasher *)p;
+    while (sizeof(Trasher) < size)
+    {
+        if (memcmp(t++, p, sizeof(Trasher)) != 0)
+            syserr("free memory has been altered somewhere between [%p and %p)\n",
+                   t - 1, t);
+        size -= sizeof(Trasher);
+    }
+    if (memcmp(t, p, size) != 0)
+        syserr("free memory has been altered somewhere between [%p and %p)\n",
+               t, (char*)t + size);
+}
+#else
+#define check_trashed(p, size) ((void)0)
+#endif
+
+#else
+#define trash_block(p, size) ((void)0)
+#define check_trashed(p, size) ((void)0)
+#endif
+
+
 static VoidStar cc_alloc(int32 n)
-{   char *p;
+{   AllocHeader *p;
     stuse_total += n;
 /* The next line's test probably only generates code on a PC.           */
     p = (sizeof(size_t) < sizeof(int32) &&
-         (unsigned32)(n+sizeof(char *)) > 0xffff) ? 0 :
-          (char *)malloc((size_t)(n+sizeof(char *)));
+         (unsigned32)(n+sizeof(AllocHeader)) > 0xffff) ? 0 :
+          (AllocHeader *)malloc((size_t)(n+sizeof(AllocHeader)));
     if (p != 0)
-    { *(char **)p = alloc_chain;
+    { p->next = alloc_chain;
+#if STORE_TRASHING
+      p->size = n+sizeof(AllocHeader);
+      trash_block((VoidStar)((char*)p + sizeof(AllocHeader)), n);
+#endif
       alloc_chain = p;
-      return p+sizeof(char *);
+      return (char*)p + sizeof(AllocHeader);
     }
 #ifdef TARGET_IS_ARM
     if (usrdbg(DBG_ANY))
@@ -62,9 +126,10 @@ void alloc_dispose(void)
     unsigned32 count = 0;
     if (debugging(DEBUG_STORE)) cc_msg("Freeing block(s) at:");
     while (alloc_chain != NULL)
-    {   char *next = *(char **)alloc_chain;
+    {   AllocHeader *next = alloc_chain->next;
         if (debugging(DEBUG_STORE))
           cc_msg("%s %p", count++ % 8 == 0 ? "\n":"", alloc_chain);
+        trash_block((VoidStar)alloc_chain, alloc_chain->size);
         free(alloc_chain);
         alloc_chain = next;
     }
@@ -128,6 +193,7 @@ static char *new_global_segment(void)
         if (debugging(DEBUG_STORE))
             cc_msg("Global store %d from binder size %ld at %p\n",
                     (int)globallcnt, (long)SEGSIZE, w);
+        check_trashed((VoidStar)w, SEGSIZE);
     }
     else
     {   w = (char *)cc_alloc(SEGSIZE);
@@ -143,15 +209,13 @@ static char *new_global_segment(void)
 /*
  * The value RR here is used when rounding store allocations up - it
  * is intended to ensure that this code runs properly when hosted on machines
- * where sizeof(char *) == 8, provided that in such cases int32 has been
- * make into a 64-bit integer value (despute its name!)
+ * where sizeof(char *) == 8.  Put a pad_to_hosttype() macro in util.h?
  */
-
 #define RR (sizeof(char *) - 1)
 
 VoidStar GlobAlloc(StoreUse t, int32 n)
 {   char *p = globallp;
-    n = (n + RR) & ~(int32)RR;     /* make n a multiple of sizeof(int32) */
+    n = (n + RR) & ~(int32)RR;          /* n = pad_to_hosttype(n, IPtr) */
     if (n > SEGSIZE)
     {   /* Big global store requests get a single oversize page.        */
         p = (char *)cc_alloc(n);
@@ -164,43 +228,48 @@ VoidStar GlobAlloc(StoreUse t, int32 n)
     {   if (p+n > globalltop)
             stuse_waste += globalltop-p,
             p = new_global_segment();
+        else
+            check_trashed(p, n);
         globallp = p + n;
     }
     stuse[(int)t] += n;
+#ifndef ALLOC_DONT_CLEAR_MEMORY
+    memset(p, 0xbb, n);
+#endif
     return p;
 }
 
-VoidStar xglobal_cons2(StoreUse t, int32 a, int32 b)
+VoidStar xglobal_cons2(StoreUse t, IPtr a, IPtr b)
 {
-    int32 *p = (int32 *) GlobAlloc(t, sizeof(int32)*2);
+    IPtr *p = (IPtr *) GlobAlloc(t, sizeof(IPtr[2]));
     p[0] = a; p[1] = b;
     return (VoidStar) p;
 }
 
-VoidStar xglobal_list3(StoreUse t, int32 a, int32 b, int32 c)
+VoidStar xglobal_list3(StoreUse t, IPtr a, IPtr b, IPtr c)
 {
-    int32 *p = (int32 *) GlobAlloc(t, sizeof(int32)*3);
+    IPtr *p = (IPtr *) GlobAlloc(t, sizeof(IPtr[3]));
     p[0] = a; p[1] = b; p[2] = c;
     return (VoidStar) p;
 }
 
-VoidStar xglobal_list4(StoreUse t, int32 a, int32 b, int32 c, int32 d)
+VoidStar xglobal_list4(StoreUse t, IPtr a, IPtr b, IPtr c, IPtr d)
 {
-    int32 *p = (int32 *) GlobAlloc(t, sizeof(int32)*4);
+    IPtr *p = (IPtr *) GlobAlloc(t, sizeof(IPtr[4]));
     p[0] = a; p[1] = b; p[2] = c; p[3] = d;
     return (VoidStar) p;
 }
 
-VoidStar xglobal_list5(StoreUse t, int32 a, int32 b, int32 c, int32 d, int32 e)
+VoidStar xglobal_list5(StoreUse t, IPtr a, IPtr b, IPtr c, IPtr d, IPtr e)
 {
-    int32 *p = (int32 *) GlobAlloc(t, sizeof(int32)*5);
+    IPtr *p = (IPtr *) GlobAlloc(t, sizeof(IPtr[5]));
     p[0] = a; p[1] = b; p[2] = c; p[3] = d; p[4] = e;
     return (VoidStar)p;
 }
 
-VoidStar xglobal_list6(StoreUse t, int32 a, int32 b, int32 c, int32 d, int32 e, int32 f)
+VoidStar xglobal_list6(StoreUse t, IPtr a, IPtr b, IPtr c, IPtr d, IPtr e, IPtr f)
 {
-    int32 *p = (int32 *) GlobAlloc(t, sizeof(int32)*6);
+    IPtr *p = (IPtr *) GlobAlloc(t, sizeof(IPtr[6]));
     p[0] = a; p[1] = b; p[2] = c; p[3] = d; p[4] = e; p[5] = f;
     return (VoidStar)p;
 }
@@ -215,6 +284,7 @@ static VoidStar expand_array(VoidStar oldp, int32 oldsize, int32 newsize)
 {   /* beware the next line if we ever record GlobAlloc's:              */
     VoidStar newp = GlobAlloc(SU_Other, newsize);
     if (oldsize != 0) memcpy(newp, oldp, (size_t)oldsize);
+    trash_block(oldp, oldsize);
     return newp;
 }
 
@@ -239,6 +309,8 @@ static char *new_bindalloc_segment(void)
                     phasename, currentfunction.symstr);
         bindsegbase[bindsegcnt++] = w;
     }
+    else
+        check_trashed(bindsegbase[bindsegcur], SEGSIZE);
     return bindsegbase[bindsegcur++];
 }
 
@@ -251,6 +323,7 @@ static char *new_synalloc_segment(void)
         if (debugging(DEBUG_2STORE) && synsegcnt>0)
             cc_msg("Syntax store %d from binder size %ld at %p\n",
                     (int)synsegcnt, (long)SEGSIZE, w);
+        check_trashed(w, SEGSIZE);
     }
     else
     {   w = (char *)cc_alloc(SEGSIZE);
@@ -265,21 +338,23 @@ static char *new_synalloc_segment(void)
 VoidStar BindAlloc(int32 n)
 {
     char *p = bindallp;
-    n = (n + RR) & ~(int32)RR;     /* make n a multiple of sizeof(int32) */
+    n = (n + RR) & ~(int32)RR;          /* n = pad_to_hosttype(n, IPtr) */
     if (n > SEGSIZE) syserr(syserr_overlarge_store1, (long)n);
     if (p + n > bindalltop)
     {   int i;                                 /* 0..segmax */
         if (bindsegcur > 0)
             bindsegptr[bindsegcur-1] = p;      /* stash highest used */
-        for (i = marklist->bind_segno;; i++)   /* search for scraps  */
-        {   if (i == bindsegcur)               /* nowhere big enough */
+        for (i = bindsegcur;;)                 /* search for scraps  */
+        {   --i;
+            if (i < marklist->bind_segno)      /* nowhere big enough */
             {   p = new_bindalloc_segment();
                 bindalltop = p + SEGSIZE;
                 break;
             }
             p = bindsegptr[i];                 /* hope springs eternal */
             bindalltop = bindsegbase[i] + SEGSIZE;
-            if (p+n <= bindalltop)             /* fingers crossed      */
+            if ((n > 3*sizeof(int32)) && (p+n <= bindalltop))
+                 /* fingers crossed      */
             {   /* we have scavenged something useful - swap to current */
                 char *t = bindsegbase[i];
                 bindsegbase[i] = bindsegbase[bindsegcur-1];
@@ -294,28 +369,34 @@ VoidStar BindAlloc(int32 n)
         }
         bindsegptr[bindsegcur-1] = (char *)DUFF_ADDR;
     }
+    check_trashed(p, n);
     bindallp = p + n;
     if ((bindallhwm += n) > bindallmax) bindallmax = bindallhwm;
+#ifndef ALLOC_DONT_CLEAR_MEMORY
+    memset(p, 0xcc, n);
+#endif
     return p;
 }
 
 VoidStar SynAlloc(int32 n)
 {   char *p = synallp;
-    n = (n + RR) & ~(int32)RR;     /* make n a multiple of sizeof(int32) */
+    n = (n + RR) & ~(int32)RR;          /* n = pad_to_hosttype(n, IPtr) */
     if (n > SEGSIZE) syserr(syserr_overlarge_store2, (long)n);
     if (p + n > synalltop)
     {   int i;                                 /* 0..segmax */
         if (synsegcnt > 0)
             synsegptr[synsegcnt-1] = p;        /* stash highest used */
-        for (i = marklist->syn_segno;; i++)    /* search for scraps  */
-        {   if (i == synsegcnt)                /* nowhere big enough */
+        for (i = synsegcnt;;)                  /* search for scraps  */
+        {   --i;
+            if (i < marklist->syn_segno)       /* nowhere big enough */
             {   p = new_synalloc_segment();
                 synalltop = p + SEGSIZE;
                 break;
             }
             p = synsegptr[i];                  /* hope springs eternal */
             synalltop = synsegbase[i] + SEGSIZE;
-            if (p+n <= synalltop)              /* fingers crossed      */
+            if ((n > 3*sizeof(int32)) && (p+n <= synalltop))
+                /* fingers crossed      */
             {   /* we have scavenged something useful - swap to current */
                 char *t = synsegbase[i];
                 synsegbase[i] = synsegbase[synsegcnt-1];
@@ -330,8 +411,12 @@ VoidStar SynAlloc(int32 n)
         }
         synsegptr[synsegcnt-1] = (char *)DUFF_ADDR;
     }
+    check_trashed(p, n);
     synallp = p + n;
     if ((synallhwm += n) > synallmax) synallmax = synallhwm;
+#ifndef ALLOC_DONT_CLEAR_MEMORY
+    memset(p, 0xaa, n);
+#endif
     return p;
 }
 
@@ -343,42 +428,46 @@ VoidStar discard2(VoidStar p)
     VoidStar q = (VoidStar) pp->next;
     int i;                   /* 0..segmax */
     pp->rest[0] ^= 0x99990000;   /* to help with debugging */
-    for (i = 0; i < synsegcnt; i++)
+    for (i = synsegcnt; i > 0; )
+    {  --i;
        if (synsegbase[i] <= (char *)pp && (char *)pp < synsegbase[i]+SEGSIZE)
        {   pp->next = synall2;
-           synall2 = (FreeList *)(((int32) pp) ^ 0x6a6a6a6a);
+           synall2 = (FreeList *)(((IPtr)pp) ^ 0x6a6a6a6a);
            return q;
        }
-    for (i = 0; i < bindsegcur; i++)
+    }
+    for (i = bindsegcur; i > 0;)
+    {  --i;
        if (bindsegbase[i] <= (char *)pp && (char *)pp < bindsegbase[i]+SEGSIZE)
        {   pp->next = bindall2;
-           bindall2 = (FreeList *)(((int32) pp) ^ 0x5a5a5a5a);
+           bindall2 = (FreeList *)(((IPtr)pp) ^ 0x5a5a5a5a);
            return q;
        }
+    }
     syserr(syserr_discard2, (VoidStar) pp);
     return q;
 }
 
-VoidStar xsyn_list2(int32 a, int32 b)
-{   int32 *p;
+VoidStar xsyn_list2(IPtr a, IPtr b)
+{   IPtr *p;
     if (synall2==NULL)
-        p = (int32 *) SynAlloc(sizeof(int32)*2);
+        p = (IPtr *) SynAlloc(sizeof(IPtr[2]));
     else
-    {   p = (int32 *)((int32) synall2 ^ 0x6a6a6a6a);
+    {   p = (IPtr *)((IPtr) synall2 ^ 0x6a6a6a6a);
         synall2 = (FreeList *) p[0];
     }
     p[0] = a; p[1] = b;
     return (VoidStar) p;
 }
 
-VoidStar xbinder_list2(int32 a, int32 b)
+VoidStar xbinder_list2(IPtr a, IPtr b)
 {   if (bindall2==NULL)
-    {   int32 *p = (int32 *) BindAlloc(sizeof(int32)*2);
+    {   IPtr *p = (IPtr *) BindAlloc(sizeof(IPtr[2]));
         p[0] = a; p[1] = b;
         return (VoidStar) p;
     }
     else
-    {   int32 *p = (int32 *)((int32) bindall2 ^ 0x5a5a5a5a);
+    {   IPtr *p = (IPtr *)((IPtr) bindall2 ^ 0x5a5a5a5a);
         bindall2 = (FreeList *) p[0];
         p[0] = a; p[1] = b;
         return (VoidStar) p;
@@ -393,74 +482,81 @@ VoidStar discard3(VoidStar p)
     FreeList *pp = (FreeList *) p;
     VoidStar q = (VoidStar) pp->next;
     int i;                   /* 0..segmax */
-    for (i = 0; i < synsegcnt; i++)
-       if (synsegbase[i] <= (char *)pp && (char *)pp < synsegbase[i]+SEGSIZE)
-       {   pp->next = synall3;
-           synall3 = (FreeList *)(((int32) pp) ^ 0x6a6a6a6a);
-           return q;
-       }
-    for (i = 0; i < bindsegcur; i++)
-       if (bindsegbase[i] <= (char *)pp && (char *)pp < bindsegbase[i]+SEGSIZE)
-       {   pp->next = bindall3;
-           bindall3 = (FreeList *)(((int32) pp) ^ 0x5a5a5a5a);
-           return q;
-       }
+    pp->rest[0] ^= 0x99990000;   /* to help with debugging */
+    pp->rest[1] ^= 0x99990000;   /* to help with debugging */
+    for (i = synsegcnt; i > 0;)
+    {   --i;
+        if (synsegbase[i] <= (char *)pp && (char *)pp < synsegbase[i]+SEGSIZE)
+        {   pp->next = synall3;
+            synall3 = (FreeList *)(((IPtr)pp) ^ 0x6a6a6a6a);
+            return q;
+        }
+    }
+    for (i = bindsegcur; i > 0;)
+    {   --i;
+        if (bindsegbase[i] <= (char *)pp && (char *)pp < bindsegbase[i]+SEGSIZE)
+        {   pp->next = bindall3;
+            bindall3 = (FreeList *)(((IPtr)pp) ^ 0x5a5a5a5a);
+            return q;
+        }
+    }
     syserr(syserr_discard3, (VoidStar) pp);
     return q;
 }
 
-VoidStar xbinder_list3(int32 a, int32 b, int32 c)
+VoidStar xbinder_list3(IPtr a, IPtr b, IPtr c)
 {
-    int32 *p;
+    IPtr *p;
     if (bindall3 == NULL)
-        p = (int32 *) BindAlloc(sizeof(int32)*3);
+        p = (IPtr *) BindAlloc(sizeof(IPtr[3]));
     else {
-        p = (int32 *)((int32) bindall3 ^ 0x5a5a5a5a);
+        p = (IPtr *)((IPtr) bindall3 ^ 0x5a5a5a5a);
         bindall3 = (FreeList *) p[0];
     }
     p[0] = a; p[1] = b; p[2] = c;
     return (VoidStar) p;
 }
 
-VoidStar xsyn_list3(int32 a, int32 b, int32 c)
-{   int32 *p;
+VoidStar xsyn_list3(IPtr a, IPtr b, IPtr c)
+{   IPtr *p;
     if (synall3 == NULL)
-        p = (int32 *) SynAlloc(sizeof(int32)*3);
+        p = (IPtr *) SynAlloc(sizeof(IPtr[3]));
     else {
-        p = (int32 *)((int32) synall3 ^ 0x6a6a6a6a);
+        p = (IPtr *)((IPtr) synall3 ^ 0x6a6a6a6a);
         synall3 = (FreeList *) p[0];
     }
     p[0] = a; p[1] = b; p[2] = c;
     return (VoidStar) p;
 }
 
-VoidStar xsyn_list4(int32 a, int32 b, int32 c, int32 d)
-{   int32 *p = (int32 *) SynAlloc(sizeof(int32)*4);
+VoidStar xsyn_list4(IPtr a, IPtr b, IPtr c, IPtr d)
+{   IPtr *p = (IPtr *) SynAlloc(sizeof(IPtr[4]));
     p[0] = a, p[1] = b, p[2] = c, p[3] = d;
     return (VoidStar) p;
 }
 
-VoidStar xsyn_list5(int32 a, int32 b, int32 c, int32 d, int32 e)
+VoidStar xsyn_list5(IPtr a, IPtr b, IPtr c, IPtr d, IPtr e)
 {
-    int32 *p = (int32 *) SynAlloc(sizeof(int32)*5);
+    IPtr *p = (IPtr *) SynAlloc(sizeof(IPtr[5]));
     p[0] = a; p[1] = b; p[2] = c; p[3] = d; p[4] = e;
     return (VoidStar) p;
 }
 
-VoidStar xsyn_list6(int32 a, int32 b, int32 c, int32 d, int32 e, int32 f)
-{   int32 *p = (int32 *) SynAlloc(sizeof(int32)*6);
+VoidStar xsyn_list6(IPtr a, IPtr b, IPtr c, IPtr d, IPtr e, IPtr f)
+{   IPtr *p = (IPtr *) SynAlloc(sizeof(IPtr[6]));
     p[0] = a, p[1] = b, p[2] = c, p[3] = d, p[4] = e, p[5] = f;
     return (VoidStar) p;
 }
 
-VoidStar xsyn_list7(int32 a, int32 b, int32 c, int32 d, int32 e, int32 f,
-                   int32 g)
-{   int32 *p = (int32 *) SynAlloc(sizeof(int32)*7);
+VoidStar xsyn_list7(IPtr a, IPtr b, IPtr c, IPtr d, IPtr e, IPtr f,
+                   IPtr g)
+{   IPtr *p = (IPtr *) SynAlloc(sizeof(IPtr[7]));
     p[0] = a, p[1] = b, p[2] = c, p[3] = d, p[4] = e, p[5] = f, p[6] = g;
     return (VoidStar) p;
 }
 
-void alloc_mark(void)           /* @@@ not used essentially for C       */
+/* @@@ not used essentially for C but it is used for C++ */
+void alloc_mark(void)
 {
     Mark *p;
     if ((p = freemarks) != NULL)
@@ -480,7 +576,7 @@ void alloc_mark(void)           /* @@@ not used essentially for C       */
                 bindsegcur, bindallp, (long)bindallhwm);
 }
 
-/* #ifdef PASCAL_OR_FORTRAN -- comment out? */
+/* #ifdef PASCAL_OR_FORTRAN_OR_CPLUSPLUS -- comment out? */
 void alloc_unmark(void)
 {
     Mark *p = marklist;
@@ -493,10 +589,16 @@ void alloc_unmark(void)
     synalltop = (synallp == DUFF_ADDR) ? (char *)DUFF_ADDR
                                        : synsegbase[synsegcnt-1] + SEGSIZE;
     synallhwm = p->syn_hwm;
+    /* NULLing out the free lists like this will lose the blocks */
+    /* that are between synallp and synalltop until the segment is */
+    /* recycled but it's considerably cheaper than scanning the free */
+    /* lists and segment array */
+    synall2 = NULL; synall3 = NULL;
     bindsegcur = p->bind_segno; bindallp = p->bind_allp;
     bindalltop = (bindallp == DUFF_ADDR) ? (char *)DUFF_ADDR
                                          : bindsegbase[bindsegcur-1] + SEGSIZE;
     bindallhwm = p->bind_hwm;
+    bindall2 = NULL; bindall3 = NULL;
 
     if (debugging(DEBUG_STORE))
         cc_msg("Unmark %d, %p, %lx :: %d, %p, %lx\n",
@@ -528,29 +630,31 @@ void drop_local_store(void)
         cc_msg("Max SynAlloc %ld in $r\n",
                 (long)synallmax, currentfunction.symstr);
     synallhwm = marklist->syn_hwm;
-    synall2 = NULL; synall3 = NULL;
+    synall2 = NULL; synall3 = NULL;  /* see comment in alloc_unmark */
 }
 
 void alloc_reinit(void)
-{   if (synsegcnt > marklist->syn_segno)
+{   if (synsegcnt > marklist->syn_segno ||
+        synallp != marklist->syn_allp ||
+        synalltop != ((synallp == DUFF_ADDR) ? (char *)DUFF_ADDR
+                                       : synsegbase[synsegcnt-1] + SEGSIZE) ||
+        synall2 != NULL ||
+        synall3 != NULL
+       )
         syserr(syserr_alloc_reinit);
-    synallp = marklist->syn_allp;
-    synalltop = (synallp == DUFF_ADDR) ? (char *)DUFF_ADDR
-                                       : synsegbase[synsegcnt-1] + SEGSIZE;
-    synall2 = NULL; synall3 = NULL;
     bindallhwm = marklist->bind_hwm;
     bindsegcur = marklist->bind_segno; bindallp = marklist->bind_allp;
     bindalltop = (bindallp == DUFF_ADDR) ? (char *)DUFF_ADDR
                                          : bindsegbase[bindsegcur-1] + SEGSIZE;
-    bindall2 = NULL; bindall3 = NULL;
+    bindall2 = NULL; bindall3 = NULL;   /* see comment in alloc_unmark */
 }
 
 void alloc_init(void)
 {
     /* reset the following vars for each one of a many file compilation */
     stuse_total = 0, stuse_waste = 0;
-    memclr((void *)stuse, sizeof(stuse));
-    alloc_chain = NULL;
+    memclr(stuse, sizeof(stuse));
+    if (alloc_chain != NULL) syserr("alloc_init notices there was no alloc_dispose");
     synsegcnt = 0;
     synallp = synalltop = (char *)DUFF_ADDR;
     synall2 = NULL; synall3 = NULL;

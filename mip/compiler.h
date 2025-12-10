@@ -5,9 +5,9 @@
  */
 
 /*
- * RCS $Revision: 1.5 $
- * Checkin $Date: 93/10/07 17:24:51 $
- * Revising $Author: irickard $
+ * RCS $Revision: 1.6 $
+ * Checkin $Date: 1995/05/10 16:03:48 $
+ * Revising $Author: lsmith $
  */
 
 #ifndef __compiler_h
@@ -35,8 +35,8 @@
 #  define LANG_UC_EXTN 'B'
 #  define LANG_EXTN_STRING "b"
 #else
-#  define FNAME_INCLUDE_SUFFIXES "c C h H"
-#  define FNAME_SUFFIXES "a A c C h H o O s S"
+#  define FNAME_INCLUDE_SUFFIXES "c C h H c++ C++ cpp CPP cp CP i I"
+#  define FNAME_SUFFIXES "a A c C h H o O s S c++ C++ cpp CPP cp CP"
 #  define LANG_EXTN 'c'
 #  define LANG_UC_EXTN 'C'
 #  define LANG_EXTN_STRING "c"
@@ -53,5 +53,9 @@ extern int ccom(int argc, char *argv[]);  /* must match spec for main */
 extern void driver_abort(char *message);
 
 extern bool cistreq(const char *s1, const char *s2);
+
+#ifdef FOR_ACORN
+extern bool cplusplus_preprocessing(void);
+#endif
 
 #endif

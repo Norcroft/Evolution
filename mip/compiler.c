@@ -6,9 +6,9 @@
  */
 
 /*
- * RCS $Revision: 1.39 $  Codemist 148
- * Checkin $Date: 93/09/29 16:12:13 $
- * Revising $Author: lsmith $
+ * RCS $Revision: 1.77 $  Codemist 147
+ * Checkin $Date: 1996/01/10 14:54:27 $
+ * Revising $Author: hmeeking $
  */
 
 /* AM Mar 89: start 'ccom-like' interface.  I allow the compiler to produce */
@@ -39,6 +39,7 @@
 #include "sem.h"      /* init */
 #include "bind.h"     /* init */
 #include "builtin.h"  /* init */
+#include "vargen.h"   /* initstaticvar */
 #include "aetree.h"
 #include "cg.h"
 #include "mcdep.h"
@@ -49,6 +50,9 @@
 #include "errors.h"
 #ifdef TARGET_IS_KCM
 #include "target.h"
+#endif
+#if defined(FOR_ACORN) && defined(COMPILING_ON_RISCOS)
+#include "dde.h"
 #endif
 
 #ifndef COMPILING_ON_MVS
@@ -93,11 +97,17 @@ static PathElement *path_hd, *path_tl, *path_sav;
 
 #define TEXT_FILE                      0
 #define BINARY_FILE                    1
+#define TEXT_FILE_APPEND               2          /* for Acorn RISC OS DDE */
 
 static int ccom_flags;
 time_t tmuse_front, tmuse_back;
 bool host_lsbytefirst;
 bool target_lsbitfirst;
+
+#ifdef MIN_ALIGNMENT_CONFIGURABLE
+int32 alignof_struct_val;
+int32 alignof_toplevel_static_var;
+#endif
 
 /*
  * Define the following as global, for various debugger back-ends.
@@ -112,6 +122,9 @@ static const char *system_flavour;
 static FILE *makestream;
 
 #ifdef COMPILING_ON_RISC_OS
+#ifdef FOR_ACORN
+static int makeflg = 0;
+#endif
 
 #include "riscos.h"
 
@@ -138,7 +151,7 @@ static void set_time_stamp(const char *file, bool good)
 
 extern void driver_abort(char *message)
 {
-  cc_msg("Compilation aborted: %s\n",message );
+  cc_msg_lookup(driver_abort_msg, message);
   exit(EXIT_error);
 }
 
@@ -148,10 +161,11 @@ static FILE *cc_open(const char *s, int mode)
     if (*s == 0 || strcmp(s, "-") == 0)
         f = (mode == BINARY_FILE) ? (s = "binary stdout", (FILE *)0) : stdout;
     else
-        f = fopen(s, (mode == BINARY_FILE) ? FOPEN_WB : "w");
+        f = fopen(s, (mode == BINARY_FILE) ? FOPEN_WB :
+                     (mode == TEXT_FILE_APPEND) ? "a" : "w");
     if (f == 0)
     {   char msg[MAX_NAME];
-        sprintf(msg, "couldn't write file '%s'\n", s);
+        msg_sprintf(msg, driver_couldnt_write, s);
         driver_abort(msg);
     }
     return f;
@@ -164,18 +178,19 @@ static void cc_close(FILE **fp, const char *file)
 /* the file still be closeable in which case it must be closed!         */
 /* Consider a floppy disc running out of space.)                        */
     FILE *f = *fp;
-    bool err;
+    int err;
     *fp = NULL;
     if (f != NULL && f != stdout && (err = ferror(f), fclose(f) || err))
         cc_fatalerr(compiler_fatalerr_io_error, file);
 }
 
+#ifndef TARGET_IS_INTERPRETER
 extern void compile_abort(int sig_no)
 {
 /* pre-conditions: initialisation done, closing not done.  Call from      */
 /* SIGINT handler at your peril!                                          */
 #ifndef COMPILING_ON_MSDOS
-    signal(SIGINT, SIG_IGN);
+    (void) signal(SIGINT, SIG_IGN);
 #endif
 #ifndef NO_ASSEMBLER_OUTPUT
     if (asmstream)
@@ -188,17 +203,16 @@ extern void compile_abort(int sig_no)
 #ifndef NO_LISTING_OUTPUT
     cc_close(&listingstream, listingfile);
 #endif
-#ifndef NO_OBJECT_OUTPUT
     if (objstream)
     {   cc_close(&objstream, objectfile);
 #ifndef COMPILING_ON_MVS
-        if (objectfile[0]) remove(objectfile);
-#endif
-    }
+        remove(objectfile);
 #endif
     cc_close(&makestream, makefile);
+    }
     exit(sig_no == (-1) ? EXIT_fatal : EXIT_syserr);
 }
+#endif
 
 /*
  * Enable compiler features
@@ -230,7 +244,7 @@ static void rtcheck_set(char *opts)
           case 'R': new_rtcheck = RTCHECK_REFERENCE; break;
           case 'P': new_rtcheck = RTCHECK_ASSERT; break;
           case 'D': new_rtcheck = RTCHECK_DEADCODE;  break;
-          default:  cc_msg("unknown option -r%c: ignored\n", opt);
+          default:  cc_warn(warn_option_r, opt);
       }
       rtcheck ^= new_rtcheck;
   }
@@ -266,7 +280,7 @@ static void feature_set(char *opts)
         /* 'V' */ FEATURE_NOUSE,
         /* 'W' */ FEATURE_WR_STR_LITS,
         /* 'X' */ UNUSED,
-        /* 'Y' */ UNUSED,
+        /* 'Y' */ FEATURE_ENUMS_ALWAYS_INT,
         /* 'Z' */ FEATURE_INLINE_CALL_KILLS_LINKREG
     };
 #undef UNUSED
@@ -289,7 +303,7 @@ static void feature_set(char *opts)
           else if (ch == 'Z')
               ccom_flags |= FLG_USE_SYSTEM_PATH;
           else
-unknown:      cc_msg("unknown option -f%c: ignored\n", opt);
+unknown:      cc_warn(warn_option_f, opt);
       }
   }
 }
@@ -302,33 +316,28 @@ unknown:      cc_msg("unknown option -f%c: ignored\n", opt);
 static void usrdbg_set(char *opts)
 {
   int opt = *opts;
-
   if (opt == 0)
-    usrdbgmask = DBG_PROC | DBG_LINE | DBG_VAR;
-  if (opt == '0')               /* -g0 turns usrdbg off         */
-    usrdbgmask = 0, opts++;
-  while ((opt = *opts++) != 0)
+    usrdbgmask = DBG_ANY;
+  else
+  {
+    while (opt)
     {
       int new_option = 0;
       switch (safe_toupper(opt))
       {
-#ifdef TARGET_IS_XAP
-/* Normally, turning on debugging (e.g. line numbers) inhibits          */
-/* optimisations like dead-code removal.  We suppress this for the XAP  */
-/* since it makes the assembler look terrible when we merely want line- */
-/* numbers, but it can be turned on again with -gk.  See usrdbgk().     */
-case 'K': new_option = DBG_KEEPCODE;   break;
-#endif
 #ifndef TARGET_IS_UNIX
 case 'F': new_option = DBG_PROC;   break;
 case 'L': new_option = DBG_LINE;   break;
 case 'V': new_option = DBG_VAR;    break;
+case 'P': new_option = DBG_PP;     break;
 #endif
-default:  new_option = DBG_PROC | DBG_LINE | DBG_VAR;
-          cc_msg("unknown debugging option -g%c: -g assumed\n", opt);
+default:  new_option = DBG_ANY;
+          cc_warn(warn_option_g, opt);
       }
       usrdbgmask |= new_option;
+      opt = *++opts;
     }
+  }
 }
 #endif
 
@@ -339,54 +348,77 @@ default:  new_option = DBG_PROC | DBG_LINE | DBG_VAR;
 static void disable_warnings(char *opts)
 {
   int opt = *opts;
-  int32 new_suppress;
-
   if (opt == 0)
   {
       var_warn_implicit_fns   = 0;
       var_warn_deprecated     = 0;
       feature |= FEATURE_NOWARNINGS;
-      suppress |= D_ASSIGNTEST | D_IMPLICITNARROWING | D_IMPLICITVOID |
-                  D_PPNOSYSINCLUDECHECK;
+      suppress |= D_ASSIGNTEST | D_LOWERINWIDER | D_IMPLICITNARROWING |
+                  D_IMPLICITVOID | D_IMPLICITCTOR | D_PPNOSYSINCLUDECHECK;
   }
   else
-  {
+  { bool switchon = NO;
     while (opt)
     {
-      new_suppress = 0L;
+      int32 new_suppress = 0L;
       switch (safe_toupper(opt))
       {
+case '+': switchon = YES;                       break;
 case 'A': new_suppress = D_ASSIGNTEST;          break;
-case 'N': new_suppress = D_IMPLICITNARROWING;   break;
+case 'I': new_suppress = D_IMPLICITCTOR;        break;
+case 'L': new_suppress = D_LOWERINWIDER;        break;
+case 'N': new_suppress = D_LOWERINWIDER|D_IMPLICITNARROWING; break;
 case 'P': new_suppress = D_PPNOSYSINCLUDECHECK; break;
 case 'V': new_suppress = D_IMPLICITVOID;        break;
-case 'D': var_warn_deprecated = 0;
-          break;
-case 'F': var_warn_implicit_fns = 0;
-          break;
+case 'G': new_suppress = D_GUARDEDINCLUDE;      break;
+case 'D': var_warn_deprecated = 0;              break;
+case 'F': var_warn_implicit_fns = 0;            break;
 
-default:  cc_msg("unknown option -w%c: ignored\n", opt);
+default:  cc_warn(warn_option_w, opt);
       }
-      suppress |= new_suppress;
+      if (switchon)
+        suppress &= ~new_suppress;
+      else
+        suppress |= new_suppress;
       opt = *++opts;
     }
   }
 }
 
 #ifdef DISABLE_ERRORS
-static void disable_errors(char *s)      /* -eXYZ suppresses ERROR messages */
-{   for (;;) switch (*s++)
-    {  case 'c': case 'C': suppress |= D_IMPLICITCAST;   break;
-       case 'm': case 'M': suppress |= D_MPWCOMPATIBLE | D_PPALLOWJUNK | D_ZEROARRAY;
-                           feature |= FEATURE_ALLOWCOUNTEDSTRINGS;
-                                                         break;
-       case 'p': case 'P': suppress |= D_PPALLOWJUNK;    break;
-#ifndef NO_VALOF_BLOCKS
-       case 'v': case 'V': suppress |= D_VALOFBLOCKS;    break;
+static void disable_errors(char *opts)      /* -eXYZ suppresses ERROR messages */
+{ int opt = *opts;
+  bool switchon = NO;
+  while (opt)
+  {
+    int32 new_suppress = 0,
+          new_feature = 0;
+    switch (safe_toupper(opt))
+    {
+case 'C': new_suppress = D_IMPLICITCAST;   break;
+case 'M': new_suppress = D_MPWCOMPATIBLE | D_PPALLOWJUNK | D_ZEROARRAY | D_PPNOSYSINCLUDECHECK;
+          new_feature = FEATURE_ALLOWCOUNTEDSTRINGS;
+                                           break;
+case 'P': new_suppress = D_PPALLOWJUNK;    break;
+#ifdef EXTENSION_VALOF
+case 'V': new_suppress = D_VALOFBLOCKS;    break;
 #endif
-       case 'z': case 'Z': suppress |= D_ZEROARRAY;      break;
-       case 0: return;
+case 'Z': new_suppress = D_ZEROARRAY;      break;
+case 'F': new_suppress = D_CAST;           break;  /* Force casts */
+/* ECN - Suppress errors about linkage disagreements */
+case 'L': new_suppress = D_LINKAGE;        break;
+case 'A': new_suppress = D_ACCESS;         break;
+default:  cc_warn(warn_option_e, opt);
     }
+    if (switchon)
+    {  suppress &= ~new_suppress;
+       feature &= ~new_feature;
+    } else {
+      suppress |= new_suppress;
+      feature |= new_feature;
+    }
+    opt = *++opts;
+  }
 }
 #endif
 
@@ -403,11 +435,7 @@ static void pragma_set(char *p)
   { int32 value;
     int ch = *p;
     if (isdigit(ch))
-    {
-      for (value = 0;  isdigit(ch);  ch = *++p)
-      {
-        value = value * 10 + (int32)ch - '0';
-      }
+    { value = strtol(p, NULL, 0);  /* allow 0x... form too */
 #ifdef FORTRAN
       if ((pragmachar == 'x' || pragmachar == 'w') &&
            pp_pragmavec[pragmachar-'a'] != -1)
@@ -437,7 +465,8 @@ static void debug_set(char *opts)
     switch (safe_toupper(opt))
     {
 #ifdef ENABLE_AETREE
-case 'A': debugmask = DEBUG_AETREE;    break;
+case 'A': ++aetree_debugcount;
+          debugmask = DEBUG_AETREE;    break;
 #endif
 #ifdef ENABLE_BIND
 case 'B': debugmask = DEBUG_BIND;      break;
@@ -448,6 +477,9 @@ case 'C': cse_debugcount++;
 #endif
 #ifdef ENABLE_DATA
 case 'D': debugmask = DEBUG_DATA;      break;
+#endif
+#ifdef ENABLE_TEMPLATE
+case 'E': debugmask = DEBUG_TEMPLATE;  break;
 #endif
 #ifdef ENABLE_FNAMES
 case 'F': debugmask = DEBUG_FNAMES;    break;
@@ -511,7 +543,7 @@ case 'Z': syserr_behaviour++;
 #endif
 #endif
           break;
-default:  cc_msg("unknown option -zq%c: ignored\n", opt);
+default:  cc_warn(warn_option_zq, opt);
     }
     sysdebugmask |= debugmask;
   }
@@ -525,11 +557,8 @@ static int32 pcc_features(void)
 {
   var_warn_implicit_fns   = 0;
   var_warn_deprecated     = 0;
-
   pp_preundefine("__STDC__");
-
   suppress |= D_ASSIGNTEST | D_IMPLICITNARROWING | D_IMPLICITVOID;
-
   return FEATURE_PCC | FEATURE_UNIX_STYLE_LONGJMP | FEATURE_SIGNED_CHAR;
 }
 
@@ -538,9 +567,14 @@ static void translate_fname(const char *file, UnparsedName *un, char *new_file)
     fname_unparse(un, FNAME_AS_NAME, new_file, MAX_NAME);
 }
 
-static void translate_path(const char *file, UnparsedName *un, char *new_file)
-{   fname_parse(file, FNAME_INCLUDE_SUFFIXES, un);
-    fname_unparse(un, FNAME_AS_PATH, new_file, MAX_NAME);
+static void translate_path(const char *path, UnparsedName *un, char *new_path)
+{   fname_parse(path, FNAME_INCLUDE_SUFFIXES, un);
+    fname_unparse(un, FNAME_AS_PATH, new_path, MAX_NAME);
+#if defined(FOR_ACORN) && defined(COMPILING_ON_RISC_OS)
+    /* DDE fix for paths like foo: ... */
+    if (un->un_pathlen > 1 && new_path[un->un_pathlen-2] == ':')
+        new_path[un->un_pathlen-1] = 0;          /* kill trailing separator */
+#endif
 }
 
 static PathElement *mk_path_element(PathElement *link, int flags, char *name)
@@ -651,7 +685,7 @@ static void pop_include(void)
 #endif
 }
 
-static void preprocess_only()
+static void preprocess_only(void)
 {
   int character;
 
@@ -669,6 +703,17 @@ static void preprocess_only()
   }
 }
 
+#ifdef  FOR_ACORN
+#ifndef PASCAL
+#ifndef FORTRAN
+int cplusplus_preprocessing(void)
+{
+    return (ccom_flags & FLG_PREPROCESS) && cplusplus_flag;
+}
+#endif
+#endif
+#endif
+
 static void pre_include(char *file)
 {   FILE *f;
     if ((f = fopen(file, "r")) != NULL)
@@ -676,12 +721,31 @@ static void pre_include(char *file)
         preprocess_only();
     }
     else
-        cc_msg("can't open pre-include file %s (ignored)\n", file);
+        cc_warn(warn_preinclude, file);
 }
 
 /*
  * Initialise compiler state.
  */
+
+static void set_debug_options(int argc, char *argv[])
+{
+  int count;
+  for (count=1;  count < argc;  ++count)
+  {   char *current = argv[count];
+      if (current[0] == '-' && current[1] != 0)
+          switch (safe_toupper(current[1]))
+          {
+#ifdef TARGET_HAS_DEBUGGER
+      case 'G': usrdbg_set(current+2);        break;
+#endif
+      case 'Z': if (safe_toupper(current[2]) == 'Q') debug_set(current+3);
+                break;
+          }
+  }
+}
+
+static int makeflag;
 
 static void set_compile_options(int argc, char *argv[])
 {
@@ -724,9 +788,7 @@ static void set_compile_options(int argc, char *argv[])
 #endif
 #ifdef COMPILING_ON_MVS
                 if (current[2])
-                {   cc_msg(
-       "Obsolete use of '%s' to suppress errors -- use '-zu' for PCC mode\n",
-                           current);
+                {   cc_warn(warn_option_E, current);
                     break;
                 }
 #endif
@@ -735,9 +797,7 @@ static void set_compile_options(int argc, char *argv[])
 
       case 'F': feature_set(current+2);       break;
 
-#ifdef TARGET_HAS_DEBUGGER
-      case 'G': usrdbg_set(current+2);        break;
-#endif
+      case 'G': break;  /* already done */
 
       case 'I': set_include_path(current+2, PE_USER);  break;
 
@@ -758,8 +818,13 @@ static void set_compile_options(int argc, char *argv[])
                 {   ccom_flags &= ~(FLG_COMPILE+FLG_NOSYSINCLUDES);
                     if (current[2] == '<') ccom_flags |= FLG_NOSYSINCLUDES;
                 }
+                else if (current[2] == '+')
+                {   makefile = current+3;
+                    break;
+                }
                 else
                     makefile = current+2;
+                makeflag = 0;
                 break;
 
       case 'O': /*
@@ -775,7 +840,7 @@ static void set_compile_options(int argc, char *argv[])
                   else if (ch == 'G' || ch == 'X' && current[3] == 0)
                     profile = 2L;
                   else
-                    cc_msg("unknown profile option %s: -p assumed\n",current);
+                    cc_warn(warn_option_p, current);
                   var_profile_option = profile;
                 }
                 break;
@@ -796,31 +861,36 @@ static void set_compile_options(int argc, char *argv[])
 #endif
                 break;
 
-      case 'U': pp_preundefine(current+2);          break;
+      case 'U': pp_preundefine(current+2);    break;
 
-      case 'W': disable_warnings(current+2);        break;
+      case 'W': disable_warnings(current+2);  break;
 
 #ifdef TARGET_IS_MVS    /* TARGET_USES_CCOM_INTERFACE ??? */
 /* The following case provides -Xcsectname for CC 163 compatibility.    */
 /* It may be that the CCOM-style interface should stuff ALL unknown     */
 /* options to mcdep_config_option()?                                    */
       case 'X': if (!mcdep_config_option(current[1], current+2))
-                    cc_msg("unknown option %s: ignored\n", current);
+                    cc_warn(warn_option, current);
                 break;
 #endif
 
       case 'Z': switch(safe_toupper(current[2]))
                 {
+#ifdef MIN_ALIGNMENT_CONFIGURABLE
+          case 'A': if (safe_toupper(current[3]) == 'S' &&
+                        isdigit(current[4])) {
+                        alignof_struct_val = current[4] - '0';
+                        break;
+                    } else if (safe_toupper(current[3]) == 'T' &&
+                        isdigit(current[4])) {
+                        alignof_toplevel_static_var = current[4] - '0';
+                        break;
+                    }
+                    goto check_mcdep;
+#endif
           case 'B': target_lsbitfirst = !target_lsbytefirst;
                     if (isdigit(current[3]))
-                        target_lsbitfirst = (current[3]-'0');
-                    break;
-          case 'D': config |= CONFIG_SINGLEFLOAT;
-/*
- * NB this pp_predefine will over-ride an earlier one that
- * gave __sizeof_double its default value (in pp_init)!
- */
-                    pp_predefine("__sizeof_double=4");
+                        target_lsbitfirst = (current[3]-'0') != 0;
                     break;
 #ifdef TARGET_ENDIANNESS_CONFIGURABLE
           case 'E': { int lsbytefirst = current[3] - '0';
@@ -828,7 +898,7 @@ static void set_compile_options(int argc, char *argv[])
                           config &= ~CONFIG_BIG_ENDIAN;
                       else
                           config |= CONFIG_BIG_ENDIAN;
-                      target_lsbitfirst = lsbytefirst;
+                      target_lsbitfirst = lsbytefirst != 0;
                     }
                     break;
 #endif
@@ -844,27 +914,38 @@ static void set_compile_options(int argc, char *argv[])
                     break;
           case 'O': feature |= FEATURE_AOF_AREA_PER_FN;
                     break;
-          case 'Q': debug_set(current+3);
-                    break;
+          case 'Q': break;  /* already done */
 #ifndef TARGET_IS_HELIOS
           case 'S': system_flavour = current+3;
                     break;
 #endif
           case 'U': feature |= pcc_features();
+                    feature &= ~(FEATURE_ANSI|FEATURE_CPP|FEATURE_CFRONT);
                     break;
-#ifdef PASCAL /*ECN*/
+          case 'Y': feature |= FEATURE_ANSI;
+                    feature &= ~(FEATURE_PCC|FEATURE_CPP|FEATURE_CFRONT);
+                    break;
+#ifdef CPLUSPLUS
+          case 'Z': feature |= FEATURE_CFRONT;
+                    /* drop through */
+          case 'X': feature |= FEATURE_CPP;
+                    feature &= ~(FEATURE_PCC|FEATURE_ANSI);
+                    break;
+#endif
+#ifdef PASCAL
           case 'Z': feature |= FEATURE_ISO;
                     break;
 #endif
           case 'T': config |= (current[3] == '+') ? CONFIG_OPTIMISE_TIME :
                                                     CONFIG_OPTIMISE_SPACE;
           break;
+          check_mcdep:
           default:  if (!mcdep_config_option(current[2], current+3))
-                        cc_msg("unknown option %s: ignored\n", current);
+                        cc_warn(warn_option, current);
                     break;
                 }
                 break;
-      default:  cc_msg("unknown option %s: ignored\n", current);
+      default:  cc_msg(msg_lookup(warn_option), current);
                 break;
           }
       }
@@ -875,14 +956,29 @@ static void set_compile_options(int argc, char *argv[])
       case 1:   if (strcmp(current, "-") == 0)
                 {   /* then just leave as stdin */
 #ifdef COMPILING_ON_RISC_OS
+                    /* Change default no-buffering to line buffering...  */
+#ifdef FOR_ACORN
+                    /* A fault in the shared library forces the use of a */
+                    /* real buffer. NULL will not do...                  */
+                    static char input_buffer[256];
+                    setvbuf(stdin, input_buffer, _IOLBF, sizeof(input_buffer));
+                    dde_prefix_init("");
+#else
 #  if defined(TARGET_IS_ARM) && !defined(OBSOLETE_ARM_NAMES)
-                    /* Hack round default RISCOS no-buffering library.  */
                     setvbuf(stdin, NULL, _IOLBF, 256);
 #  endif
 #endif
+#endif
                 }
-                else if (freopen(current,"r",stdin) != NULL)
-                {   UnparsedName unparse;
+                else
+                {
+#ifdef FOR_ACORN
+                  /* IDJ: 06-Jun-94. Set desktop "current directory" */
+                  dde_prefix_init(current);
+                  dde_sourcefile_init();
+#endif
+                  if (freopen(current,"r",stdin) != NULL)
+                  { UnparsedName unparse;
                     char new_dir[MAX_NAME], *mod;
                     ccom_flags &= ~FLG_STDIN;
                     sourcefile = current;
@@ -899,16 +995,16 @@ static void set_compile_options(int argc, char *argv[])
                     memcpy(mod, unparse.root, unparse.rlen);
                     mod[unparse.rlen] = 0;
                     sourcemodule = mod;
-                }
-                else
-                {
-                    sprintf(message, "couldn't read file '%s'", current);
+                  }
+                  else
+                  { msg_sprintf(message, driver_couldnt_read, current);
                     driver_abort(message);
+                  }
                 }
                 break;
       case 2:   objectfile = current;
                 break;
-      default:  driver_abort("too many file arguments");
+      default:  driver_abort(msg_lookup(driver_too_many_file_args));
           }
       }
   }
@@ -920,7 +1016,6 @@ static void set_compile_options(int argc, char *argv[])
 #ifdef TARGET_HAS_SEPARATE_CODE_DATA_SEGS
   /* On machines like amd29000 code and data buses are separate    */
   /* so that all non-instruction data must go in the data segment. */
-  /* New implementations should set TARGET_HAS_HARVARD_SEGS.       */
   feature |= FEATURE_WR_STR_LITS;
 #endif
 
@@ -956,24 +1051,24 @@ static void set_compile_options(int argc, char *argv[])
           else listingstream = stdout;
           if (ccom_flags & FLG_COUNTS)
           { FILE *map = fopen("counts", "rb");
-            if (map == NULL) driver_abort("couldn't read \"counts\" file");
-            if (!map_init(map)) driver_abort("malformed \"counts\" file");
+            if (map == NULL) driver_abort(msg_lookup(driver_couldnt_read_counts));
+            if (!map_init(map)) driver_abort(msg_lookup(driver_malformed_counts));
           }
       }
 #endif
   }
 
   if (ccom_flags & FLG_MAKEFILE)
-  {
-      if (makefile[0] == 0)
+  {   if (makefile[0] == 0)
           makestream = stdout;
       else
-      {
-          makestream = cc_open(makefile, TEXT_FILE);
+      {   /* if -M+, then open with append ("a") if already writing to  */
+          /* makefile (makeflag != 0)                                   */
+          makestream = cc_open(makefile,
+                  makeflag ? TEXT_FILE_APPEND : TEXT_FILE);
+          makeflag = 1;
       }
-      /*
-       *  Print out source file and object file for -M option
-       */
+      /* Print out source file and object file for -M option...         */
       fprintf(makestream, DEPEND_FORMAT, objectfile, sourcefile);
   }
 }
@@ -1026,12 +1121,10 @@ static void compile_statements(void)
       if (h0d == s_eof) break; else decls = YES;
     }
 #ifndef PASCAL /*ECN*/
-    if (!decls && !(feature & FEATURE_PCC))    /* move to rd_topdecl()? */
+    if (!decls && (feature & FEATURE_ANSI))    /* move to rd_topdecl()? */
       cc_rerr(compiler_rerr_no_extern_decl);
 #endif
-#ifdef CPLUSPLUS
-    vg_ref_dynamic_init();
-#endif
+    if (LanguageIsCPlusPlus) vg_ref_dynamic_init();
 #ifdef TARGET_IS_HELIOS
     obj_makestubs();             /* tentative positioning */
 #endif
@@ -1062,7 +1155,8 @@ static void cleanup(void)
 #   ifdef COMPILING_ON_UNIX
       if (have_obj && system_flavour != NULL)
       {   char *cmd;
-          cmd = ccom_alloc(24 + strlen(system_flavour) + strlen(objectfile));
+          cmd = GlobAlloc(SU_Other,
+                          24 + strlen(system_flavour) + strlen(objectfile));
           sprintf(cmd,"/usr/bin/symrename -%s %s",system_flavour,objectfile);
           system(cmd);
       }
@@ -1168,6 +1262,19 @@ extern FILE *pp_inclopen(char *file, bool systemheader,
           }
           p = p->link;
       }
+#ifdef COMPILING_ON_RISC_OS
+      /* IDJ 06-Jun-94: before trying instore headers we try just the filename
+       * by itself.  This is because of something like <foo$dir>.h.bar which
+       * may or may not be a rooted filename.
+       */
+      if (debugging(DEBUG_FILES)) cc_msg("Try file '%s'\n", new_file);
+      if ((new_include_file = fopen(new_file, "r")) != 0)
+      {   if (!(systemheader && (ccom_flags & FLG_NOSYSINCLUDES)))
+              show_h_line(1, new_file, YES);
+          *hostname = push_include(new_file, new_file);
+          return new_include_file;
+      }
+#endif
 #ifndef NO_INSTORE_FILES
 /* Not found - ANSI require looking for "stdio.h" as <stdio.h> when all */
 /* else has failed.                                                     */
@@ -1194,6 +1301,7 @@ extern void pp_inclclose(FileLine fl)
     show_h_line(fl.l, fl.f, NO);
 }
 
+#ifndef TARGET_IS_INTERPRETER
 #ifdef HOST_USES_CCOM_INTERFACE
 /* don't move the opening braces in the lines below : topcc needs them */
 extern int main(int argc, char *argv[]) {
@@ -1206,24 +1314,30 @@ extern int ccom(int argc, char *argv[]) { /* must match spec for main */
 #ifndef COMPILING_ON_MSDOS
   (void) signal(SIGINT, compile_abort);
 #endif
-#else
-#ifndef COMPILING_ON_MSDOS
+#else /* TARGET_IS_UNIX */
   /* The signal ignore state can be inherited from the parent... */
 #define sig_ign ((void (*)(int))(SIG_IGN))
   if (signal(SIGINT,  sig_ign) != sig_ign)
     (void) signal(SIGINT, compile_abort);
   if (signal(SIGHUP,  sig_ign) != sig_ign)
-    (void) signal(SIGINT, compile_abort);
+    (void) signal(SIGHUP, compile_abort);
   if (signal(SIGTERM, sig_ign) != sig_ign)
-    (void) signal(SIGINT, compile_abort);
+    (void) signal(SIGTERM, compile_abort);
 #endif
 #endif
+
+#if (defined NLS) && (defined HOST_USES_CCOM_INTERFACE)
+  msg_init(argv[0],MSG_TOOL_NAME);
 #endif
+
   ccom_flags = FLG_STDIN + FLG_COMPILE + FLG_INSTORE_FILES_IMPLICITLY;
-  asmfile = listingfile = makefile = objectfile = sourcefile = sourcemodule = "";
+
+  asmfile = listingfile = makefile = objectfile = sourcefile = sourcemodule = ""
+;
   system_flavour = NULL;
 
   asmstream = objstream = listingstream = makestream = 0;
+  makeflag = 0;
 
   tmuse_front = tmuse_back = 0;
 
@@ -1234,10 +1348,19 @@ extern int ccom(int argc, char *argv[]) { /* must match spec for main */
 #endif
 
 #ifdef TARGET_WANTS_FUNCTION_NAMES
-  feature          = FEATURE_SAVENAME; /* keep function names (for debugger) */
+  feature          = FEATURE_SAVENAME;
+                              /* keep function names (for debugger) */
 #else
   feature          = 0;
 #endif
+
+#ifdef CPLUSPLUS
+  feature          |= FEATURE_CPP;
+#else
+/* /* PASCAL? FORTRAN? others? */
+  feature          |= FEATURE_ANSI;
+#endif
+
 #ifdef TARGET_IS_UNIX
   feature          |= FEATURE_WR_STR_LITS | FEATURE_LIMITED_PCC;
 #endif
@@ -1245,6 +1368,7 @@ extern int ccom(int argc, char *argv[]) { /* must match spec for main */
   suppress         = D_SUPPRESSED;
   sysdebugmask     = 0;
   syserr_behaviour = 0;
+  aetree_debugcount = 0;
   cse_debugcount   = 0;
   localcg_debugcount = 0;
 #ifdef TARGET_HAS_DEBUGGER
@@ -1254,11 +1378,11 @@ extern int ccom(int argc, char *argv[]) { /* must match spec for main */
 #ifndef NO_CONFIG
     config_init();
 #else
-    config = 0;
+     config = 0;
 #endif
 
   {   static int endian_test = 1;
-      host_lsbytefirst = *((char *)&endian_test);
+      host_lsbytefirst = *((char *)&endian_test) != 0;
   }
 #ifdef TARGET_ENDIANNESS_CONFIGURABLE
   if (!(config & CONFIG_ENDIANNESS_SET))
@@ -1266,27 +1390,47 @@ extern int ccom(int argc, char *argv[]) { /* must match spec for main */
 #endif
   target_lsbitfirst = target_lsbytefirst;
 
+#ifdef MIN_ALIGNMENT_CONFIGURABLE
+  alignof_struct_val = alignof_struct_default;
+  alignof_toplevel_static_var = alignof_toplevel_static_default;
+#endif
+
   phasename = "init";
   currentfunction.symstr = NULL;
+
   errstate_init();
+  set_debug_options(argc, argv);
+
   alloc_init();
   pp_init(&curlex.fl);
                   /* for pp_predefine() option and pragma on command line  */
                   /* must init_sym_tab here if pp shares its symbol tables */
   sourcefile = "<stdin>"; sourcemodule = "none";
 
+#ifdef FORTRAN
+  pp_pragmavec['x'-'a'] = 1;   /* Enable double-complex by default for now */
+#endif
+
+#ifndef DEFAULT_DOES_NO_CSE
+/*
+ * Enable CSE by default, even though there may be bugs in the code yet...
+ * Use -zpz0 to disable CSE if you need to.
+ */
   var_cse_enabled = 1;
+#endif
+
   var_cc_private_flags = 0;      /* No development options switched on yet */
 
   set_compile_options(argc, argv);
+#ifdef SOFTWARE_FLOATING_POINT
+  if (software_floating_point_enabled) pp_predefine("__SOFTFP__");
+#endif
   if (config & CONFIG_OPTIMISE_TIME) var_crossjump_enabled = 0;
-  /* GNU compatibility... */
-  pp_predefine((feature & FEATURE_SIGNED_CHAR) ? "_CHAR_IS_SIGNED"
-                                               : "_CHAR_IS_UNSIGNED");
 
   pp_notesource(sourcefile, stdin);
   show_h_line(1, sourcefile, NO);
 
+  aetree_init();
   bind_init();
   lex_init();                        /* sets curlex.sym to s_nothing   */
   builtin_init();                    /* change to setup from syn_init? */
@@ -1294,7 +1438,9 @@ extern int ccom(int argc, char *argv[]) { /* must match spec for main */
 #ifndef PASCAL /*ECN*/
   syn_init();
 #endif
+  vargen_init();
   cg_init();
+  initstaticvar(datasegment, 1);    /* nasty here */
   drop_local_store();       /* required for alloc_reinit()             */
 
   if (ccom_flags & FLG_COMPILE)
@@ -1310,5 +1456,13 @@ extern int ccom(int argc, char *argv[]) { /* must match spec for main */
   if (warncount != 0) return EXIT_warn;
   return 0;
 }
+#endif
+
+#ifdef TARGET_IS_INTERPRETER
+void compiler_init(void)
+{
+     path_hd = mk_path_element(path_hd, PE_USER, "");
+}
+#endif
 
 /* end of compiler.c */

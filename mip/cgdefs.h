@@ -6,9 +6,9 @@
  */
 
 /*
- * RCS $Revision: 1.8 $ Codemist 4
- * Checkin $Date: 93/10/07 17:22:30 $
- * Revising $Author: irickard $
+ * RCS $Revision: 1.15 $ Codemist 4
+ * Checkin $Date: 1995/06/26 16:37:19 $
+ * Revising $Author: amycroft $
  */
 
 #ifndef _cgdefs_LOADED
@@ -31,27 +31,24 @@ typedef struct CSEBlockHead CSEBlockHead;
  */
 struct LabelNumber {            /* compiler-generated-label descriptor */
   BlockHead *block;             /* block containing label */
-  union /* LabRefDef */ {
+  union {
       List *frefs;              /* forwd ref list, managed by local cg */
       int32 defn;               /* jopcode location or code location   */
   } u;
-#ifdef TARGET_IS_XAP_OR_NEC
-  int32 lndraft;                /* worst case code position            */
-#endif
-  int32 lnname;                 /* 'lnname' (internal label number) -  */
+  int32 lndraft;                /* worst case code position -- gen.c   */
+  int32 name;                   /* 'name' (internal label number) -  */
 };                              /* top bit indicates 'label defined' */
- 
 /*
  * Useful access and constructor functions...
  */
 #define addfref_(l,v)       ((l)->u.frefs = \
                              (List *)binder_icons2((l)->u.frefs,(v)))
 #define addlongfref_(l,v,i) ((l)->u.frefs = \
-                             (List *)binder_icons3((l)->u.frefs,(v),(int32)(i)))
-#define lab_isset_(l)       ((l)->lnname < 0)
-#define lab_setloc_(l,v)    ((l)->lnname |= ~0x7fffffff, (l)->u.defn = (v))
-#define lab_name_(l)        ((l)->lnname)
-#define lab_xname_(l)       (is_exit_label(l) ? (int32)(l) : \
+                             (List *)binder_icons3((l)->u.frefs,(v),(IPtr)(i)))
+#define lab_isset_(l)       ((l)->name < 0)
+#define lab_setloc_(l,v)    ((l)->name |= ~0x7fffffff, (l)->u.defn = (v))
+#define lab_name_(l)        ((l)->name)
+#define lab_xname_(l)       (is_exit_label(l) ? (int32)(IPtr)(l) : \
                              lab_name_(l) & 0x7fffffff)
 
 /*
@@ -79,7 +76,7 @@ struct BlockHead
           BlockHead *backp;             /* for branch_chain() only       */
         } succ1;
   union { LabelNumber *next1;           /* alternative successor         */
-          int32 tabsize;                /* or size of switch table       */
+          /* int32 */ IPtr tabsize;     /* or size of switch table       */
           BlockHead *backp1;            /* for branch_chain() only       */
         } succ2;
   BlockHead *down;                  /* forward chaining                  */
@@ -90,7 +87,7 @@ struct BlockHead
                                     /* and also dominators of this block */
                                     /* (during cse & live range splitting*/
   union { BindList *l;              /* binders active at head of block   */
-          int32 i;
+          /* int32 */ IPtr i;
         } stack;
   BindListList *debenv;             /* @@@ temp/rationalise - see flowgraph */
   BlockList *usedfrom;              /* list of blocks that ref. this one */
@@ -119,23 +116,14 @@ typedef int32 RealRegister;
 /* The following mask is used so that cse and regalloc can pack a       */
 /* RegSort value and a small integer into an int32.                     */
 /* Maybe neither of these are very essential anymore.                   */
-#define REGSORTMASK (~0x07ffffffL)/* for pack/unpack of RegSort & int   */
+#define REGSORTMASK (~0x07ffffff) /* for pack/unpack of RegSort & int   */
 
-#ifdef TARGET_IS_XAP
-/* new code needing to be parameterised other than XAP:                 */
-#define WRDREG      0x18000000L
-#define ADDRREG WRDREG
-/* surely SOFTWARE_FLOATING_POINT => isintregtype_() == 1?              */
-#define isintregtype_(rsort) ((rsort) == INTREG || (rsort) == WRDREG)
-#else
-#define WRDREG INTREG
 #ifdef ADDRESS_REG_STUFF
 #define ADDRREG     0x18000000L
 #define isintregtype_(rsort) ((rsort) == INTREG || (rsort) == ADDRREG)
 #else
 #define ADDRREG INTREG
 #define isintregtype_(rsort) ((rsort) == INTREG)
-#endif
 #endif
 
 #define regbit(n) (((unsigned32)1L)<<(n))
@@ -153,12 +141,10 @@ typedef int32 RealRegister;
 # endif
 #endif
 
-#define V_resultreg(rsort) \
-  (isintregtype_(rsort) ? R_A1result : R_FA1result)
+#define V_resultreg(rsort) (isintregtype_(rsort) ? R_A1result : R_FA1result)
 /* The following line allows for the possibility of the function result   */
 /* register being different in caller and callee (e.g. register windows). */
-#define V_Presultreg(rsort) \
-  (isintregtype_(rsort) ? R_P1result : R_FP1result)
+#define V_Presultreg(rsort) (isintregtype_(rsort) ? R_P1result : R_FP1result)
 
 /* 'GAP' is a non-value of type VRegnum.  The bit pattern is chosen so  */
 /* that it invalidates any packing with REGSORTMASK above, and often    */
@@ -168,7 +154,7 @@ typedef int32 RealRegister;
 
 typedef struct RegList {
     struct RegList *rlcdr;
-    VRegnum rlcar;
+    /* VRegnum */ IPtr rlcar;
 } RegList;
 
 #define mkRegList(a,b) ((RegList *)binder_icons2(a,b))
@@ -177,9 +163,9 @@ typedef struct RegList {
 
 typedef union VRegInt
 {
-    VRegnum r;
-    RealRegister rr;
-    int32 i;
+    /* VRegnum */ IPtr r;
+    /* RealRegister */ IPtr rr;
+    /* int32 */ IPtr i;
     char *str;
     StringSegList *s;
     LabelNumber *l;

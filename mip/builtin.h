@@ -1,14 +1,14 @@
 /*
  * mip/builtin.h:
  * Copyright (C) Acorn Computers Ltd., 1988-1990.
- * Copyright (C) Codemist Ltd., 1987-1994.
+ * Copyright (C) Codemist Ltd., 1987-1992.
  * Copyright (C) Advanced RISC Machines Limited, 1991-1992.
  */
 
 /*
- * RCS $Revision: 1.10 $
- * Checkin $Date: 93/10/07 17:20:55 $
- * Revising $Author: irickard $
+ * RCS $Revision: 1.29 $
+ * Checkin $Date: 1995/10/09 13:40:29 $
+ * Revising $Author: sdouglas $
  */
 
 #ifndef _builtin_h
@@ -34,39 +34,45 @@ extern FPConst fc_one;          /*                          1.0  */
 extern FPConst fc_two;          /*                          2.0  */
 extern FPConst fc_minusone;     /*                          -1.0  */
 
-extern TypeExpr *te_char;   /* = (global)primtype_(bitoftype_(s_char)) */
-extern TypeExpr *te_int;    /* = (global)primtype_(bitoftype_(s_int)) */
-extern TypeExpr *te_uint, *te_lint, *te_ulint;  /* and friends */
-extern TypeExpr *te_double; /* = (global)primtype_(bitoftype_(s_double)) */
-extern TypeExpr *te_float;  /* its short friend */
-extern TypeExpr *te_ldble;  /* and its long one */
-extern TypeExpr *te_void;   /* = (global)primtype_(bitoftype_(s_void)) */
-#ifdef EXTENSION_FRAC
-extern TypeExpr *te_frac;
-extern TypeExpr *te_lfrac;
-#endif
+extern TypeExpr *te_boolean;    /* == te_int in C */
+extern Expr *lit_false;         /* (int)0 in C    */
+extern Expr *lit_true;          /* (int)1 in C    */
 
-extern Binder *codesegment;
-#ifndef TARGET_ASM_NAMES_LITERALS
-extern Binder *datasegment, *constdatasegment;
-#ifdef TARGET_IS_XAP_OR_NEC
-extern Binder *zvdatasegment, *zcdatasegment;
-#ifdef TARGET_HAS_BSS
-extern Binder *zbsssegment;
-#endif
-#endif
+extern TypeExpr *te_char;    /* = (global)primtype_(bitoftype_(s_char)) */
+extern TypeExpr *te_int;     /* = (global)primtype_(bitoftype_(s_int)) */
+extern TypeExpr *te_ushort, *te_uint, *te_lint, *te_ulint;  /* and friends */
+extern TypeExpr *te_double;  /* = (global)primtype_(bitoftype_(s_double)) */
+extern TypeExpr *te_float;   /* its short friend */
+extern TypeExpr *te_ldble;   /* and its long one */
+extern TypeExpr *te_void;    /* = (global)primtype_(bitoftype_(s_void)) */
+extern TypeExpr *te_charptr; /* = (global)ptrtotype_(te_char))) */
+extern TypeExpr *te_intptr;  /* = (global)ptrtotype_(te_int))) */
+extern TypeExpr *te_voidptr; /* = (global)ptrtotype_(te_void))) */
+extern TypeExpr *te_fntype(TypeExpr *res, TypeExpr *a1, TypeExpr *a2,
+                                          TypeExpr *a3, TypeExpr *a4,
+                                          TypeExpr *a5);
+extern TypeExpr *g_te_fntype(TypeExpr *res, TypeExpr *a1, TypeExpr *a2,
+                                            TypeExpr *a3, TypeExpr *a4,
+                                            TypeExpr *a5);
+
+#define te_size_t (feature & FEATURE_PCC ? te_int : te_uint)
+
+extern Binder *datasegment, *codesegment, *constdatasegment, *ddtorsegment;
 #ifdef TARGET_HAS_BSS
 extern Binder *bsssegment;
 #endif
-#ifdef TARGET_HAS_NEC_SECTS
-extern Binder *tidatasegment, *sidatasegment, *sedatasegment, *sebsssegment;
-#endif
-#ifdef TARGET_HAS_C4P_SECTS
-extern Binder *idatasegment, *iconstsegment, *ibsssegment;
-#endif
-#endif /* TARGET_ASM_NAMES_LITERALS */
 extern Symstr *mainsym, *setjmpsym, *assertsym, *first_arg_sym, *last_arg_sym;
-extern Symstr *thissym, *ctorsym, *dtorsym, *vtabsym;
+#define DUFF_SYMSTR ((Symstr*)DUFF_ADDR)
+#ifdef CPLUSPLUS
+extern Symstr *thissym, *ctorsym, *dtorsym, *assignsym, *vtabsym, *deletesym;
+#else
+#define thissym DUFF_SYMSTR
+#define ctorsym DUFF_SYMSTR
+#define dtorsym DUFF_SYMSTR
+#define assignsym DUFF_SYMSTR
+#define vtabsym DUFF_SYMSTR
+#define deletesym DUFF_SYMSTR
+#endif
 extern Symstr *libentrypoint, *stackoverflow, *stack1overflow,
               *countroutine, *count1routine;
 
@@ -103,34 +109,43 @@ typedef struct op_simulation {
    Expr *inserted_word;
    Expr *readcheck1, *readcheck2, *readcheck4,
         *writecheck1, *writecheck2, *writecheck4;
-   Expr *xprintf, *xfprintf, *xsprintf, *xscanf, *xfscanf, *xsscanf;
+   Expr *xprintf, *xfprintf, *xsprintf;
    Expr *realmemcpyfn, *realmemsetfn;
    Symstr *strcpysym;
-   Symstr *yprintf, *yfprintf, *ysprintf, *yscanf, *yfscanf, *ysscanf;
+   Symstr *yprintf, *yfprintf, *ysprintf;
+#ifdef STRING_COMPRESSION
+   Expr *xprintf_z, *xfprintf_z, *xsprintf_z, *yprintf_z, *yfprintf_z, *ysprintf_z;
+#endif
 #ifdef RANGECHECK_SUPPORTED
    Symstr *abcfault, *valfault;
 #endif
 #ifdef SOFTWARE_FLOATING_POINT
    Expr *dadd, *dsubtract, *dmultiply, *ddivide, *dnegate,
      *dgreater, *dgeq, *dless, *dleq, *dequal, *dneq, *dfloat, *dfloatu,
-     *dfix, *dfixu;
+     *dfix, *dfixu,
+     *drsb, *drdiv;
    Expr *fadd, *fsubtract, *fmultiply, *fdivide, *fnegate,
      *fgreater, *fgeq, *fless, *fleq, *fequal, *fneq, *ffloat, *ffloatu,
-     *ffix, *ffixu;
+     *ffix, *ffixu,
+     *frsb, *frdiv;
    Expr *fnarrow, *dwiden;
 #endif
-#ifdef CPLUSPLUS
-   Symstr *xnew, *xdel, *xnewvec, *xdelvec;
-#endif
    Expr *proc_entry, *proc_exit;
-#ifdef EXTENSION_FRAC
-   Expr *xmulfn, *xdivfn;
-   Expr *ffixr, *dfixr;
-   Expr *ffloatr, *dfloatr;
-#endif
 } op_simulation;
 
 extern op_simulation sim;
+
+#ifdef CPLUSPLUS
+typedef struct cpp_op_simulation {
+   Symstr *xnew, *xdel;
+   Binder *xpvfn;
+   Expr *xpush_ddtor;
+   Expr *xnewvec, *xdelvec;
+   Expr *xmapvec1, *xmapvec1c, *xmapvec1ci, *xmapvec2;
+} cpp_op_simulation;
+
+extern cpp_op_simulation cppsim;
+#endif
 
 extern bool returnsheapptr(Symstr *fn);
 

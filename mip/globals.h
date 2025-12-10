@@ -5,9 +5,9 @@
  */
 
 /*
- * RCS $Revision: 1.22 $
- * Checkin $Date: 93/10/07 17:36:18 $
- * Revising $Author: irickard $
+ * RCS $Revision: 1.62 $
+ * Checkin $Date: 1995/11/24 12:24:11 $
+ * Revising $Author: hmeeking $
  */
 
 #ifndef _globals_LOADED
@@ -35,6 +35,8 @@
 #  include "defs.h"
 #endif
 
+#include "msg.h"
+
 /*
  * DUFF_ADDR is used to initialise pointers which may not be dereferenced.
  * The address chosen traps on dereference on the machines we use.
@@ -42,7 +44,7 @@
  * itself when used to initialise allocators.  It could, functionally,
  * equally well be NULL, or for the queasy, a pointer to one static byte.
  */
-#define DUFF_ADDR (VoidStar )(~0x45245252)     /* 0xbadbadad */
+#define DUFF_ADDR (VoidStar)(~0x45245252L)     /* 0xbadbadad */
 
 /* the following lines ease bootstrapping problems: "\v\f\r" respectively */
 /* (allowing different settings from the usual ones below in options.h    */
@@ -59,9 +61,6 @@
 #  define CHAR_CR 13
 #endif
 #define CHAR_BEL ('A'==193 ? 0x2f : 7)
-
-#define YES 1
-#define NO  0
 
 /* Beware the following, if n==32 then ANSI-undefined.                     */
 #define lsbmask(n) (((unsigned32)1 << (n)) - 1)
@@ -80,6 +79,8 @@ extern int32 pp_pragmavec[];
 #define fpregargs_disabled      (pp_pragmavec['g'-'a'] > 0)
 #define integerlike_enabled     (pp_pragmavec['h'-'a'] != 0)  /* cc */
 #define crossjump_enabled       (pp_pragmavec['j'-'a'] != 0)  /* mip */
+/* ECN - pragma to disable all gen optimisations */
+#define gen_opt_disabled        (pp_pragmavec['k'-'a'] > 0)
 #define ldm_enabled             (pp_pragmavec['m'-'a'] > 0)   /* arm */
 #define multiple_aof_code_areas (pp_pragmavec['o'-'a'] > 0)   /* arm, mip */
 #define profile_option          (pp_pragmavec['p'-'a'] > 0)   /* mip, arm */
@@ -96,6 +97,7 @@ extern int32 pp_pragmavec[];
 #define global_floatreg_var         pp_pragmavec['f'-'a']
 #define var_include_once            pp_pragmavec['i'-'a']
 #define var_crossjump_enabled       pp_pragmavec['j'-'a']
+#define var_gen_opt_disabled        pp_pragmavec['k'-'a']
 #define var_ldm_enabled             pp_pragmavec['m'-'a']
 #define var_aof_code_area           pp_pragmavec['o'-'a']
 #define var_profile_option          pp_pragmavec['p'-'a']
@@ -108,6 +110,37 @@ extern int32 pp_pragmavec[];
 #define var_no_side_effects         pp_pragmavec['y'-'a']
 #define var_cse_enabled             pp_pragmavec['z'-'a']
 
+/*
+ * Bits within var_cc_private_flags: PLEASE keep up to date.
+ * 0x40000000            COMMON, CODE attribute - used internally
+ * 0x01000000 16777216   Enable Standard scoping
+ * 0x00800000 8388608    Suppress generation of fpdesc tables
+ * 0x00400000 4194304    Show final function overloads
+ * 0x00200000 2097152    Enable C++ generated fns debugging
+ * 0x00100000 1048576    Disable direct substituion of inline function arguments
+ * 0x00080000  524288    flowgraf: uh... tail recursion something?
+ * 0x00040000  262144    flowgraf: Disable BLK2EXIT stuff
+ * 0x00020000  131072    Disable struct binder splitting
+ * 0x00010000   65536    Enable exprtemps debugging
+ * 0x00008000   32768    Disable str compression (#ifdef STRING_COMPRESSION)
+ * 0x00004000   16384    Show overload match value calculations
+ * 0x00002000    8192    Disable function inlining (forces out-of-line)
+ * 0x00001000    4096    Disable regalloc allocation preference calculation
+ * 0x00000800    2048    Disable regalloc copy-avoidance preference
+ * 0x00000400    1024    Disable preservation of unused a1-a4 across fn call
+ * 0x00000200     512    J_OPSYSK sets the psr
+ * 0x00000100     256    Disable live range splitting
+ * 0x00000080     128
+ * 0x00000040      64    CSE: Disable propagating local values
+ * 0x00000020      32    CSE: Disable heapptr dataflow
+ * 0x00000010      16    Disable the tail continuation optimisation
+ * 0x00000008       8    Disable peepholing
+ * 0x00000004       4    Disable regalloc spill 'cleaning'
+ * 0x00000002       2    Toggle allocate store for top-level non-addrof
+                         simpletype consts (default: C/do, C++/don't)
+ * 0x00000001       1    Ignore 'register' attribute on binders
+ */
+
 /* static options for compiler */
 
 #define NAMEMAX       256L      /* max no of significant chars in a name  */
@@ -116,9 +149,9 @@ extern int32 pp_pragmavec[];
 #define SEGSIZE     31744L      /* (bytes) - unit of alloc of hunks         */
                                 /* (32K - 1024) for benefit of 16 bit ints  */
 #define ICODESEGSIZE  512L      /* Icode vector now allocated in 8k hunks   */
-#define CODEVECSEGBITS  9L      /* 2k byte unit of allocation               */
+#define CODEVECSEGBITS 10L      /* 4Kbyte unit of allocation                */
 #define CODEVECSEGSIZE (1L<<CODEVECSEGBITS)
-#define CODEVECSEGMAX  64L      /* max segments (hence max 128K bytes/proc) */
+#define CODEVECSEGMAX 256L      /* max segments (max 1024K bytes/proc)      */
 #define REGHEAPSEGBITS  9L      /* index array for segment of 512 vregs     */
 #define REGHEAPSEGSIZE (1L<<REGHEAPSEGBITS)
 #define REGHEAPSEGMAX  64L      /* max segments (hence max 32K vregs/proc)  */
@@ -128,21 +161,36 @@ extern int32 pp_pragmavec[];
 #define LITPOOLSEGSIZE (1L<<LITPOOLSEGBITS)
 #define LITPOOLSEGMAX  32L      /* max segments, so 1024 lits ovfl gently   */
 
+#ifdef  FOR_ACORN
+#ifndef PASCAL
+#ifndef FORTRAN
+/* support for CFront pre-processing (IDJ:6-Jun-94) */
+extern int cplusplus_flag;
+#endif
+#endif
+#endif
+
 /*
  * disable error/warnings...
  */
 extern int32 suppress;
-/* spare:                       1L */
+#define D_IMPLICITCTOR          1L
 #define D_ASSIGNTEST            2L
 #define D_SHORTWARN             4L
 #define D_PPNOSYSINCLUDECHECK   8L
-#define D_IMPLICITVOID         16L
-#define D_VALOFBLOCKS          32L
-#define D_IMPLICITNARROWING    64L
-/* spare: was D_ENUM          128L */
-#define D_LONGFLOAT           256L
-#define D_STRUCTWARN          512L  /* undefined struct/union - now defunct */
-#define D_STRUCTPADDING      1024L
+#define D_IMPLICITVOID       0x10L
+#define D_VALOFBLOCKS        0x20L
+#define D_IMPLICITNARROWING  0x40L
+#define D_ACCESS             0x80L
+#define D_LONGFLOAT         0x100L
+#define D_STRUCTWARN        0x200L  /* undefined struct/union - now defunct */
+#define D_STRUCTPADDING     0x400L
+#define D_LOWERINWIDER      0x800L
+#define D_GUARDEDINCLUDE   0x1000L
+
+/* These two are currently pragmas rather than bits in suppress. Why? */
+#define D_DEPRECATED       0x2000L
+#define D_IMPLICITFNS      0x4000L
 
 #ifdef PASCAL /*ECN*/
 #undef D_ASSIGNTEST
@@ -156,10 +204,16 @@ extern int32 suppress;
 #define D_PPALLOWJUNK     0x20000L
 #define D_IMPLICITCAST    0x40000L
 #define D_MPWCOMPATIBLE   0x80000L
+#define D_CAST           0x100000L /* Suppress errors about implicit casting of
+                                      pointer to A to pointer to B (A != B)
+                                    */
+#define D_LINKAGE        0x200000L /* ECN - Suppress errors about static/extern
+                                      linkage disagreements
+                                    */
 
 /* warnings which are disabled by default */
 #ifndef D_SUPPRESSED
-#  define D_SUPPRESSED (D_SHORTWARN | D_STRUCTWARN | D_STRUCTPADDING)
+#  define D_SUPPRESSED (D_SHORTWARN | D_STRUCTWARN | D_STRUCTPADDING | D_GUARDEDINCLUDE)
 #endif
 
 #ifdef PASCAL /*ECN*/
@@ -179,38 +233,44 @@ extern int32 rtcheck;
  * features
  */
 extern int32 feature;
-#define FEATURE_SAVENAME                1L  /* arm(gen), mip */
-#define FEATURE_NOUSE                   2L  /* mip(bind) */
-#define FEATURE_PPNOUSE                 4L  /* cc */
-#define FEATURE_RELOCATE                8L  /* UNUSED */
-#define FEATURE_FILEX                0x10L  /* UNUSED */
-#define FEATURE_PREDECLARE           0x20L  /* mip(bind) */
-#define FEATURE_ANOMALY              0x40L  /* mip(regalloc) */
-#define FEATURE_ANNOTATE             0x80L  /* arm(asm), potentially mip */
-#define FEATURE_WARNOLDFNS          0x100L  /* cc */
-#define FEATURE_TELL_PTRINT         0x200L  /* cc */
-#define FEATURE_UNEXPANDED_LISTING  0x400L  /* cc */
-#define FEATURE_USERINCLUDE_LISTING 0x800L  /* cc */
-#define FEATURE_SYSINCLUDE_LISTING 0x1000L  /* cc */
-#define FEATURE_6CHARMONOCASE      0x2000L  /* cc */
-#define FEATURE_ALLOWCOUNTEDSTRINGS 0x4000L
-#define FEATURE_PCC               0x10000L  /* cc, mip(bind, misc) */
-#define FEATURE_NOWARNINGS        0x20000L  /* mip(misc) */
-#define FEATURE_PPCOMMENT         0x40000L  /* cc */
-#define FEATURE_WR_STR_LITS       0x80000L  /* mip(flowgraf) */
-#define FEATURE_SIGNED_CHAR      0x100000L  /* cc */
-#define FEATURE_FUSSY            0x200000L  /* for pedants & paranoiacs */
-#define FEATURE_UNIX_STYLE_LONGJMP 0x400000L /* mip */
-#define FEATURE_LET_LONGJMP_CORRUPT_REGVARS 0x800000L  /* mip */
+#define FEATURE_SAVENAME                    1L  /* arm(gen), mip */
+#define FEATURE_NOUSE                       2L  /* mip(bind) */
+#define FEATURE_PPNOUSE                     4L  /* cc */
+#define FEATURE_PREDECLARE                  8L  /* mip(bind) */
+#define FEATURE_ANOMALY                  0x10L  /* mip(regalloc) */
+#define FEATURE_ANNOTATE                 0x20L  /* arm(asm), potentially mip */
+#define FEATURE_WARNOLDFNS               0x40L  /* cc */
+#define FEATURE_TELL_PTRINT              0x80L  /* cc */
+#define FEATURE_UNEXPANDED_LISTING      0x100L  /* cc */
+#define FEATURE_USERINCLUDE_LISTING     0x200L  /* cc */
+#define FEATURE_SYSINCLUDE_LISTING      0x400L  /* cc */
+#define FEATURE_6CHARMONOCASE           0x800L  /* cc */
+#define FEATURE_ALLOWCOUNTEDSTRINGS    0x1000L
+#define FEATURE_CPP                   0x02000L  /* ISO/ANSI C++ Standard */
+#define FEATURE_CFRONT                0x04000L  /* want this near to _PCC... */
+#define FEATURE_PCC                   0x08000L  /* cc, mip(bind, misc) */
+#define FEATURE_ANSI                  0x10000L  /* ISO/ANSI C Standard */
+#define FEATURE_CFRONT_OR_PCC         (FEATURE_CFRONT|FEATURE_PCC)
+#define FEATURE_NOWARNINGS            0x20000L  /* mip(misc) */
+#define FEATURE_PPCOMMENT             0x40000L  /* cc */
+#define FEATURE_WR_STR_LITS           0x80000L  /* mip(flowgraf) */
+#define FEATURE_SIGNED_CHAR          0x100000L  /* cc */
+#define FEATURE_FUSSY                0x200000L  /* for pedants & paranoiacs */
+#define FEATURE_UNIX_STYLE_LONGJMP   0x400000L /* mip */
+#define FEATURE_LET_LONGJMP_CORRUPT_REGVARS \
+                                     0x800000L  /* mip */
                               /* meaningful only if _UNIX_STYLE_LONGJMP */
-#define FEATURE_AOF_AREA_PER_FN 0x1000000L  /* arm(aaof) */
-#define FEATURE_VERBOSE         0x2000000L  /* mip */
-#define FEATURE_DONTUSE_LINKREG 0x4000000L  /* mip */
-#define FEATURE_LIMITED_PCC     0x8000000L  /* pp, sem */
-#define FEATURE_KANDR_INCLUDE  0x10000000L  /* mip */
-#define FEATURE_INLINE_CALL_KILLS_LINKREG 0x20000000L /* mip */
+#define FEATURE_AOF_AREA_PER_FN     0x1000000L  /* arm(aaof) */
+#define FEATURE_VERBOSE             0x2000000L  /* mip */
+#define FEATURE_DONTUSE_LINKREG     0x4000000L  /* mip */
+#define FEATURE_LIMITED_PCC         0x8000000L  /* pp, sem */
+#define FEATURE_KANDR_INCLUDE      0x10000000L  /* mip */
+#define FEATURE_INLINE_CALL_KILLS_LINKREG \
+                                   0x20000000L /* mip */
 #ifdef PASCAL /*ECN*/
-#define FEATURE_ISO            0x40000000L  /* cc */
+#define FEATURE_ISO                0x40000000L  /* cc */
+#else
+#define FEATURE_ENUMS_ALWAYS_INT   0x40000000L
 #endif
 
 #ifdef PASCAL /*ECN*/
@@ -232,26 +292,33 @@ extern int32 feature;
 #define FEATURE_6CHARMONOCASE      0
 #endif
 
+#ifdef CPLUSPLUS
+#define LanguageIsCPlusPlus (feature & FEATURE_CPP)
+#else
+#define LanguageIsCPlusPlus 0
+#endif
+
 /*
  * Dynamic configuration flags.
  */
 extern int32 config;
-#define CONFIG_HAS_MULTIPLY      @@@  /* obsolete */
-#define CONFIG_SLOW_COND_FP_EXEC 2L  /* Useful for ARM1 vs ARM2 */
-#define CONFIG_INDIRECT_SETJMP   4L  /* a fn ptr may point to setjmp() */
-#define CONFIG_CLIPPER30         8L  /* Special for Intergraph Clipper */
-#define CONFIG_ALT_REGUSE     0x10L  /* to generalise normal_sp_sl     */
+/*                               1L  CONFIG_HAS_MULTIPLY now defunct    */
+/*                               2L  CONFIG_SLOW_COND_FP_EXEC now defunct */
+#define CONFIG_INDIRECT_SETJMP   4L  /* a fn ptr may point to setjmp()  */
+#define CONFIG_CLIPPER30         8L  /* Special for Intergraph Clipper  */
+#define CONFIG_ALT_REGUSE     0x10L  /* to generalise normal_sp_sl      */
 #define CONFIG_FPREGARGS      0x20L
 #define CONFIG_BIG_ENDIAN     0x40L
 #define CONFIG_ENDIANNESS_SET 0x80L  /* if this is set (by config_init())  */
                                      /* default of target byte sex to host */
                                      /* does not apply                     */
 #define CONFIG_NO_UNALIGNED_LOADS 0x100L
-#define CONFIG_REENTRANT_CODE 0x200L
-#define CONFIG_OPTIMISE_SPACE 0x400L
-#define CONFIG_OPTIMISE_TIME  0x800L
-#define CONFIG_SINGLEFLOAT   0x1000L
-#define target_singlefloat ((config & CONFIG_SINGLEFLOAT) != 0)
+#define CONFIG_REENTRANT_CODE     0x200L
+#define CONFIG_OPTIMISE_SPACE     0x400L
+#define CONFIG_OPTIMISE_TIME      0x800L
+#define CONFIG_SOFTWARE_FP       0x1000L
+
+#define CONFIG_HALFWORD_SPT      0x2000L
 
 #ifdef TARGET_IS_BIG_ENDIAN
 #define target_lsbytefirst 0
@@ -267,7 +334,7 @@ extern bool target_lsbitfirst;       /* ordering for bitfields within word */
 extern bool host_lsbytefirst;
 
 extern FILE *asmstream, *objstream;
-extern char *sourcefile, *objectfile, *sourcemodule;
+extern char *sourcefile, *objectfile;
 extern int32 xwarncount, warncount, recovercount, errorcount;
 extern bool list_this_file;
 extern FILE *listingstream;
@@ -277,10 +344,25 @@ extern struct CurrentFnDetails {
     Symstr *symstr;
     int xrflags;
     Binder *structresult;
+    VRegnum baseresultreg;
     int nresultregs;
+    int32 flags, auxflags;
+    int32 maxstack;
+    int32 maxargsize;
+    int32 argwords;
+    BindList *argbindlist;
+    int32 fnname_offset;      /* for xxx/gen.c    */
+    FileLine fl;
 } currentfunction;
 
-#ifdef TARGET_IS_ARM
+#define procflags currentfunction.flags
+#define procauxflags currentfunction.auxflags
+#define greatest_stackdepth currentfunction.maxstack
+#define argument_bindlist currentfunction.argbindlist
+#define max_argsize currentfunction.maxargsize
+#define cg_fnname_offset_in_codeseg currentfunction.fnname_offset
+
+#ifdef TARGET_IS_ARM_OR_THUMB
   extern int arthur_module;
 #endif
 
@@ -291,13 +373,19 @@ extern FloatCon *int_to_real(int32 n, int32 u, SET_BITMAP m);
 extern int32 length(List *l);
 extern List *dreverse(List *x);
 extern List *nconc(List *x, List *y);
+extern bool generic_member(IPtr a, List *l);
+extern List *generic_ndelete(IPtr a, List *l);
+/* Destructively modify the argument reglist by removing from it the   */
+/* first entry whose data field is 'a'.                                */
 
-#undef max      /* WATCOM C #defines (illegally!) */
 extern int32 max(int32 a, int32 b);
 extern int32 bitcount(int32 n);
+extern int32 logbase2(int32 n);
+extern int32 power_of_two(int32 n);
 
 extern void errstate_init(void);
 
+extern int32 aetree_debugcount;
 extern int32 cse_debugcount;
 extern int32 localcg_debugcount;
 extern int32 syserr_behaviour;
@@ -308,49 +396,35 @@ extern int32 syserr_behaviour;
    * Note use of a cryptic pragma rather than a nice spelt out one,
    * since the option is only intended for support of this compiler
    */
-  #pragma -v3
+#  pragma -v3
 #endif
-extern void cc_msg(char *s, ...);    /* NB still an uncompressed string */
+extern void cc_msg(char *s, ...);  /* NB still an uncompressed string */
 #ifdef __CC_NORCROFT
-  #pragma -v0
+#  pragma -v0
+#endif
+#ifdef NLS
+extern void cc_msg_lookup(msg_t errcode, ...);
+#else
+#  define cc_msg_lookup cc_msg
 #endif
 
 /* The following 4 functions are used by the Fortran front end. */
-extern void cc_rerr_l(int32 line, char *errorcode, va_list a);
-extern void cc_warn_l(int32 line, char *errorcode, va_list a);
-extern void cc_err_l(int32 line, char *errorcode, va_list a);
-extern void cc_fatalerr_l(int32 line, char *errorcode, va_list a);
+extern void cc_rerr_l(int32 line, msg_t errorcode, va_list a);
+extern void cc_warn_l(int32 line, msg_t errorcode, va_list a);
+extern void cc_err_l(int32 line, msg_t errorcode, va_list a);
+extern void cc_fatalerr_l(int32 line, msg_t errorcode, va_list a);
 
+extern void flt_report_error(int);
 extern void compile_abort(int);
 extern void summarise(void);
 extern void listing_diagnostics(void);
 
-extern void fltrep_stod(const char *s, DbleBin *p);
-extern bool fltrep_narrow(DbleBin *d, FloatBin *e);
-extern bool fltrep_narrow_round(DbleBin *d, FloatBin *e);
-extern void fltrep_widen(FloatBin *e, DbleBin *d);
-#ifdef EXTENSION_FRAC
-extern bool frac_narrow(int32 *n);
-extern bool frac_narrow_round(int32 *n);
-#endif
-extern bool flt_add(DbleBin *a, DbleBin *b, DbleBin *c);
-extern bool flt_subtract(DbleBin *a, DbleBin *b, DbleBin *c);
-extern bool flt_multiply(DbleBin *a, DbleBin *b, DbleBin *c);
-extern bool flt_divide(DbleBin *a, DbleBin *b, DbleBin *c);
-extern int flt_compare(DbleBin *b, DbleBin *c);
-extern bool flt_move(DbleBin *a, DbleBin *b);
-extern bool flt_negate(DbleBin *a, DbleBin *b);
-extern bool flt_dtoi(int32 *n, DbleBin *a);
-extern bool flt_dtou(unsigned32 *u, DbleBin *a);
-#ifdef EXTENSION_FRAC
-extern bool flt_dtofrac(int32 *n, DbleBin *a);
-extern bool flt_fractod(DbleBin *a, int32 n);
-extern bool frac_multiply(int32 *a, int32 b, int32 c);
-extern bool frac_divide(int32 *a, int32 b, int32 c);
-#endif
-
+#ifdef TARGET_IS_INTERPRETER
+#define reg_setallused(s) ((void)(s))
+#else
 #ifndef NON_CODEMIST_MIDDLE_END
-extern void reg_setregsused(RealRegSet *s, int32 rdesc);
+extern void reg_setallused(RealRegSet *s);      /* not as nasty as memcpy */
+#endif
 #endif
 
 #endif

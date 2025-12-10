@@ -6,9 +6,9 @@
  */
 
 /*
- * RCS $Revision: 1.9 $
- * Checkin $Date: 93/10/07 17:47:05 $
- * Revising $Author: irickard $
+ * RCS $Revision: 1.13 $
+ * Checkin $Date: 1995/09/13 12:13:51 $
+ * Revising $Author: amycroft $
  */
 
 #ifndef _lex_h
@@ -44,9 +44,27 @@ extern void lex_beware_reinit(void);
 extern void lex_reinit(void);
 
 #ifdef CPLUSPLUS
-extern int lex_savebody(void);
-extern void lex_openbody(int h);
-extern void lex_closebody(void);
+
+/* for C++ or ANSI C; harmless here */
+extern int lex_bodybegin(void);         /* start save template def      */
+extern int lex_bodyend(void);           /* end   save template def      */
+extern int lex_savebody(void);          /* save member fn def           */
+extern int lex_saveexpr(void);
+extern void lex_openbody(int h, bool dup);      /* re-read saved text   */
+extern void lex_closebody(void);                /* end read + lose text */
+/* for C++ ONLY; not used in ANSI C */
+extern AEop lex_buffersym(void);
+extern void lex_endbuffering(void);
+
+#else
+
+#define lex_bodybegin() 0
+#define lex_bodyend() 0
+#define lex_savebody() 0
+#define lex_saveexpr() 0
+#define lex_openbody(h,dup) 0
+#define lex_closebody() 0
+
 #endif
 
 #endif

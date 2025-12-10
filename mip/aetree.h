@@ -6,9 +6,9 @@
  */
 
 /*
- * RCS $Revision: 1.8 $ Codemist 15
- * Checkin $Date: 93/10/07 17:18:21 $
- * Revising $Author: irickard $
+ * RCS $Revision: 1.16 $ Codemist 15
+ * Checkin $Date: 1995/09/13 14:13:41 $
+ * Revising $Author: amycroft $
  */
 
 #ifndef _aetree_h
@@ -36,7 +36,7 @@ extern Expr *mk_expr3(AEop op, TypeExpr *t, Expr *a1, Expr *a2, Expr *a3);
 extern Expr *mk_expr_valof(AEop op, TypeExpr *t, Cmd *c);
 #endif
 
-extern Expr *mk_exprwdot(AEop op, TypeExpr *t, Expr *a1, int32 a2);
+extern Expr *mk_exprwdot(AEop op, TypeExpr *t, Expr *a1, IPtr a2);
 
 extern Expr *mk_exprbdot(AEop op, TypeExpr *t, Expr *a1, int32 a2, int32 a3,
                          int32 a4);
@@ -45,7 +45,7 @@ extern Expr *mk_exprbdot(AEop op, TypeExpr *t, Expr *a1, int32 a2, int32 a3,
 extern DeclRhsList *mkDeclRhsList(Symstr *sv, TypeExpr *t, SET_BITMAP s);
 
 extern TopDecl *mkTopDeclFnDef(AEop a, Binder *b, SynBindList *c,
-                               Cmd *d, bool e, FileLine fl);
+                               Cmd *d, bool e);
 
 extern TypeExpr *mk_typeexpr1(AEop op, TypeExpr *t, Expr *a1);
 extern TypeExpr *mkTypeExprfn(AEop a, TypeExpr *b, SET_BITMAP s,
@@ -57,6 +57,25 @@ extern FormTypeList *mkFormTypeList(FormTypeList *ftcdr, Symstr *ftname,
                                     TypeExpr *fttype, Expr *ftdefault);
 extern FormTypeList *g_mkFormTypeList(FormTypeList *ftcdr, Symstr *ftname,
                                       TypeExpr *fttype, Expr *ftdefault);
+
+/* temporary home, pending demise... */
+extern int32 evaluate(Expr *a);
+
+extern Expr *globalize_int(int32 n);
+extern FormTypeList *globalize_formals(FormTypeList *d);
+
+/* globalize_typeexpr caches only basic types (including structs/typedefs) */
+/* and pointers to things which are already cached.  Tough ched arrays/fns */
+extern TypeExpr *globalize_typeexpr(TypeExpr *t);
+/* and this omits default argument values to avoid a redeclaration by a */
+/* postponed class function definition                                  */
+extern TypeExpr *globalize_typeexpr_no_default_arg_vals(TypeExpr *t);
+
+extern StringSegList *globalize_strseg(StringSegList *s);
+
+extern Expr *globalize_expr(Expr *e);
+
+extern void aetree_init(void);
 
 extern Cmd *mk_cmd_0(AEop op, FileLine x);
   /* op = s_break,s_endcase,s_continue */
@@ -80,24 +99,26 @@ extern Cmd *mk_cmd_for(FileLine x, Expr *e1, Expr *e2, Expr *e3, Cmd *c);
 
 extern Cmd *mk_cmd_case(FileLine x, Expr *e, Cmd *c1, Cmd *c2);
 
-extern bool is_fpzero(Expr *e);
-extern bool is_fpone(Expr *e);
-extern bool is_fpminusone(Expr *e);
+extern bool is_fpzero(Expr const *e);
+extern bool is_fpone(Expr const *e);
+extern bool is_fpminusone(Expr const *e);
 
 extern int32 result2;
-extern bool integer_constant(Expr *e);
+extern bool integer_constant(Expr const *e);
 
-extern bool is_intzero(Expr *e);
-extern bool is_intone(Expr *e);
-extern bool is_intminusone(Expr *e);
+extern bool is_intzero(Expr const *e);
+extern bool is_intone(Expr const *e);
+extern bool is_intminusone(Expr const *e);
 
-extern void eprintf(char *s, ...);
+extern void eprintf(char const *s, ...);
 
 extern void pr_typeexpr(TypeExpr *x, Symstr *s);
 
 extern void pr_stringsegs(StringSegList *z);
 
 extern void pr_expr(Expr *x);
+
+extern void pr_exproftype(char const *s, Expr *x);
 
 extern void pr_cmd(Cmd *c);
 

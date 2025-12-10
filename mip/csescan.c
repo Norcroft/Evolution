@@ -5,9 +5,9 @@
  */
 
 /*
- * RCS $Revision: 1.49 $ Codemist 126
- * Checkin $Date: 93/10/06 15:30:38 $
- * Revising $Author: hmeekings $
+ * RCS $Revision: 1.117 $ Codemist 125
+ * Checkin $Date: 1996/01/09 13:14:47 $
+ * Revising $Author: hmeeking $
  */
 
 #ifdef __STDC__
@@ -35,10 +35,10 @@
 #include "cg.h"
 
 #define HASHSIZE 1024
-#define hash(op,a,b) ( ((op) + (((int32)(a)) * 7)) & (HASHSIZE-1) )
+#define hash(op,a,b) ( ((op) + ((((IPtr)(a))/4) * 7)) & (HASHSIZE-1) )
 
 #define LOCHASHSIZE 512
-#define lochash(type,a,b) ( ((type) + (int32)(a)) & (LOCHASHSIZE-1) )
+#define lochash(type,base,k,id) ( ((type) + ((type) == LOC_VAR ? (IPtr)(id) : (k))) & (LOCHASHSIZE-1) )
 
 Exprn **exprnindex[EXPRNINDEXSIZE];
 
@@ -84,11 +84,13 @@ static VRegSetP compares;
 
 #endif
 
+#define MOVCLOC (-2)
+
 #define J_NEK J_INIT     /* really, we should have a different jopcode for this */
 #define J_HEAPPTR J_NOOP /* and for this */
 
 #define IsLive(x) (vregset_member(exid_(x), liveexprns))
-#define LocKills(x, p) (vregset_member(x, (p)->users) || vregset_member(x, (p)->aliasusers))
+#define LocKills(x, p) (vregset_member(x, (p)->aliasusers))
 
 static int32 locationid;
 
@@ -96,6 +98,7 @@ typedef struct FloatConList {
     struct FloatConList *cdr;
     FloatCon *f;
 } FloatConList;
+#define mkFloatConList(a,b) (FloatConList *)syn_cons2(a,b)
 
 static FloatConList *floatconlist;
 
@@ -119,7 +122,7 @@ static LocList *LocList_DiscardOne(LocList *locs) {
 
 typedef struct RegValue {
     struct RegValue *cdr;
-    VRegnum reg;
+    /* VRegnum */ IPtr reg;
     ExSet *value;
 } RegValue;
 
@@ -143,7 +146,7 @@ struct LocSet {
     ExSet *oldval;
 };
 
-#define LocSet_Member(x, s) member((VRegnum)x, (RegList *)s)
+#define LocSet_Member(x, s) generic_member((IPtr)x, (List *)s)
 
 static LocSet *LocSet_New(LocSet *next, Location *loc) {
   return (LocSet *)CSEList3(next, loc, NULL);
@@ -176,17 +179,18 @@ static bool LocSet_Subset(LocSet *sub, LocSet *super) {
 typedef struct StoreAccessList {
     struct StoreAccessList *cdr;
     LocSet *locs;
+    bool needed;
     Icode *ic;
 } StoreAccessList;
 
 static StoreAccessList *storeaccesses;
 
 static StoreAccessList *StoreAccessList_New(StoreAccessList *next, LocSet *locs, Icode *ic) {
-  return (StoreAccessList *)CSEList3(next, locs, ic);
+  return (StoreAccessList *)CSEList4(next, locs, NO, ic);
 }
 
 static StoreAccessList *StoreAccessList_DiscardOne(StoreAccessList *sa) {
-  return (StoreAccessList *)discard3((VoidStar)sa);
+  return sa->cdr;
 }
 
 static StoreAccessList *StoreAccessList_Copy(StoreAccessList *sa) {
@@ -212,11 +216,13 @@ static void StoreAccessList_Discard(StoreAccessList *sa) {
 void cse_print_loc(Location *x)
 {
     switch (loctype_(x)) {
-default:
-        cc_msg("<odd-loc>"); break;
+    default:
+        cc_msg("<odd-loc %ld>", (long)loctype_(x)); break;
     case LOC_VAR:
-    case LOC_PVAR:
         cc_msg("'%s'", symname_(bindsym_(locbind_(x))));
+        break;
+    case LOC_PVAR:
+        cc_msg("'%s'P", symname_(bindsym_(locbind_(x))));
         break;
     case LOC_(MEM_B):
     case LOC_(MEM_W):
@@ -275,6 +281,9 @@ void cse_printexits(int32 flags, LabelNumber *exit, LabelNumber *exit1)
 {
     VRegInt gap, m;
     gap.r = GAP;
+    if (flags & BLKSWITCH)
+        return;
+
     if (flags & BLK2EXIT) {
         m.l = exit1;
         print_jopcode(J_B + (flags & Q_MASK), gap, gap, m);
@@ -298,13 +307,14 @@ static void StoreAccessList_Print(StoreAccessList *p, const char *s) {
   char *s1 = "store accesses: ";
   for (; p != NULL; p = cdr_(p)) {
     LocSet *locs = p->locs;
-    char *s2 = " {";
+    char *s2 = " <";
     cc_msg("%s%s", s1, loads_r1(p->ic->op) ? "LD": "ST");
     for (; locs != NULL; locs = cdr_(locs)) {
       cc_msg(s2); cse_print_loc(locs->loc);
+      cc_msg(" {%ld}", exid_(locs->loc->load));
       s2 = ", ";
     }
-    cc_msg("}");
+    cc_msg(">");
     s1 = ", ";
   }
   cc_msg("%s", s);
@@ -339,6 +349,10 @@ static void ExSet_Print(ExSet *set, char *s) {
 }
 
 static void StoreAccessList_Print(StoreAccessList *p, const char *s) {
+    IGNORE(p); IGNORE(s);
+}
+
+static void RegValue_Print(RegValue *p, const char *s) {
     IGNORE(p); IGNORE(s);
 }
 
@@ -436,7 +450,13 @@ static bool ExSet_Map(ExSet *p, ExSetMapFn *f, void *a) {
   return YES;
 }
 
-static ExSet *ExSet_Append(ExSet *a, ExSet *b) {
+static Exprn *ExSet_Some(ExSet *p, ExSetMapFn *f, void *a) {
+  for (; p != NULL; p = cdr_(p))
+    if (f(p->exprn, a)) return p->exprn;
+    return NULL;
+}
+
+static ExSet *ExSet_Append(ExSet const *a, ExSet *b) {
   ExSet *res = b;
   for (; a != NULL; a = cdr_(a))
     res = ExSet_Insert(a->exprn, res);
@@ -461,7 +481,8 @@ static ExSet *OpInSet(ExSet *set, J_OPCODE op, int32 ignorebits) {
 #define MOVFKinSet(set) OpInSet(set, J_MOVFK, 0)
 #define MOVDKinSet(set) OpInSet(set, J_MOVDK, 0)
 
-static ExSet *OpInSetFn(ExSet *set, bool p(Exprn *exprn)) {
+typedef bool OpInSet_Aux(Exprn *);
+static ExSet *OpInSetFn(ExSet *set, OpInSet_Aux *p) {
   for (; set != 0; set = cdr_(set))
     if (p(set->exprn))
       return set;
@@ -549,7 +570,7 @@ Exprn *adconbase(Exprn *ex, bool allowvaroffsets)
     if (ex == heapptr) return ex;
     switch (exop_(ex) & J_TABLE_BITS)
     {
-case J_ADCON: case J_ADCONV:
+case J_ADCON: case J_ADCONV: case J_ADCONF: case J_ADCOND:
         return ex;
 case J_LDRK:        /* J_LDRLK on TARGET_IS_ALPHA? */
         {   Location *loc = exloc_(ex);
@@ -575,44 +596,124 @@ case J_ADDK:
     return NULL;
 }
 
-static bool possiblealias(Location *loc,
-                          LocType type, Exprn *base, int32 off)
+static Exprn *adconbasek(Exprn *ex, int32 *p)
+{   if (ex == NULL) syserr(syserr_adconbase);
+    if (ex == heapptr) return ex;
+    switch (exop_(ex) & J_TABLE_BITS)
+    {
+case J_ADCON: case J_ADCONV: case J_ADCONF: case J_ADCOND:
+        return ex;
+case J_SUBK:
+        *p -= e2k_(ex);
+        return adconbasek(e1_(ex), p);
+case J_ADDK:
+        *p += e2k_(ex);
+        return adconbasek(e1_(ex), p);
+    }
+    return NULL;
+}
+
+typedef enum {
+    NotAlias,   /* Definitely unrelated */
+    MaybeAlias, /* Possible aliases (address-taken var vs pointer dereference)
+                   or definitely overlapping but not identical.
+                 */
+    IsSynonym   /* The same location accessed identically (LDRV x vs LDRVK 0,x)
+                 */
+} AliasType;
+
+static AliasType possiblealias(Location *loc, Location *loc1)
 {
-    /* Determine whether loc may be an alias of {type,base,off}
-       (type known to be LOC_(MEM_x)) */
-    /* NB required to return NO if loc is the same as {type,base,off} */
+    /* Determine whether loc may be an alias of loc1. Both loc and loc1 may */
+    /* have any type.                                                       */
+    /* NB required to return NO if loc is the same as loc1                  */
+    /* Simple variables are an oddity here: x may be aliased by       */
+    /* something like ((ADCONV x) . n), but by nothing else (or else  */
+    /* it would be marked as address-taken, and be a LOC_PVAR instead)*/
 
     LocType t = loctype_(loc);
-    Exprn *b = locbase_(loc);
-    if (t == LOC_PVAR) {
-        Exprn *b1 = adconbase(base, YES);
-        return ( b1 == NULL ||
-                 (exop_(b1) == J_ADCONV && e1b_(b1) == locbind_(loc)));
+    LocType t1 = loctype_(loc1);
+
+    if ((t & LOC_REG) || (t1 & LOC_REG))
+    {   if ((t|t1) & LOC_REALBASE) syserr("possiblealias(REG+REALBASE)");
+        return NotAlias;
     }
-    if (t & LOC_anyVAR) return NO;
-    if (b != base) {
-        Exprn *base1 = adconbase(b, YES),
-              *base2 = adconbase(base, YES);
-        if (base1 == NULL || base2 == NULL)
-            return YES;
-        else if (base1 == base2)
-            return YES;
-#ifndef TARGET_ASM_NAMES_LITERALS
-        else if (exop_(base1) == J_ADCON && exop_(base2) == J_ADCON &&
-                 (bindstg_(e1b_(base2)) & bitofstg_(s_static)) &&
-                 (bindstg_(e1b_(base1)) & bitofstg_(s_static))) {
-            /* otherwise we check if one version is 'foo' and the other */
-            /* 'datasegment+offset(foo)'.                               */
-            if (e1b_(base1) == datasegment)
-                return overlap(type, off + bindaddr_(e1b_(base2)), t, locoff_(loc));
-            else if (e1b_(base2) == datasegment)
-                return overlap(type, off, t, locoff_(loc)+bindaddr_(e1b_(base1)));
+
+    if ((t & LOC_anyVAR) && (t1 & LOC_anyVAR)) {
+      if (locbind_(loc) != locbind_(loc1)) return NotAlias;
+      if (locvartype_(loc) != locvartype_(loc1)) return MaybeAlias;
+        /* Same variable, different access */
+      return NotAlias;
+    }
+
+    if (t1 & LOC_anyVAR) {
+      LocType x = t; Location *xl = loc;
+      t = t1, loc = loc1;
+      t1 = x, loc1 = xl;
+    }
+
+    if (t & LOC_anyVAR) {
+      /* hence by above t1 = LOC_(MEM_xx)+maybe(REALBASE) */
+      int32 k = locoff_(loc1);
+      Exprn *base1 = locbase_(loc1);
+      Exprn *b1 = adconbasek(base1, &k);
+      Binder *v = locbind_(loc);
+      if (b1 != NULL) {
+        t = locvartype_(loc);
+        if (exop_(b1) == J_ADCONV && e1b_(b1) == v)
+          return k == 0 && t == t1 ? IsSynonym :
+                    k < locsize(t) ? MaybeAlias :
+                                     NotAlias;
+        return NotAlias;
+      }
+      b1 = adconbase(base1, YES);
+      return b1 == NULL ? ((t == LOC_PVAR) ? MaybeAlias : NotAlias) :
+                 (exop_(b1) == J_ADCONV && e1b_(b1) == v) ? MaybeAlias :
+                                                            NotAlias;
+    }
+    /* By above both t and t1 are LOC_(MEM_xx)+maybe(REALBASE) */
+    { Exprn *b = locbase_(loc), *b1 = locbase_(loc1);
+      int32 off = locoff_(loc), off1 = locoff_(loc1);
+      if (b != b1) {
+        Exprn *ba = adconbase(b, YES),
+              *b1a = adconbase(b1, YES);
+        if (ba == NULL || b1a == NULL)
+          return MaybeAlias;
+        else if (ba == b1a)
+          return MaybeAlias;
+        else if (exop_(ba) == J_ADCON && exop_(b1a) == J_ADCON &&
+                 (bindstg_(e1b_(b1a)) & bitofstg_(s_static)) &&
+                 (bindstg_(e1b_(ba)) & bitofstg_(s_static))) {
+          if (adconbasek(b, &off) == ba && adconbasek(b1, &off1) == b1a) {
+            return overlap(t1, off1 + bindaddr_(e1b_(b1a)), t, off + bindaddr_(e1b_(ba))) ?
+                 MaybeAlias : NotAlias;
+          }
         }
-#endif
-        return NO;
+        return NotAlias;
+      }
+      return (t == t1 && off == off1)  ? NotAlias :
+             overlap(t1, off1, t, off) ? MaybeAlias :
+                                         NotAlias;
     }
-    return (!(t == type && off == locoff_(loc)) &&
-            overlap(type, off, t, locoff_(loc)));
+}
+
+static void updateusers_cb(int32 n, void *arg) {
+    int32 id = *(int32 *)arg;
+    Location *loc = loc_(n);
+    int32 i;
+    for (i = 0 ; i < LOCINDEXSIZE ; i++) {
+        Location **index = locindex[i];
+        int32 j;
+        if (index == 0) break;
+        for (j = 0 ; j < LOCSEGSIZE ; j++) {
+            Location *q = index[j];
+            if (q == 0) break;
+            if (possiblealias(q, loc))
+                cseset_insert(id, q->aliasusers, NULL);
+        }
+    }
+    cseset_insert(id, loc->users, NULL);
+    cseset_insert(id, loc->aliasusers, NULL);
 }
 
 static void updateusers(int32 id, Exprn *p)
@@ -622,51 +723,11 @@ static void updateusers(int32 id, Exprn *p)
    * On the assumption that expressions are small, no attempt is made to be
    * clever about getting at the leaves.
    */
-    if (p == NULL) return;
-    switch (extype_(p)) {
-    case E_BINARY:
-        updateusers(id, e2_(p));
-    case E_BINARYK:
-    case E_UNARY:
-        updateusers(id, e1_(p));
-        break;
-    case E_LOAD:
-        {   Location *loc = exloc_(p);
-            LocType type = loctype_(loc);
-            if (!(type & LOC_anyVAR)) {
-                Exprn *base = locbase_(loc);
-                int32 off = locoff_(loc);
-                int32 i;
-                for (i = 0 ; i < LOCINDEXSIZE ; i++) {
-                    Location **index = locindex[i];
-                    int32 j;
-                    if (index == 0) break;
-                    for (j = 0 ; j < LOCSEGSIZE ; j++) {
-                        Location *q = index[j];
-                        if (q == 0) break;
-                        if (possiblealias(q, type, base, off))
-                            cseset_insert(id, q->aliasusers, NULL);
-                    }
-                }
-                updateusers(id, base);
-            }
-            cseset_insert(id, loc->users, NULL);
-            break;
-        }
-    case E_LOADR:
-        {   Location *loc = exloadrloc_(p);
-            if (loc != NULL) cseset_insert(id, loc->users, NULL);
-            break;
-        }
-    case E_CALL:
-        {   int32 i;
-            for (i = 0 ; i < exnargs_(p) ; i++)
-                updateusers(id, exarg_(p, i));
-        }
-        break;
-    default:
-        break;
-    }
+    if (p != NULL) cseset_map(exleaves_(p), updateusers_cb, &id);
+}
+
+static void maybealias_cb(int32 n, void *arg) {
+    if (ispublic(loc_(n))) *(bool *)arg = YES;
 }
 
 static bool maybealias(Exprn *p)
@@ -675,26 +736,9 @@ static bool maybealias(Exprn *p)
    * (Used to give things which do and don't distinct sets of ids,
    *  to reduce the space usage of killed sets).
    */
-    if (p == NULL) return NO;
-    switch (extype_(p)) {
-    case E_BINARY:
-        if (maybealias(e2_(p))) return YES;
-    case E_BINARYK:
-    case E_UNARY:
-        return maybealias(e1_(p));
-    case E_LOAD:
-        {   Location *loc = exloc_(p);
-            return ispublic(loc);
-        }
-    case E_CALL:
-        {   int32 i;
-            for (i = 0 ; i < exnargs_(p) ; i++)
-                if (maybealias(exarg_(p, i))) return YES;
-            return NO;
-        }
-    default:
-        return NO;
-    }
+    bool res = NO;
+    if (p != NULL) cseset_map(exleaves_(p), maybealias_cb, &res);
+    return res;
 }
 
 static FloatCon *canonicalfpconst(FloatCon *old)
@@ -703,9 +747,10 @@ static FloatCon *canonicalfpconst(FloatCon *old)
     for ( p = floatconlist ; p != NULL ; p = cdr_(p) )
         if (p->f->floatlen == old->floatlen &&
             p->f->floatbin.irep[0] == old->floatbin.irep[0] &&
-            p->f->floatbin.irep[1] == old->floatbin.irep[1])
+            ((p->f->floatlen & bitoftype_(s_short)) ||
+             p->f->floatbin.irep[1] == old->floatbin.irep[1]))
             return p->f;
-    floatconlist = (FloatConList *) syn_cons2(floatconlist, old);
+    floatconlist = mkFloatConList(floatconlist, old);
     return old;
 }
 
@@ -872,7 +917,11 @@ static void useoldexprn(Exprn *p, int flags) {
   }
 }
 
-static Location *find_loc(LocType type, Exprn *base, int32 k, J_OPCODE load,
+#define find_varloc(id, load, flags) find_loc(LOC_VAR, NULL, 0, id, load, flags)
+#define find_regloc(reg, load, flags) find_loc(LOC_REG, NULL, reg, NULL, load, flags)
+#define find_memloc(type, base, offset, load, flags) find_loc(type, base, offset, NULL, load, flags)
+
+static Location *find_loc(LocType type, Exprn *base, int32 k, Binder *id, J_OPCODE load,
                           int32 loctypeflags);
 
 static Exprn *find_exprn(int32 op, Exprn *a, Exprn *b, Exprn *arg[], int flags)
@@ -880,14 +929,15 @@ static Exprn *find_exprn(int32 op, Exprn *a, Exprn *b, Exprn *arg[], int flags)
     Exprn *p, *prev;
     Exprn **list;
     int32 type;
+    VRegSetP leaves = NULL;
     if (op == J_ADDK || op == J_SUBK) {
       if (a == heapptr)
         return heapptr;
       else if (exop_(a) == J_NEK) {
-        int32 k = (int32)b;
+        int32 k = (int32)(IPtr)b;
         if (op == J_SUBK) k = -k;
         op = J_NEK;
-        a = (Exprn *)(e1k_(a) + k);
+        a = (Exprn *)(IPtr)(e1k_(a) + k);
         b = NULL;
         flags = U_NOTDEF2+U_NOTREF;
       }
@@ -915,6 +965,8 @@ static Exprn *find_exprn(int32 op, Exprn *a, Exprn *b, Exprn *arg[], int flags)
         p = (Exprn *) CSEAlloc(
                        (int) (offsetof(Exprn, u.binary.e2) + sizeof(Exprn *)));
         e2_(p)   = b;
+        leaves = cseset_copy(exleaves_(a));
+        if (type == E_BINARY) cseset_union(leaves, exleaves_(b));
         break;
     case E_UNARY:
         if (CantBeSubExprn(a)) return NULL;
@@ -931,17 +983,35 @@ static Exprn *find_exprn(int32 op, Exprn *a, Exprn *b, Exprn *arg[], int flags)
             }
         }
         if (flags & U_PEEK) return NULL;  /* just checking */
-        if (type == E_LOADR) {
-            p = (Exprn *) CSEAlloc(
-                        (int)(offsetof(Exprn, u.unary.e1) + sizeof(Exprn *) + sizeof(Location *)));
-            exloadrloc_(p) = isany_realreg_((VRegnum)a) ?
-                               find_loc(LOC_REG, a, 0, CSE_LOADR, 0): NULL;
-        } else
+        switch (type) {
+        case E_UNARY:
+            leaves = cseset_copy(exleaves_(a));
+            break;
+        case E_LOAD:
+            {   Location *loc = (Location *)a;
+                if (!(loctype_(loc) & LOC_anyVAR))
+                    cseset_union(leaves, exleaves_(locbase_(loc)));
+                cseset_insert(locid_(loc), leaves, NULL);
+            }
+            break;
+        case E_LOADR:
+            {   VRegnum r = (VRegnum)(IPtr)a;
+                Location *loc = isany_realreg_(r) ? find_regloc(r, CSE_LOADR, 0): NULL;
+                if (loc != NULL) {
+                    cseset_insert(locid_(loc), leaves, NULL);
+                }
+                p = (Exprn *) CSEAlloc(
+                            (int)(offsetof(Exprn, u.unary.e1) + sizeof(Exprn *) + sizeof(Location *)));
+                exloadrloc_(p) = loc;
+                break;
+            }
+        }
+        if (p == NULL)
             p = (Exprn *) CSEAlloc(
                         (int)(offsetof(Exprn, u.unary.e1) + sizeof(Exprn *)));
         break;
     case E_CALL:
-        {   int32 i, n = k_argregs_((int32)b);
+        {   int32 i, n = k_argregs_((IPtr)b);
             for (i = 0 ; i < n ; i++)
                 if (CantBeSubExprn(arg[i])) return NULL;
             for (prev = NULL, p = *list; p != NULL; prev = p, p = cdr_(p)) {
@@ -957,8 +1027,10 @@ static Exprn *find_exprn(int32 op, Exprn *a, Exprn *b, Exprn *arg[], int flags)
             if (flags & U_PEEK) return NULL;  /* just checking */
             p = (Exprn *) CSEAlloc(
                  (int) (offsetof(Exprn, u.call.arg[0]) + n * sizeof(Exprn *)));
-            for (i = 0 ; i < n ; i++)
+            for (i = 0 ; i < n ; i++) {
                 exarg_(p, i) = arg[i];
+                cseset_union(leaves, exleaves_(arg[i]));
+            }
             e2_(p)   = b; /* @@@ this updates call.nargs hence exfntype_()! */
         }
         break;
@@ -970,6 +1042,7 @@ static Exprn *find_exprn(int32 op, Exprn *a, Exprn *b, Exprn *arg[], int flags)
     exop_(p)  = op;
     p->nodeid = type;  /* id 0 (type is needed for maybealias) */
     exwaslive_(p) = NO;
+    exleaves_(p) = leaves;
     {   int32 id; int32 alias;
         exuses_(p) = (flags & (U_NOTDEF+U_NOTDEF2)) ? NULL : ExprnUse_New(NULL, flags, 0);
         e1_(p)   = a;
@@ -999,7 +1072,7 @@ static Exprn *find_exprn(int32 op, Exprn *a, Exprn *b, Exprn *arg[], int flags)
                 index = (Exprn **) CSEAlloc(EXPRNSEGSIZE * sizeof(Exprn **));
                 *(cseallocrec.statsbytes) += EXPRNSEGSIZE * sizeof(Exprn **);
                 exprnindex[id>>EXPRNSEGBITS] = index;
-                memclr((void *)index, EXPRNSEGSIZE * sizeof(Exprn **));
+                memclr(index, EXPRNSEGSIZE * sizeof(Exprn **));
             }
             index[id & (EXPRNSEGSIZE-1)] = p;
         }
@@ -1009,43 +1082,66 @@ static Exprn *find_exprn(int32 op, Exprn *a, Exprn *b, Exprn *arg[], int flags)
 }
 
 
-static Exprn *find_movk(J_OPCODE op, int32 n, int flags)
-{
-    return find_exprn(op, (Exprn *)n, NULL, NULL, flags);
+static Exprn *find_movk(int32 n, int flags) {
+    return find_exprn(J_MOVK, (Exprn *)(IPtr)n, NULL, NULL, flags);
+}
+
+static Exprn *find_loadr(VRegnum r, int flags) {
+    return find_exprn(CSE_LOADR, (Exprn *)(IPtr)r, NULL, NULL, flags);
+}
+
+static Exprn *find_unaryb(int32 op, Binder *b, int flags) {
+    return find_exprn(op, (Exprn *)b, NULL, NULL, flags);
+}
+
+static Exprn *find_loadexprn(int32 op, Location *loc, int flags) {
+    return find_exprn(op, (Exprn *)loc, NULL, NULL, flags);
 }
 
 /*
  * Stuff about reading/writing/corrupting Locations.
  */
 
-static Location *find_loc(LocType type, Exprn *base, int32 k, J_OPCODE load,
-                          int32 loctypeflags)
+static Location *find_loc(LocType type, Exprn *base, int32 k, Binder *id,
+                          J_OPCODE load, int32 loctypeflags)
 {
-    int32 id1 = k;
     Location *p, *prev;
-    Location **list = &locations[lochash(type, id1, (int32)base)];
-    if (!(type & LOC_anyVAR) && exop_(base) == J_NEK)
+    Location **list = &locations[lochash(type, base, k, id)];
+    if (base != NULL && exop_(base) == J_NEK)
         return NULL;
     for (prev = NULL, p = *list; p != NULL; prev = p, p = cdr_(p)) {
-        if (loctype_(p) != type  &&
-             !(loctype_(p) & LOC_anyVAR  &&  type & LOC_anyVAR))
-            continue;
-        if (locoff_(p) != id1) continue;
-        if (type & LOC_anyVAR || locbase_(p) == base) {
-            if (prev != NULL) {
-                cdr_(prev) = cdr_(p); cdr_(p) = *list; *list = p;
-            }
-            return p;
+        LocType ltype = loctype_(p);
+        if (ltype == LOC_REG) {
+            if (type != LOC_REG || locreg_(p) != k)
+                continue;
+
+        } else if ((ltype & LOC_anyVAR) && type == LOC_VAR) {
+        /* ltype is either LOC_VAR or LOC_PVAR (LOC_REG filtered out above) */
+        /* type can't be LOC_PVAR: that gets invented below */
+            if (locbind_(p) != id ||
+                locvartype_(p) != LOC_(j_memsize(load)))
+            /* The same variable accessed differently is a different (aliased)
+               location. Maybe can't happen as generated by cg, but I have
+               intentions to turn LDRVK 0,x into LDRV x.
+             */
+                continue;
+
+        } else {
+            if (ltype != type || locbase_(p) != base || locoff_(p) != k)
+                continue;
         }
+        if (prev != NULL) {
+            cdr_(prev) = cdr_(p); cdr_(p) = *list; *list = p;
+        }
+        return p;
     }
-    {   int32 size = type == LOC_VAR ? SizeOfLocVar : sizeof(Location);
-        Location **index = locindex[locationid>>LOCSEGBITS];
-        p = (Location *) CSEAlloc(size);
+    {   Location **index = locindex[locationid>>LOCSEGBITS];
+        p = (Location *) CSEAlloc(sizeof(Location));
         if (index == NULL) {
             index = (Location **) CSEAlloc(LOCSEGSIZE * sizeof(Location **));
             *(cseallocrec.statsbytes) += LOCSEGSIZE * sizeof(Location **);
             locindex[locationid>>LOCSEGBITS] = index;
-            memclr((void *)index, LOCSEGSIZE * sizeof(Location **));
+            memclr(index, LOCSEGSIZE * sizeof(Location **));
         }
         index[locationid & (LOCSEGSIZE-1)] = p;
     }
@@ -1053,32 +1149,39 @@ static Location *find_loc(LocType type, Exprn *base, int32 k, J_OPCODE load,
     locvalue_(p)= NULL;
     p->users    = NULL;
     p->aliasusers = NULL;
-    locoff_(p)  = id1;
+    locsynonym_(p) = NULL;
     if (type == LOC_VAR) {
-        SET_BITMAP stg = bindstg_((Binder *)id1);
+        SET_BITMAP stg = bindstg_(id);
         if (stg & (b_addrof | b_globalregvar |
                    bitofstg_(s_static) | bitofstg_(s_extern))) {
             type = LOC_PVAR;
         }
-    } else
+        locbind_(p) = id;
+        locvartype_(p) = LOC_(j_memsize(load));
+    } else if (type == LOC_REG) {
+        locreg_(p) = k;
+    } else {
         locbase_(p) = base;
+        locoff_(p) = k;
+    }
     p->idandtype = mkidandtype_(locationid++, type | loctypeflags);
-    if (!(type & LOC_anyVAR)) {
-        int32 i;
+    {   int32 i;
         for (i = 0 ; i < LOCINDEXSIZE ; i++) {
             Location **index = locindex[i];
             int32 j;
             if (index == 0) break;
             for (j = 0 ; j < LOCSEGSIZE ; j++) {
                 Location *q = index[j];
+                AliasType a;
                 if (q == 0) break;
-                if (possiblealias(q, type, base, id1))
-                    cseset_union(p->aliasusers, q->users);
+                a = possiblealias(q, p);
+                if (a != NotAlias) cseset_union(p->aliasusers, q->users);
+                if (a == IsSynonym) locsynonym_(p) = q, locsynonym_(q) = p;
             }
         }
     }
     p->load = (type == LOC_REG) ? NULL :
-      find_exprn(load, (Exprn *)p, 0, NULL, U_NOTDEF+U_NOTREF);
+      find_loadexprn(load, p, U_NOTDEF+U_NOTREF);
     return (*list = p);
 }
 
@@ -1098,8 +1201,7 @@ static bool is_flavoured(J_OPCODE op, Location *loc)
 
 static Exprn *flavoured_load(J_OPCODE op, Location *loc, int flags)
 {
-    return find_exprn(j_to_ldrk(op) | (op & J_SIGNbits),
-                      (Exprn *)loc, 0, NULL, flags);
+    return find_loadexprn(j_to_ldrk(op) | (op & J_SIGNbits), loc, flags);
 }
 
 static bool SignBitClear(Exprn *e)
@@ -1112,10 +1214,10 @@ case J_LDRWK: case J_LDRWR: case J_LDRWVK:      /* j_memsize(op)==MEM_W */
          if (op & J_UNSIGNED) return YES;
          break;
 case J_MOVK:
-         if (e1k_(e) > 0) return YES;           /* @@@ should be >= 0   */
+         if (e1k_(e) >= 0) return YES;
          break;
 case J_ANDK:
-         if (e2k_(e) > 0) return YES;           /* @@@ should be >= 0   */
+         if (e2k_(e) >= 0) return YES;
          break;
     }
     return NO;
@@ -1153,6 +1255,7 @@ static ExSet *loc_read(Location *p, int exprnflags, J_OPCODE op)
   locvalue_(p) = e;  /* Otherwise, if an exprn in locvalue_(p) subsequently
                         becomes live we are in trouble
                       */
+  if (!(loctype_(p) & LOC_anyVAR) && locbase_(p) == heapptr) return NULL;
   e = ExSet_Copy(e);
   { Exprn *load;
     if (is_flavoured(op, p)) {
@@ -1176,7 +1279,7 @@ static ExSet *loc_read(Location *p, int exprnflags, J_OPCODE op)
       }
       useoldexprn(load, exprnflags);
     }
-
+    if (load != p->load) useoldexprn(p->load, U_NOTREF+U_NOTDEF2);
     if (is_flavoured(op, p))
     /* we must discard all but a correctly extended values for the flavour
        of load wanted.
@@ -1187,9 +1290,14 @@ static ExSet *loc_read(Location *p, int exprnflags, J_OPCODE op)
 }
 
 static ExSet *locs_read(LocSet *p, int exprnflags, J_OPCODE op) {
-  ExSet *e = loc_read(p->loc, exprnflags, op);
-  while ((p = cdr_(p)) != NULL)
-    e = ExSet_Union(e, loc_read(p->loc, exprnflags, op));
+  ExSet *e = NULL;
+  for (; p != NULL; p = cdr_(p)) {
+    Location *loc = p->loc;
+    ExSet *locval = loc_read(loc, exprnflags, op);
+    e = e == NULL ? locval : ExSet_Union(e, locval);
+    if (locsynonym_(loc) != NULL)
+      e = ExSet_Union(e, loc_read(locsynonym_(loc), exprnflags, op));
+  }
   return e;
 }
 
@@ -1200,10 +1308,14 @@ static bool AddToLocs(Exprn *e, void *loc) {
 
 static void setlocvalue(Location *p, ExSet *val, VRegSetP localiases)
 {
+    if (locbase_(p) == heapptr) return;
     locvalue_(p) = ExSet_Copy(val);
     ExSet_Map(val, AddToLocs, p);
-    { VRegSetP es = cseset_copy(p->users);
-      cseset_union(es, p->aliasusers);
+    if (localiases == NULL) {
+      cseset_difference(availableexprns, p->aliasusers);
+      cseset_difference(liveexprns, p->aliasusers);
+    } else {
+      VRegSetP es = cseset_copy(p->aliasusers);
       cseset_difference(availableexprns, es);
       cseset_difference(es, localiases);
       cseset_difference(liveexprns, es);
@@ -1230,14 +1342,19 @@ static void setreg(VRegnum reg, ExSet *val, bool newvalue)
 {
     RegValue **prevp = &knownregs, *r;
     if (isany_realreg_(reg)) {
-      Exprn *ex = find_exprn(CSE_LOADR, (Exprn *) reg, 0, NULL, U_NOTDEF+U_NOTREF);
-      cseset_delete(exid_(ex), liveexprns, NULL);
-      cseset_insert(locid_(exloadrloc_(ex)), killedlocations, NULL);
+      Exprn *ex = find_loadr(reg, U_NOTDEF+U_NOTREF);
+      Location *loc = exloadrloc_(ex);
+      cseset_difference(availableexprns, loc->users);
+      cseset_difference(liveexprns, loc->users);
+      cseset_insert(locid_(loc), killedlocations, NULL);
     }
     /* LOADRs are never available */
     for (; (r = *prevp) != NULL ; prevp = &cdr_(r)) {
         if (rv_reg_(r) == reg) {
-            if (newvalue) {
+            if (newvalue && val != rv_val_(r)) {
+            /* the second condition covers the case of a register being */
+            /* copied to itself, as a result of optimisation of one of  */
+            /* the few cases where register reuse is permitted          */
                 ExSet_Discard(rv_val_(r));
                 rv_val_(r) = NULL;
             }
@@ -1281,7 +1398,7 @@ static ExSet *readreg(VRegnum reg)
     */
     ExSet *res = valueinreg(reg);
     if (res != NULL) return res;
-    {   Exprn *r = find_exprn(CSE_LOADR, (Exprn *) reg, 0, NULL, U_NOTDEF+U_NOTREF);
+    {   Exprn *r = find_loadr(reg, U_NOTDEF+U_NOTREF);
         cseset_insert(exid_(r), loadrs, NULL);
         cseset_insert(exid_(r), liveexprns, NULL);
         res = ExprnToSet(r);
@@ -1301,18 +1418,14 @@ static void setvar(Location *p, ExSet *val, VRegSetP localiases)
     setlocvalue(p, val, localiases);
     /* Now if p may be an alias for anything, we must discard
        the known value of that thing. */
-    if (loctype_(p) == LOC_PVAR) {
-        for (i = 0 ; i < LOCINDEXSIZE ; i++) {
-            Location **index = locindex[i];
-            int32 j;
-            if (index == 0) break;
-            for (j = 0 ; j < LOCSEGSIZE ; j++) {
-                Location *q = index[j];
-                if (q == 0) break;
-                if (!(loctype_(q) & LOC_anyVAR) &&
-                    possiblealias(p, loctype_(q), locbase_(q), locoff_(q)) )
-                    setlocvalue(q, NULL, localiases);
-            }
+    for (i = 0 ; i < LOCINDEXSIZE ; i++) {
+        Location **index = locindex[i];
+        int32 j;
+        if (index == 0) break;
+        for (j = 0 ; j < LOCSEGSIZE ; j++) {
+            Location *q = index[j];
+            if (q == 0) break;
+            if (possiblealias(p, q) != NotAlias) setlocvalue(q, NULL, localiases);
         }
     }
 }
@@ -1333,6 +1446,47 @@ static void corruptmem(void)
      * as location CALLLOC (real locations start at 0).
      */
     cseset_insert(CALLLOC, killedlocations, NULL);
+}
+
+static int32 movcbaseid;
+typedef struct MOVCTarget MOVCTarget;
+struct MOVCTarget {
+    MOVCTarget *cdr;
+    Exprn *base;
+    int32 id;
+    VRegSetP locswithbase;
+};
+static MOVCTarget *movctargets;
+
+static int32 BaseId(Exprn *base)
+{   MOVCTarget *p = movctargets;
+    for (; p != NULL; p = cdr_(p))
+        if (p->base == base) return p->id;
+    p = (MOVCTarget *)CSEAlloc(sizeof(MOVCTarget));
+    cdr_(p) = movctargets;
+    p->base = base; p->id = --movcbaseid; p->locswithbase = NULL;
+    movctargets = p;
+    return p->id;
+}
+
+static void corruptlocswithbase(Exprn *base, int32 limit)
+{   int32 i;
+    int32 ldop = alignof_struct < 4 ? J_LDRBK|J_ALIGN1 : J_LDRK|J_ALIGN4;
+    int32 mem = alignof_struct < 4 ? MEM_B : MEM_I;
+    find_memloc(LOC_(mem), base, 0, ldop, LOC_REALBASE);
+    for (i = 0 ; i < LOCINDEXSIZE ; i++) {
+        Location **index = locindex[i];
+        int32 j;
+        if (index == 0) break;
+        for (j = 0 ; j < LOCSEGSIZE ; j++) {
+            Location *q = index[j];
+            if (q == 0) break;
+            if (!(loctype_(q) & LOC_anyVAR) &&
+                 locbase_(q) == base && locoff_(q) < limit)
+                setlocvalue(q, NULL, NULL);
+        }
+    }
+    cseset_insert(BaseId(base), killedlocations, NULL);
 }
 
 /*
@@ -1372,13 +1526,12 @@ static int32 shiftedval(J_OPCODE op, int32 b)
             b = b << (msh & SHIFT_MASK);
         else if (msh & SHIFT_ARITH)
             b = b >> (msh & SHIFT_MASK);
-        else if ((msh & SHIFT_MASK) != 0)
-            b = (b >> (msh & SHIFT_MASK)) &
-                (0x7fffffffL >> ((msh & SHIFT_MASK)-1));
+        else
+            b = (int32) ((just32bits_((unsigned32)b)) >> (msh & SHIFT_MASK));
     }
     if (op & J_NEGINDEX) b = -b;
 /* The complication here is for the sake of 64 bit hosts */
-    if (b & 0x80000000) b |= ~0x7fffffffL;
+    if (b & 0x80000000) b |= ~0x7fffffff;
     else b &= 0x7fffffff;
     return b;
 }
@@ -1391,8 +1544,7 @@ static bool ExprIsExprPlusK(ExSet *es1, ExSet *es2, int32 *p1, int32 *p2)
 {
     int32 n1 = 0, n2 = 0;
     Exprn *ex1 = NULL, *ex2 = NULL;
-    ExSet *e1, *e2;
-    e1 = OpInSet(es1, J_ADDK, 0);
+    ExSet *e2, *e1 = OpInSet(es1, J_ADDK, 0);
     if (e1 != NULL)
         n1 = e2k_(e1->exprn);
     else {
@@ -1424,10 +1576,10 @@ static bool ExprIsExprPlusK(ExSet *es1, ExSet *es2, int32 *p1, int32 *p2)
 }
 
 static void KillArc(BlockHead *block, LabelNumber *lab) {
-    if (!is_exit_label(lab) && !blk_scanned_(lab->block)) {
+    if (!is_exit_label(lab)) {
         BlockHead *b = lab->block;
         if (blk_pred_(b) == NULL) return;
-        blk_pred_(b) = (BlockList *)ndelete((VRegnum)block, (RegList *)blk_pred_(b));
+        blk_pred_(b) = (BlockList *)generic_ndelete((IPtr)block, (List *)blk_pred_(b));
         if (blk_pred_(b) != NULL || (blkflags_(b) & BLKSWITCH)) return;
         if (blkflags_(b) & BLK2EXIT) KillArc(b, blknext1_(b));
         KillArc(b, blknext_(b));
@@ -1436,8 +1588,8 @@ static void KillArc(BlockHead *block, LabelNumber *lab) {
 
 static LabelNumber *ComparisonDest(int32 a, int32 b, BlockHead *block) {
     bool taken;
-    unsigned32 ua = a & 0xffffffffu,
-               ub = b & 0xffffffffu;
+    unsigned32 ua = just32bits_(a),
+               ub = just32bits_(b);
     switch (blkflags_(block) & Q_MASK) {
     case Q_UEQ:
     case Q_EQ:  taken = (a == b); break;
@@ -1494,8 +1646,6 @@ static ExSet *newexprnpart(int32 part, ExSet *set)
     return res;
 }
 
-typedef bool EvalFn(int32 *, int32, int32);
-
 static bool sdiv(int32 *resp, int32 a0, int32 a1) {
 /* nb arguments reversed from natural order */
     if (a0 == 0) { cc_warn(sem_warn_divrem_0, s_div); return NO; }
@@ -1515,7 +1665,7 @@ static bool udiv(int32 *resp, int32 a0, int32 a1) {
     a0 &= 0xffffffff;
     a1 &= 0xffffffff;
     if (a0 == 0) { cc_warn(sem_warn_divrem_0, s_div); return NO; }
-    *resp = (int32)(((unsigned32)a1) / (unsigned32)a0);
+    *resp = (int32)(((unsigned32)a1) / a0);
     return YES;
 }
 
@@ -1524,7 +1674,7 @@ static bool urem(int32 *resp, int32 a0, int32 a1) {
     a0 &= 0xffffffff;
     a1 &= 0xffffffff;
     if (a0 == 0) { cc_warn(sem_warn_divrem_0, s_rem); return NO; }
-    *resp = (int32)(((unsigned32)a1) % (unsigned32)a0);
+    *resp = (int32)(((unsigned32)a1) % a0);
     return YES;
 }
 
@@ -1536,35 +1686,6 @@ static bool mul(int32 *resp, int32 a0, int32 a1) {
 }
 #endif
 
-#ifdef EXTENSION_FRAC
-static bool xmul(int32 *resp, int32 a0, int32 a1) {
-/* *resp = hi(a1*a0) */
-    int32 flag = bitoftype_(s_long);	/* hack */
-    bool ok;
-    if (sizeof_int==2 && !(flag & bitoftype_(s_long)))
-        a0 <<= 16, a1 <<= 16;
-    ok = frac_multiply(resp,a1,a0);
-    if (sizeof_int==2 && !(flag & bitoftype_(s_long)))
-        (void)frac_narrow(resp);
-    cc_warn("__frac mul/div constant expression may be mis-calculated");
-    return ok;
-}
-
-static bool xdiv(int32 *resp, int32 a0, int32 a1) {
-/* nb arguments reversed from natural order */
-    int32 flag = bitoftype_(s_long);	/* hack */
-    bool ok;
-    if (a0 == 0) { cc_warn(sem_warn_divrem_0, s_xdiv); return NO; }
-    if (sizeof_int==2 && !(flag & bitoftype_(s_long)))
-        a0 <<= 16, a1 <<= 16;
-    ok = frac_divide(resp,a1,a0);
-    if (sizeof_int==2 && !(flag & bitoftype_(s_long)))
-        (void)frac_narrow(resp);
-    cc_warn("__frac mul/div constant expression may be mis-calculated");
-    return ok;
-}
-#endif
-
 static bool EvalUnary(J_OPCODE op, int32 *resp, ExSet *ex) {
   J_OPCODE baseop = op & J_TABLE_BITS;
   ExSet *c1 = MOVKinSet(ex);
@@ -1572,28 +1693,30 @@ static bool EvalUnary(J_OPCODE op, int32 *resp, ExSet *ex) {
   if (c1 != NULL) {
     n = shiftedval(op, e1k_(c1->exprn));
     switch (baseop) {
-    default: syserr(syserr_evalconst, (long)op);
     case J_NOTR: n = ~n; break;
     case J_MOVR: n =  n; break;
     case J_NEGR: n = -n; break;
-    case J_MOVI0WR: n = (int16)n; break;
-    case J_MOVI1WR: n = (int16)(n>>16); break;
-    case J_MOVWIR: n = op & J_UNSIGNED ? n & 0xffff : (int16)n; break;
     }
     done = YES;
   } else if (baseop == J_FIXFR && (c1 = MOVFKinSet(ex)) != NULL) {
     DbleBin d;
-    fltrep_widen(&((FloatCon *)e1k_(c1->exprn))->floatbin.fb, &d);
-    done = op & J_UNSIGNED ? flt_dtou((unsigned32 *)&n, &d) : flt_dtoi(&n, &d);
+    fltrep_widen(&e1f_(c1->exprn)->floatbin.fb, &d);
+    { int status = (op & J_UNSIGNED) ? flt_dtou((unsigned32 *)&n, &d) :
+                                       flt_dtoi(&n, &d);
+      done = status == flt_ok;
+    }
   } else if (baseop == J_FIXDR && (c1 = MOVDKinSet(ex)) != NULL) {
-    DbleBin *d = &((FloatCon *)e1k_(c1->exprn))->floatbin.db;
-    done = op & J_UNSIGNED ? flt_dtou((unsigned32 *)&n, d) : flt_dtoi(&n, d);
+    DbleBin *d = &e1f_(c1->exprn)->floatbin.db;
+    { int status = (op & J_UNSIGNED) ? flt_dtou((unsigned32 *)&n, d) :
+                                       flt_dtoi(&n, d);
+      done = status == flt_ok;
+    }
   }
 
   if (done) {
     if (debugging(DEBUG_CSE) && CSEDebugLevel(1))
       cc_msg("Compile-time evaluable = %ld\n", n);
-    if (n & 0x80000000) n |= ~0x7fffffffL;
+    if (n & 0x80000000) n |= ~0x7fffffff;
     else n &= 0x7fffffff;
     *resp = n;
   }
@@ -1614,10 +1737,6 @@ static bool EvalBinary_I(J_OPCODE op, int32 *resp, Exprn *ax, int32 b)
                   break;
     case J_ADDK: res = a + b; break;
     case J_MULK: res = a * b; break;
-#ifdef EXTENSION_FRAC
-    case J_XMULK: done = xmul(&res, a, b); break;
-    case J_XDIVK: done = xdiv(&res, b, a); break;
-#endif
     case J_ANDK: res = a & b; break;
     case J_ORRK: res = a | b; break;
     case J_EORK: res = a ^ b; break;
@@ -1636,22 +1755,20 @@ static bool EvalBinary_I(J_OPCODE op, int32 *resp, Exprn *ax, int32 b)
 #else
     case J_SHLK: res = a << b; break;
 #endif
-    case J_SHRK: if (b == 0) res = a;
-                 else if (op & J_UNSIGNED)
-                     res = (a >> b) & (0x7fffffffL >> (b-1));
-                 else res = TARGET_RIGHTSHIFT(a, b);
+    case J_SHRK: res = (op & J_UNSIGNED) ?
+                        (int32) ((0xffffffff & (unsigned32) a) >> b) :
+                        TARGET_RIGHTSHIFT(a, b);
                  break;
 #ifdef TARGET_HAS_ROTATE
 /* Hmm, ROLK is probably more common than RORK.                         */
-    case J_RORK: if (b == 0) res = a;
-                 else res = ((unsigned32)a << (32-b)) |
-                        ((a >> b) & (0x7fffffffL >> (b-1)));
+    case J_RORK: res = ((unsigned32)a << (32-b)) |
+                        ((0xffffffff & (unsigned32)a) >> b);
                  break;
 #endif
     default: syserr(syserr_evalconst, (long)op);
              return NO;
     }
-    if (res & 0x80000000) res |= ~0x7fffffffL;
+    if (res & 0x80000000) res |= ~0x7fffffff;
     else res &= 0x7fffffff;
     if (done) *resp = res;
     if (done && debugging(DEBUG_CSE) && CSEDebugLevel(1))
@@ -1660,73 +1777,345 @@ static bool EvalBinary_I(J_OPCODE op, int32 *resp, Exprn *ax, int32 b)
     return done;
 }
 
-static FloatCon *EvalBinary_D(J_OPCODE op, ExSet *as, FloatCon *b)
+static FloatCon *EvalBinary_D(J_OPCODE op, ExSet *as, FloatCon const *b)
 {
     FloatCon *a;
     DbleBin db;
-    bool ok;
+    int failed;
     as = MOVDKinSet(as);
     if (as == NULL) return NULL;
-    a = (FloatCon *)e1k_(as->exprn);
+    a = e1f_(as->exprn);
     switch (op) {
-    case J_ADDDK: ok = flt_add(&db, &a->floatbin.db, &b->floatbin.db); break;
-    case J_MULDK: ok = flt_multiply(&db, &a->floatbin.db, &b->floatbin.db); break;
-    case J_SUBDK: ok = flt_subtract(&db, &a->floatbin.db, &b->floatbin.db); break;
-    case J_DIVDK: ok = flt_divide(&db, &a->floatbin.db, &b->floatbin.db); break;
+    case J_ADDDK: failed = flt_add(&db, &a->floatbin.db, &b->floatbin.db); break;
+    case J_MULDK: failed = flt_multiply(&db, &a->floatbin.db, &b->floatbin.db); break;
+    case J_SUBDK: failed = flt_subtract(&db, &a->floatbin.db, &b->floatbin.db); break;
+    case J_DIVDK: failed = flt_divide(&db, &a->floatbin.db, &b->floatbin.db); break;
     default: syserr(syserr_evalconst, (long)op);
              return NULL;
     }
-    if (!ok) return NULL;
-    a = real_of_string("<expr>", bitoftype_(s_double));
+    if (failed) return NULL;
+    a = real_of_string("<expr>", 0);
+    a->floatlen = bitoftype_(s_double);
     a->floatbin.db = db;
     if (debugging(DEBUG_CSE) && CSEDebugLevel(1))
       cc_msg("Compile-time evaluable\n");
     return a;
 }
 
-static FloatCon *EvalBinary_F(J_OPCODE op, ExSet *as, FloatCon *b)
-{
+static bool EvalBinary_F_1(J_OPCODE op, FloatBin const *a, FloatBin const *b, FloatBin *r) {
     DbleBin dr, da, db;
-    bool ok;
+    bool failed;
+    fltrep_widen(a, &da);
+    fltrep_widen(b, &db);
+    switch (op) {
+    case J_ADDFK: failed = flt_add(&dr, &da, &db); break;
+    case J_MULFK: failed = flt_multiply(&dr, &da, &db); break;
+    case J_SUBFK: failed = flt_subtract(&dr, &da, &db); break;
+    case J_DIVFK: failed = flt_divide(&dr, &da, &db); break;
+    default: syserr(syserr_evalconst, (long)op);
+             return NO;
+    }
+    if (failed) return NO;
+    if (fltrep_narrow(&dr, r) != flt_ok) return NO;
+    return YES;
+}
+
+static FloatCon *EvalBinary_F(J_OPCODE op, ExSet *as, FloatCon const *b)
+{
+    FloatBin fr;
     as = MOVFKinSet(as);
     if (as == NULL) return NULL;
-    fltrep_widen(&((FloatCon *)e1k_(as->exprn))->floatbin.fb, &da);
-    fltrep_widen(&b->floatbin.fb, &db);
-    switch (op) {
-    case J_ADDFK: ok = flt_add(&dr, &da, &db); break;
-    case J_MULFK: ok = flt_multiply(&dr, &da, &db); break;
-    case J_SUBFK: ok = flt_subtract(&dr, &da, &db); break;
-    case J_DIVFK: ok = flt_divide(&dr, &da, &db); break;
-    default: syserr(syserr_evalconst, (long)op);
-             return NULL;
-    }
-    if (!ok) return NULL;
-    { FloatBin fb; FloatCon *a;
-      if (fltrep_narrow(&dr, &fb)) return NULL;
-      a = real_of_string("<expr>", bitoftype_(s_double)|bitoftype_(s_short));
-      a->floatbin.fb = fb;
+    { FloatCon *a = e1f_(as->exprn);
+      if (!EvalBinary_F_1(op, &a->floatbin.fb, &b->floatbin.fb, &fr))
+        return NULL;
+      a = real_of_string("<expr>", 0);
+      a->floatlen = bitoftype_(s_double)|bitoftype_(s_short);
+      a->floatbin.fb = fr;
       if (debugging(DEBUG_CSE) && CSEDebugLevel(1))
         cc_msg("Compile-time evaluable\n");
       return a;
     }
 }
 
-static EvalFn *evaluablefn(Expr *fn, VRegnum res, int *args)
+static bool fcompare(int *res, FloatBin const *a, FloatBin const *b) {
+/* Currently, flt_compare() can return only -1, 0, or 1 (all argument values
+   are considered comparable). Code here anticipates an interface change which
+   allows a 'not comparable' return value outside this set.
+ */
+    DbleBin da, db; int r;
+    fltrep_widen(a, &da);
+    fltrep_widen(b, &db);
+    r = flt_compare(&da, &db);
+    if (!(-1 <= r && r <= 1)) return NO;
+    *res = r;
+    return YES;
+}
+
+static bool dcompare(int *res, FloatCon const *a, FloatCon const *b) {
+    int r = flt_compare(&a->floatbin.db, &b->floatbin.db);
+    if (!(-1 <= r && r <= 1)) return NO;
+    *res = r;
+    return YES;
+}
+
+#ifdef SOFTWARE_FLOATING_POINT
+static Exprn *AdconDInSet(ExSet *s, int32 n) {
+    for (;; s = cdr_(s)) {
+      Location *loc;
+      s = OpInSet(s, J_LDRK, 0);
+      if (s == NULL) return NULL;
+      loc = exloc_(s->exprn);
+      if (!(loctype_(loc) & LOC_anyVAR) &&
+          exop_(locbase_(loc)) == J_ADCOND)
+        return locoff_(loc) == n ? locbase_(loc) : NULL;
+    }
+}
+
+static FloatCon *DoubleLoadedToIntPair(ExSet *a0s, ExSet *a1s) {
+    Exprn *adcond = AdconDInSet(a0s, 0);
+    if (adcond != NULL && AdconDInSet(a1s, 4) == adcond)
+      return e1f_(adcond);
+    return NULL;
+}
+
+static bool EvalSFP_D(Expr const *fn, int32 narg, ExSet *arg[], DbleBin *dresp) {
+    FloatCon *a0, *a1;
+    a0 = DoubleLoadedToIntPair(arg[0], arg[1]);
+    if (a0 == NULL) return NO;
+    if (narg == 2 && fn == sim.dnegate)
+      return flt_negate(dresp, &a0->floatbin.db) == flt_ok;
+    if (narg != 4) return NO;
+    a1 = DoubleLoadedToIntPair(arg[2], arg[3]);
+    if (a1 == NULL) return NO;
+    if (fn == sim.dadd)
+      return flt_add(dresp, &a0->floatbin.db, &a1->floatbin.db) == flt_ok;
+    else if (fn == sim.dsubtract)
+      return flt_add(dresp, &a0->floatbin.db, &a1->floatbin.db) == flt_ok;
+    else if (fn == sim.dmultiply)
+      return flt_add(dresp, &a0->floatbin.db, &a1->floatbin.db) == flt_ok;
+    else if (fn == sim.ddivide)
+      return flt_add(dresp, &a0->floatbin.db, &a1->floatbin.db) == flt_ok;
+    else
+      return NO;
+}
+
+static bool fadd(int32 *resp, int32 a0, int32 a1) {
+    return EvalBinary_F_1(J_ADDFK, (FloatBin *)&a0, (FloatBin *)&a1, (FloatBin *)resp);
+}
+
+static bool fsub(int32 *resp, int32 a0, int32 a1) {
+    return EvalBinary_F_1(J_SUBFK, (FloatBin *)&a0, (FloatBin *)&a1, (FloatBin *)resp);
+}
+
+static bool fmul(int32 *resp, int32 a0, int32 a1) {
+    return EvalBinary_F_1(J_MULFK, (FloatBin *)&a0, (FloatBin *)&a1, (FloatBin *)resp);
+}
+
+static bool fdiv(int32 *resp, int32 a0, int32 a1) {
+    return EvalBinary_F_1(J_DIVFK, (FloatBin *)&a0, (FloatBin *)&a1, (FloatBin *)resp);
+}
+
+static bool fgreater(int32 *resp, int32 a0, int32 a1) {
+    int r;
+    if (fcompare(&r, (FloatBin *)&a0, (FloatBin *)&a1)) {
+      *resp = (r > 0);
+      return YES;
+    }
+    return NO;
+}
+
+static bool fgeq(int32 *resp, int32 a0, int32 a1) {
+    int r;
+    if (fcompare(&r, (FloatBin *)&a0, (FloatBin *)&a1)) {
+      *resp = (r >= 0);
+      return YES;
+    }
+    return NO;
+}
+
+static bool fless(int32 *resp, int32 a0, int32 a1) {
+    int r;
+    if (fcompare(&r, (FloatBin *)&a0, (FloatBin *)&a1)) {
+      *resp = (r < 0);
+      return YES;
+    }
+    return NO;
+}
+
+static bool fleq(int32 *resp, int32 a0, int32 a1) {
+    int r;
+    if (fcompare(&r, (FloatBin *)&a0, (FloatBin *)&a1)) {
+      *resp = (r <= 0);
+      return YES;
+    }
+    return NO;
+}
+
+static bool fequal(int32 *resp, int32 a0, int32 a1) {
+    int r;
+    if (fcompare(&r, (FloatBin *)&a0, (FloatBin *)&a1)) {
+      *resp = (r == 0);
+      return YES;
+    }
+    return NO;
+}
+
+static bool fneq(int32 *resp, int32 a0, int32 a1) {
+    int r;
+    if (fcompare(&r, (FloatBin *)&a0, (FloatBin *)&a1)) {
+      *resp = (r != 0);
+      return YES;
+    }
+    return NO;
+}
+
+static bool fneg(int32 *resp, int32 a0) {
+    DbleBin dr, da;
+    fltrep_widen((FloatBin *)&a0, &da);
+    return (flt_negate(&dr, &da) == flt_ok &&
+            fltrep_narrow(&dr, (FloatBin *)resp) == flt_ok);
+}
+
+static bool ffix(int32 *resp, int32 a0) {
+    DbleBin da;
+    fltrep_widen((FloatBin *)&a0, &da);
+    return (flt_dtoi(resp, &da) == flt_ok);
+}
+
+static bool ffixu(int32 *resp, int32 a0) {
+    DbleBin da;
+    fltrep_widen((FloatBin *)&a0, &da);
+    return (flt_dtou((unsigned32 *)resp, &da) == flt_ok);
+}
+
+static bool ffloat(int32 *resp, int32 a0) {
+    DbleBin dr;
+    return (flt_itod(&dr, a0) == flt_ok &&
+            fltrep_narrow(&dr, (FloatBin *)resp) == flt_ok);
+}
+
+static bool ffloatu(int32 *resp, int32 a0) {
+    DbleBin dr;
+    return (flt_utod(&dr, a0) == flt_ok &&
+            fltrep_narrow(&dr, (FloatBin *)resp) == flt_ok);
+}
+
+static bool dgreater(int32 *resp, FloatCon const *a0, FloatCon const *a1) {
+    int r;
+    if (dcompare(&r, a0, a1)) {
+      *resp = (r > 0);
+      return YES;
+    }
+    return NO;
+}
+
+static bool dgeq(int32 *resp, FloatCon const *a0, FloatCon const *a1) {
+    int r;
+    if (dcompare(&r, a0, a1)) {
+      *resp = (r >= 0);
+      return YES;
+    }
+    return NO;
+}
+
+static bool dless(int32 *resp, FloatCon const *a0, FloatCon const *a1) {
+    int r;
+    if (dcompare(&r, a0, a1)) {
+      *resp = (r < 0);
+      return YES;
+    }
+    return NO;
+}
+
+static bool dleq(int32 *resp, FloatCon const *a0, FloatCon const *a1) {
+    int r;
+    if (dcompare(&r, a0, a1)) {
+      *resp = (r <= 0);
+      return YES;
+    }
+    return NO;
+}
+
+static bool dequal(int32 *resp, FloatCon const *a0, FloatCon const *a1) {
+    int r;
+    if (dcompare(&r, a0, a1)) {
+      *resp = (r == 0);
+      return YES;
+    }
+    return NO;
+}
+
+static bool dneq(int32 *resp, FloatCon const *a0, FloatCon const *a1) {
+    int r;
+    if (dcompare(&r, a0, a1)) {
+      *resp = (r != 0);
+      return YES;
+    }
+    return NO;
+}
+
+static bool dfix(int32 *resp, FloatCon const *a0) {
+    return flt_dtoi(resp, &a0->floatbin.db) == flt_ok;
+}
+
+static bool dfixu(int32 *resp, FloatCon const *a0) {
+    return flt_dtou((unsigned32 *)resp, &a0->floatbin.db) == flt_ok;
+}
+
+#endif
+
+typedef union {
+    bool (*unaryi)(int32 *, int32);
+    bool (*binaryi)(int32 *, int32, int32);
+    bool (*unaryd)(int32 *, FloatCon const *);
+    bool (*binaryd)(int32 *, FloatCon const *, FloatCon const *);
+} EvalFn;
+
+#define ArgCount 0xf
+#define FPArgs 0x10
+
+static int evaluablefn(Expr *fn, VRegnum res, EvalFn *ev)
 {
 #ifndef TARGET_HAS_DIVIDE
-    if (fn == arg1_(sim.divfn))  { *args = 2; return res == R_A1 ? sdiv : srem; }
-    if (fn == arg1_(sim.udivfn)) { *args = 2; return res == R_A1 ? udiv : urem; }
+    if (fn == arg1_(sim.divfn))  { ev->binaryi = res == R_A1 ? sdiv : srem; return 2; }
+    if (fn == arg1_(sim.udivfn)) { ev->binaryi = res == R_A1 ? udiv : urem; return 2; }
 #endif
 #if defined(TARGET_LACKS_REMAINDER) || !defined(TARGET_HAS_DIVIDE)
-    if (fn == arg1_(sim.remfn))  { *args = 2; return srem; }
-    if (fn == arg1_(sim.uremfn)) { *args = 2; return urem; }
+    if (fn == arg1_(sim.remfn))  { ev->binaryi = srem; return 2; }
+    if (fn == arg1_(sim.uremfn)) { ev->binaryi = urem; return 2; }
 #endif
 #ifndef TARGET_HAS_MULTIPLY
-    if (fn == arg1_(sim.mulfn))  { *args = 2; return mul; }
+    if (fn == arg1_(sim.mulfn))  { ev->binaryi = mul; return 2; }
 #endif
-#ifdef EXTENSION_FRAC
-    if (fn == arg1_(sim.xmulfn))  { *args = 2; return xmul; }
-    if (fn == arg1_(sim.xdivfn))  { *args = 2; return xdiv; }
+#ifdef SOFTWARE_FLOATING_POINT
+    if (software_floating_point_enabled) {
+      if (fn == sim.fadd)       { ev->binaryi = fadd; return 2; }
+      if (fn == sim.fsubtract)  { ev->binaryi = fsub; return 2; }
+      if (fn == sim.fmultiply)  { ev->binaryi = fmul; return 2; }
+      if (fn == sim.fdivide)    { ev->binaryi = fdiv; return 2; }
+      if (fn == sim.fnegate)    { ev->unaryi = fneg; return 1; }
+      if (fn == sim.ffix)       { ev->unaryi = ffix; return 1; }
+      if (fn == sim.ffixu)      { ev->unaryi = ffixu; return 1; }
+      if (fn == sim.ffloat)     { ev->unaryi = ffloat; return 1; }
+      if (fn == sim.ffloatu)    { ev->unaryi = ffloatu; return 1; }
+
+      if (fn == sim.fgreater)   { ev->binaryi = fgreater; return 2; }
+      if (fn == sim.fgeq)       { ev->binaryi = fgeq; return 2; }
+      if (fn == sim.fless)      { ev->binaryi = fless; return 2; }
+      if (fn == sim.fleq)       { ev->binaryi = fleq; return 2; }
+      if (fn == sim.fequal)     { ev->binaryi = fequal; return 2; }
+      if (fn == sim.fneq)       { ev->binaryi = fneq; return 2; }
+
+      if (fn == sim.dfix)       { ev->unaryd = dfix; return 2+FPArgs; }
+      if (fn == sim.dfixu)      { ev->unaryd = dfixu; return 2+FPArgs; }
+
+      if (fn == sim.dgreater)   { ev->binaryd = dgreater; return 4+FPArgs; }
+      if (fn == sim.dgeq)       { ev->binaryd = dgeq; return 4+FPArgs; }
+      if (fn == sim.dless)      { ev->binaryd = dless; return 4+FPArgs; }
+      if (fn == sim.dleq)       { ev->binaryd = dleq; return 4+FPArgs; }
+      if (fn == sim.dequal)     { ev->binaryd = dequal; return 4+FPArgs; }
+      if (fn == sim.dneq)       { ev->binaryd = dneq; return 4+FPArgs; }
+    }
 #endif
     return 0;
 }
@@ -1734,27 +2123,42 @@ static EvalFn *evaluablefn(Expr *fn, VRegnum res, int *args)
 static bool evaluablecall(Expr *fn, VRegnum res, int32 argres, ExSet *arg[],
                           int32 *resp)
 {
-    int args;
-    EvalFn *op = evaluablefn(fn, res, &args);
+    EvalFn op;
+    int args = evaluablefn(fn, res, &op);
     bool done = NO;
-    if (op == 0) return NO;
-    /* All compile-time evaluable fns are binary currently.
-       Software FP?
-     */
-    if (args == k_argregs_(argres) && !k_argisfp_(argres,0) && arg[0] != NULL)
+    if (args == 0) return NO;
+    if ((args & ArgCount) == k_argregs_(argres) && !k_argisfp_(argres,0) && arg[0] != NULL)
       switch(args)
       {
-case 1: {   ExSet *c0 = MOVKinSet(arg[0]);
-            done = (c0 != 0 && op(resp, e1k_(c0->exprn), 0));
+case 1: { ExSet *c0 = MOVKinSet(arg[0]);
+          done = (c0 != 0 && op.unaryi(resp, e1k_(c0->exprn)));
         }
         break;
 case 2: if (!k_argisfp_(argres,1) && arg[1] != NULL)
-        {   ExSet *c0 = MOVKinSet(arg[0]);
-            ExSet *c1 = MOVKinSet(arg[1]);
-            done = (c0 != 0 && c1 != 0 &&
-                    op(resp, e1k_(c0->exprn), e1k_(c1->exprn)));
+        { ExSet *c0 = MOVKinSet(arg[0]);
+          ExSet *c1 = MOVKinSet(arg[1]);
+          done = (c0 != 0 && c1 != 0 &&
+                  op.binaryi(resp, e1k_(c0->exprn), e1k_(c1->exprn)));
         }
         break;
+#ifdef SOFTWARE_FLOATING_POINT
+case 2+FPArgs:
+        if (!k_argisfp_(argres,1) && arg[1] != NULL)
+        { FloatCon *a0 = DoubleLoadedToIntPair(arg[0], arg[1]);
+          done = (a0 != NULL && op.unaryd(resp, a0));
+        }
+        break;
+case 4+FPArgs:
+        if (!k_argisfp_(argres,1) && arg[1] != NULL &&
+            !k_argisfp_(argres,2) && arg[2] != NULL &&
+            !k_argisfp_(argres,3) && arg[3] != NULL)
+        { FloatCon *a0 = DoubleLoadedToIntPair(arg[0], arg[1]);
+          FloatCon *a1 = DoubleLoadedToIntPair(arg[2], arg[3]);
+          done = (a0 != NULL && a1 != NULL &&
+                  op.binaryd(resp, a0, a1));
+        }
+        break;
+#endif
       }
 
     if (done && debugging(DEBUG_CSE) && CSEDebugLevel(1))
@@ -1776,7 +2180,7 @@ static void add_store_access(LocSet *x) {
     if (debugging(DEBUG_CSE) && CSEDebugLevel(4)) StoreAccessList_Print(storeaccesses, "\n");
 }
 
-#define LocInSet(a, s) member((VRegnum)a, (RegList *)s)
+#define LocInSet(a, s) generic_member((IPtr)a, (List *)s)
 
 static LocType MaxLocType(LocSet *locs, Location **locp) {
     Location *loc = locs->loc;
@@ -1796,12 +2200,11 @@ static void killoldunusedstore(Location *loc, int ignorealiascount)
      but not loads from a possible alias.
    */
   StoreAccessList *a = storeaccesses;
-  LocType type = loctype_(loc);
   for (; a != NULL; a = cdr_(a), --ignorealiascount) {
     if (locbase_(loc) != heapptr && LocInSet(loc, a->locs)) {
       Icode *store = a->ic;
       J_OPCODE op = store->op;
-      if (stores_r1(op)) {
+      if (stores_r1(op) && !a->needed) {
         store->op = J_NOOP;
         if (debugging(DEBUG_CSE)) {
           cc_msg("-- killed unused");
@@ -1809,26 +2212,43 @@ static void killoldunusedstore(Location *loc, int ignorealiascount)
         }
       }
       return;
-    } else if (a->ic->op != J_NOOP && !stores_r1(a->ic->op) && type != LOC_VAR &&
+    } else if (a->ic->op != J_NOOP && !stores_r1(a->ic->op) &&
                ignorealiascount <= 0) {
-      Location *loca;
-      LocType typea = MaxLocType(a->locs, &loca);
-     /* /* asymmetry of possiblealias is annoying here */
-      if (typea == LOC_PVAR) {
-        if ( type != LOC_PVAR &&
-             possiblealias(loca, type, locbase_(loc), locoff_(loc)))
-          return;
-      } else if (typea != LOC_VAR) {
-        bool notalias = YES;
-        LocSet *s = a->locs;
-        for (; s != NULL; s = cdr_(s))
-          if (possiblealias(loc, loctype_(s->loc), locbase_(s->loc), locoff_(s->loc)))
-            notalias = NO;
-          else {
-            notalias = YES; break;
-          }
-        if (!notalias) return;
-      }
+      bool notalias = YES;
+      LocSet *s = a->locs;
+      for (; s != NULL; s = cdr_(s))
+        if (possiblealias(loc, s->loc))
+          notalias = NO;
+        else {
+          notalias = YES; break;
+        }
+      if (!notalias) return;
+    }
+  }
+}
+
+static void ensureoldstore(Location *loc, int ignorealiascount)
+{ /* If the last reference to loc was in a store instruction, ensure it
+     can't subsequently be discarded.
+     We can ignore stores to something which may be an alias of loc,
+     but not loads from a possible alias.
+   */
+  StoreAccessList *a = storeaccesses;
+  for (; a != NULL; a = cdr_(a), --ignorealiascount) {
+    if (locbase_(loc) != heapptr && LocInSet(loc, a->locs)) {
+      if (stores_r1(a->ic->op)) a->needed = YES;
+      return;
+    } else if (a->ic->op != J_NOOP && !stores_r1(a->ic->op) &&
+               ignorealiascount <= 0) {
+      bool notalias = YES;
+      LocSet *s = a->locs;
+      for (; s != NULL; s = cdr_(s))
+        if (possiblealias(loc, s->loc))
+          notalias = NO;
+        else {
+          notalias = YES; break;
+        }
+      if (!notalias) return;
     }
   }
 }
@@ -1836,8 +2256,10 @@ static void killoldunusedstore(Location *loc, int ignorealiascount)
 static Exprn *LocSetBase(LocSet *locs) {
   Exprn *base = NULL;
   for (; locs != NULL; locs = cdr_(locs))
-    if ((base = adconbase(locbase_(locs->loc), YES)) != NULL)
-      break;
+    if (!(loctype_(locs->loc) & LOC_anyVAR)) {
+      if ((base = adconbase(locbase_(locs->loc), YES)) != NULL)
+        break;
+    }
   return base;
 }
 
@@ -1849,30 +2271,40 @@ static int NonAliasLoadCount(LocSet *locs) {
   Exprn *base = (maxtype & LOC_anyVAR) ? NULL : LocSetBase(locs);
 
   for (; a != 0; a = cdr_(a), i++)
-    if (a->ic->op != J_NOOP && !stores_r1(a->ic->op) && maxtype != LOC_VAR) {
-      Location *loc1;
-      switch (MaxLocType(a->locs, &loc1)) {
+    if (a->ic->op != J_NOOP && !stores_r1(a->ic->op)) {
+      LocType type1; Location *loc1;
+      switch (type1 = MaxLocType(a->locs, &loc1)) {
       case LOC_VAR:
-        break;
-
       case LOC_PVAR:
-        if (maxtype == LOC_PVAR) {
-          if (locbind_(loc1) == locbind_(maxloc)) return i;
-        } else if (base == NULL)
-          return i;
+        if (maxtype == type1) {
+          if (locbind_(loc1) == locbind_(maxloc))
+            goto DoReturn;
+        } else if (base == NULL ||
+                   (exop_(base) == J_ADCONV && e1b_(base) == locbind_(loc1)))
+          goto DoReturn;
         break;
 
       default:
+        if (maxtype == LOC_VAR) break;
         { Exprn *base1 = LocSetBase(a->locs);
           if (base == NULL || base1 == NULL || base1 == base)
-            return i;
+            goto DoReturn;
         }
       }
     }
+DoReturn:
   return i;
 }
 
-static void storein_i(VRegnum r1, ExSet *val, LocSet *locs, bool isvolatile) {
+static void KillRedundantStore(void) {
+  if (debugging(DEBUG_CSE)) {
+    cc_msg("-- redundant "); jopprint_opname(currenticode->op);
+    cc_msg("\n");
+  }
+  currenticode->op = J_NOOP;
+}
+
+static bool storein_i(VRegnum r1, ExSet *val, LocSet *locs, bool isvolatile) {
   LocSet *p; ExSet *loadexs = NULL;
   VRegSetP loads = NULL;
   VRegSetP waslive = NULL;
@@ -1885,14 +2317,9 @@ static void storein_i(VRegnum r1, ExSet *val, LocSet *locs, bool isvolatile) {
   if (!isvolatile)
     for (p = locs; p != NULL; p = cdr_(p)) {
       if (ExSetsOverlap(p->oldval, val)) {
-        if (debugging(DEBUG_CSE)) {
-          cc_msg("-- redundant "); jopprint_opname(currenticode->op);
-          cc_msg("\n");
-        }
-        currenticode->op = J_NOOP;
         for (p = locs; p != NULL; p = cdr_(p))
           locvalue_(p->loc) = ExSet_Append(val, p->oldval);
-        return;
+        return YES;
       }
     }
   { int n = NonAliasLoadCount(locs);
@@ -1908,14 +2335,17 @@ static void storein_i(VRegnum r1, ExSet *val, LocSet *locs, bool isvolatile) {
       }
     }
   }
-  for (p = locs; p != NULL; p = cdr_(p)) {
-    ExSet_Discard(p->oldval);
-    if (loctype_(p->loc) & LOC_anyVAR)
-      setvar(p->loc, val, loads);
-    else
-      setmem(p->loc, val, loads);
-    useoldexprn(p->loc->load, U_NOTREF+U_STORE);
-    exwaslive_(p->loc->load) = YES;
+  { int uflags = U_NOTREF+U_STORE;
+    if (r1 == GAP) uflags |= U_NOTDEF2;
+    for (p = locs; p != NULL; p = cdr_(p)) {
+      ExSet_Discard(p->oldval);
+      if (loctype_(p->loc) & LOC_anyVAR)
+        setvar(p->loc, val, loads);
+      else
+        setmem(p->loc, val, loads);
+      useoldexprn(p->loc->load, uflags);
+      exwaslive_(p->loc->load) = YES;
+    }
   }
   cseset_discard(loads);
   cseset_discard(waslive);
@@ -1923,31 +2353,34 @@ static void storein_i(VRegnum r1, ExSet *val, LocSet *locs, bool isvolatile) {
     add_store_access(locs);
     setreg(r1, loadexs, NO);
   }
+  return NO;
 }
 
-static void storein(VRegnum r1, Location *loc, ExSet *val, bool isvolatile) {
-  storein_i(r1, val, LocSet_New(NULL, loc), isvolatile);
+static bool storein(VRegnum r1, Location *loc, ExSet *val, bool isvolatile) {
+  LocSet *locs = LocSet_New(NULL, loc);
+  if (locsynonym_(loc) != NULL) locs = LocSet_New(locs, locsynonym_(loc));
+  return storein_i(r1, val, locs, isvolatile);
 }
 
-static void storeink(VRegnum r1, ExSet *val, LocType type, int32 m,
+static bool storeink(VRegnum r1, ExSet *val, LocType type, int32 m,
                      J_OPCODE load, ExSet *bases, bool isvolatile) {
   LocSet *locs = NULL;
-  int32 flags = LOC_REALBASE;
   for (; bases != NULL; bases = cdr_(bases)) {
-    Location *loc = find_loc(type, bases->exprn, m, load, flags);
+    Location *loc = find_memloc(type, bases->exprn, m, load, LOC_REALBASE);
     if (loc != NULL) {
       locs = LocSet_New(locs, loc);
-      flags = 0;
+      if (locsynonym_(loc) != NULL) locs = LocSet_New(locs, locsynonym_(loc));
     }
   }
-  if (locs != NULL)
-    storein_i(r1, val, locs, isvolatile);
+  return (locs == NULL) ? NO :
+                          storein_i(r1, val, locs, isvolatile);
+
 }
 
 static VRegSetP deleteloadvariant(Location *loc, int32 variant, VRegSetP set)
 {
-    Exprn *e = find_exprn(exop_(loc->load) | variant, (Exprn *)loc, 0, NULL,
-                          U_NOTREF+U_NOTDEF+U_PEEK);
+    Exprn *e = find_loadexprn(exop_(loc->load) | variant, loc,
+                              U_NOTREF+U_NOTDEF+U_PEEK);
     if (e != NULL)
         return cseset_delete(exid_(e), set, NULL);
     else
@@ -1972,19 +2405,26 @@ static VRegSetP deleteloads(Location *loc, VRegSetP set)
 
 static bool validdisplacement(J_OPCODE op, int32 n) {
     int32 type = j_memsize(op);
-    int32 mink = TARGET_LDRK_MIN, maxk = TARGET_LDRK_MAX;
-    int32 quantum = 1;
-#ifdef TARGET_LDRFK_MAX
-    if (type == MEM_F || type == MEM_D) {
-        mink = TARGET_LDRFK_MIN;
-        maxk = TARGET_LDRFK_MAX;
+    int32 mink, maxk,
+          quantum = target_ldrk_quantum(locsize(loctype(op)),
+                                        (type == MEM_F || type == MEM_D));
+    switch (j_memsize(op)) {
+    case MEM_D: mink = TARGET_LDRDK_MIN, maxk = TARGET_LDRDK_MAX; break;
+    case MEM_F: mink = TARGET_LDRFK_MIN, maxk = TARGET_LDRFK_MAX; break;
+    case MEM_B: mink = TARGET_LDRBK_MIN, maxk = TARGET_LDRBK_MAX; break;
+    case MEM_W: mink = TARGET_LDRWK_MIN, maxk = TARGET_LDRWK_MAX; break;
+    case MEM_LL:mink = TARGET_LDRLK_MIN, maxk = TARGET_LDRLK_MAX; break;
+    default:    mink = TARGET_LDRK_MIN,  maxk = TARGET_LDRK_MAX;
     }
-#endif
-#ifdef TARGET_LDRK_QUANTUM
-    quantum = target_ldrk_quantum(locsize(loctype(op)),
-                                  (type == MEM_F || type == MEM_D));
-#endif
+    /* ECN: If J_ALIGN1 then this may be a byte access. */
+    /*      See also cg_limit_displacement in cg.c      */
+    if ((op & J_ALIGNMENT) == J_ALIGN1) {
+        if (TARGET_LDRBK_MIN > mink) mink = TARGET_LDRBK_MIN;
+        if (TARGET_LDRBK_MAX < maxk) maxk = TARGET_LDRBK_MAX;
+    }
 #ifdef TARGET_IS_ALPHA
+    /* /* Can this now be done via TARGET_LDRBK_MIN = TARGET_LDRBK_MAX = 0 etc ?? */
+    /* Why no corresponding code in cg.c ? */
     if (locsize(loctype(op)) < 4) return (n == 0);
 #endif
     return n >= mink && n <= maxk && (n & -quantum) == n;
@@ -1992,9 +2432,9 @@ static bool validdisplacement(J_OPCODE op, int32 n) {
 
 #endif /* TARGET_LDRK_MAX */
 
-static bool OpIs32MinusEx(Exprn *e, Exprn *ex) {
+static bool OpIs32MinusEx(Exprn const *e, Exprn const *ex) {
   if (exop_(e) == J_SUBR) {
-    Exprn *e1 = e1_(e);
+    Exprn const *e1 = e1_(e);
     return (exop_(e1) == J_MOVK && e1k_(e1) == 32 &&
             e2_(e) == ex);
   }
@@ -2063,6 +2503,54 @@ static Exprn *ORRR_IsRORR(ExSet *e1, ExSet *e2) {
 }
 #endif
 
+static bool BottomBitsKnownZero(ExSet *e, int32 n) {
+  ExSet *ex = OpInSet(e, J_ANDK, 0);
+  if (ex != NULL && (e2k_(ex->exprn) & ((1L << n) - 1L)) == 0)
+    return YES;
+  ex = OpInSet(e, J_SHLK, J_SIGNbits);
+  if (ex != NULL && e2k_(ex->exprn) >= n)
+    return YES;
+  return NO;
+}
+
+static bool TopBitsKnownZero_e(Exprn *e, int32 n) {
+  if (exop_(e) == J_ANDK) {
+    if ((e2k_(e) & (0xffffffffL << (32-n))) == 0)
+      return YES;
+  } else if (exop_(e) == J_SHRK+J_UNSIGNED) {
+    int32 shift = e2k_(e);
+    if (shift >= n)
+      return YES;
+    else
+      return TopBitsKnownZero_e(e1_(e), n - shift);
+  }
+#ifdef TARGET_HAS_SCALED_OPS
+  else if ((exop_(e) & ~(SHIFT_MASK<<J_SHIFTPOS)) == J_ANDR+(SHIFT_RIGHT<<J_SHIFTPOS)) {
+    int32 shift = (exop_(e) >> J_SHIFTPOS) & SHIFT_MASK;
+    if (shift >= n)
+      return YES;
+    else
+      return TopBitsKnownZero_e(e2_(e), n - shift);
+  }
+#endif
+  return NO;
+}
+
+static bool TopBitsKnownZero(ExSet *e, int32 n) {
+  ExSet *ex = OpInSet(e, J_ANDK, 0);
+  if (ex != NULL)
+    return TopBitsKnownZero_e(ex->exprn, n);
+  ex = OpInSet(e, J_SHRK+J_UNSIGNED, 0);
+  if (ex != NULL)
+    return TopBitsKnownZero_e(ex->exprn, n);
+#ifdef TARGET_HAS_SCALED_OPS
+  ex = OpInSet(e, J_ANDR+(SHIFT_RIGHT<<J_SHIFTPOS), SHIFT_MASK<<J_SHIFTPOS);
+  if (ex != NULL)
+    return TopBitsKnownZero_e(ex->exprn, n);
+#endif
+  return NO;
+}
+
 #if defined TARGET_HAS_SCALED_ADDRESSING || defined TARGET_HAS_SCALED_OPS || \
     defined TARGET_HAS_SCALED_ADD
 static bool ShiftedOutBitsKnownZero(J_OPCODE op, ExSet *e) {
@@ -2070,23 +2558,10 @@ static bool ShiftedOutBitsKnownZero(J_OPCODE op, ExSet *e) {
   int32 shiftby = shift & SHIFT_MASK;
   if (shiftby == 0)
       return YES;
-  else if (shift & SHIFT_RIGHT) {
-      ExSet *ex = OpInSet(e, J_ANDK, 0);
-      if (ex != NULL && (e2k_(ex->exprn) & ((1L << shiftby) - 1L)) == 0)
-          return YES;
-      ex = OpInSet(e, J_SHLK, J_SIGNbits);
-      if (ex != NULL && e2k_(ex->exprn) >= shiftby)
-          return YES;
-  } else {
-      ExSet *ex = OpInSet(e, J_ANDK, 0);
-      if (ex != NULL && (e2k_(ex->exprn) &
-                         (0xffffffffL << (32-shiftby)) &
-                         0xffffffffL) == 0)
-          return YES;
-      ex = OpInSet(e, J_SHRK+J_UNSIGNED, 0);
-      if (ex != NULL && e2k_(ex->exprn) >= shiftby)
-          return YES;
-  }
+  else if (shift & SHIFT_RIGHT)
+      return BottomBitsKnownZero(e, shiftby);
+  else
+      return TopBitsKnownZero(e, shiftby);
   return NO;
 }
 #endif
@@ -2134,7 +2609,8 @@ static ExSet *FindRRSet(int32 op, ExSet *a, ExSet *b, int flags) {
   return res;
 }
 
-static ExSet *FindRKSet(int32 op, ExSet *a, int32 m, int flags) {
+static ExSet *FindRKSet(int32 op, ExSet *a, IPtr m, int flags) {
+  /* m is union {int32,pointer} */
   ExSet *res = NULL;
   for (; a != NULL; a = cdr_(a)) {
     Exprn *e = find_exprn(op, a->exprn, (Exprn *)m, NULL, flags);
@@ -2152,14 +2628,14 @@ static struct {
 
 static ExSet *FindCallSet_aux(
     ExSet *arg[], Exprn *argex[], int32 argno, int32 maxarg, ExSet *res) {
-  ExSet *p = arg[argno];
-  for (; p != NULL; p = cdr_(p)) {
-    argex[argno] = p->exprn;
-    if (argno == maxarg) {
-      Exprn *e = find_exprn(J_CALLK, (Exprn *)fcsrec.f,
-                                     (Exprn *)fcsrec.argres, argex, 0);
-      if (e != NULL) res = ExSet_Insert(e, res);
-    } else {
+  if (argno > maxarg) {
+    Exprn *e = find_exprn(J_CALLK, (Exprn *)fcsrec.f,
+                                   (Exprn *)(IPtr)fcsrec.argres, argex, 0);
+    if (e != NULL) res = ExSet_Insert(e, res);
+  } else {
+    ExSet *p = arg[argno];
+    for (; p != NULL; p = cdr_(p)) {
+      argex[argno] = p->exprn;
       res = FindCallSet_aux(arg, argex, argno+1, maxarg, res);
     }
   }
@@ -2171,7 +2647,6 @@ static ExSet *FindCallSet(
   Exprn *argex[NANYARGREGS==0 ? 1 : NANYARGREGS];
 /* /* AM: the use of k_setflags_() to add a VREGSORT to replace a K_FLAGS  */
 /* field looks jolly dubious here...                                       */
-/* Also, this code dies (ill mem ref) if k_argregs_(argdesc) == 0.         */
   if (debugging(DEBUG_CSE))
     cc_msg("FindCallset $b %lx %lx\n", f, restype, argdesc);
   fcsrec.f = f; fcsrec.argres = k_setflags_(argdesc, restype);
@@ -2210,7 +2685,7 @@ static LocSet *rr_locs(J_OPCODE op, ExSet *e1, ExSet *e2) {
   LocSet *locs = NULL;
   for (; rrset != NULL; rrset = cdr_(rrset))
     locs = LocSet_New(locs,
-                find_loc(loctype(op), rrset->exprn, 0, j_to_ldrk(op), 0));
+                find_memloc(loctype(op), rrset->exprn, 0, j_to_ldrk(op), 0));
   return locs;
 }
 
@@ -2224,15 +2699,20 @@ typedef struct {
 static bool WorthTryingLocalCSE(Exprn *e, void *w) {
   WTLRec *wp = (WTLRec *)w;
   bool answ;
-  if (debugging(DEBUG_CSE) && CSEDebugLevel(2))
-    { cc_msg("WorthTrying %d(%lx %ld) ", exwaslive_(e),
-                                         (long)wp->op, (long)wp->r1);
-      cse_print_node(e);
-    }
-  answ = ( ( wp->isload &&
-             ( extype_(e) != E_LOAD || !LocSet_Member(exloc_(e), wp->locs))
-             /* That is, e is a propagated value */
-           ) ||
+  if (debugging(DEBUG_CSE) && CSEDebugLevel(2)) {
+    cc_msg("WorthTrying %ld(", (long)exid_(e));
+    jopprint_opname(wp->op);
+    cc_msg("%ld) %d ", (long)wp->r1, exwaslive_(e));
+  }
+  answ =
+#if 0
+         ( wp->isload &&
+           ( extype_(e) != E_LOAD ||
+             !LocSet_Member(exloc_(e), wp->locs)
+           )
+         ) /* That is, e is a propagated value */
+           ? NO :
+#endif
            ( ( exwaslive_(e) ||
                ( exop_(e) == J_RESULT2 &&
                  exwaslive_(e1_(e))
@@ -2252,8 +2732,8 @@ static bool WorthTryingLocalCSE(Exprn *e, void *w) {
             !( isany_realreg_(wp->r1) &&
                  (wp->op == J_MOVK || wp->op == J_ADCON || wp->op == J_ADCONV)
              )
-           )
-         );
+           );
+
   if (debugging(DEBUG_CSE) && CSEDebugLevel(2))
     cc_msg("=> %d\n", answ);
   return answ;
@@ -2278,6 +2758,7 @@ struct SavedLocVals {
   StoreAccessList *storeaccesses;
   RegValue *exportedregs;
 };
+#define mkSavedLocVals(a,b,c,d,e) (SavedLocVals *)syn_list5(a,b,c,d,e)
 
 typedef struct {
   int32 mask;
@@ -2298,8 +2779,8 @@ static void PrintSavedLocVals(LocValList *p, const char *s1, const char *s2) {
 
 #else
 
-static void PrintSavedLocVals(LocValList *p) {
-  IGNORE(p);
+static void PrintSavedLocVals(LocValList *p, const char *s1, const char *s2) {
+  IGNORE(p); IGNORE(s1); IGNORE(s2);
 }
 
 #endif
@@ -2346,6 +2827,22 @@ static LocValList *LocValList_Intersect(LocValList *a, LocValList *b) {
   return a;
 }
 
+static RegValue *MergeRegValues(RegValue *rv1, RegValue *rv2) {
+  RegValue *res = NULL;
+  for (; rv2 != NULL; rv2 = cdr_(rv2)) {
+    VRegnum r = rv2->reg;
+    RegValue *p = rv1;
+    for (; p != NULL; p = cdr_(p))
+      if (p->reg == r) {
+        ExSet *ex = ExSet_Copy(p->value);
+        ex = ExSet_Intersection(ex, rv2->value);
+        if (ex != NULL) res = RegValue_New(res, r, ex);
+        break;
+      }
+  }
+  return res;
+}
+
 static void ImportLocVals(BlockHead *block) {
   if (blk_pred_(block) != NULL && !(var_cc_private_flags & 64L)) {
     if (debugging(DEBUG_CSE) && CSEDebugLevel(2)) {
@@ -2371,7 +2868,7 @@ static void ImportLocVals(BlockHead *block) {
       knownregs = sv->exportedregs;
       for (; (sv = cdr_(sv)) != NULL; ) {
         vals = LocValList_Intersect(vals, sv->locvals);
-        if (sv->exportedregs != NULL) knownregs = sv->exportedregs;
+        knownregs = MergeRegValues(knownregs, sv->exportedregs);
       }
       if (debugging(DEBUG_CSE) && CSEDebugLevel(2))
         if (blk_pred_(block)->blklstcdr != NULL)
@@ -2405,7 +2902,7 @@ static void ImportLocVals(BlockHead *block) {
 
 static void SavedLocVals_Add(BlockHead *block, BlockHead *b, LocValList *lv,
                              StoreAccessList *sa, RegValue *rv) {
-  blk_locvals_(block) = (SavedLocVals *)syn_list5(blk_locvals_(block), b, lv, sa, rv);
+  blk_locvals_(block) = mkSavedLocVals(blk_locvals_(block), b, lv, sa, rv);
 }
 
 static void SaveLocVals(
@@ -2430,7 +2927,7 @@ static void SaveLocVals(
             n1 += e2k_(r2ex);
         }
         if (loc != NULL) {
-          Exprn *ex = find_exprn(op, (Exprn *)n1, NULL, NULL, U_NOTDEF2+U_NOTREF);
+          Exprn *ex = find_exprn(op, (Exprn *)(IPtr)n1, NULL, NULL, U_NOTDEF2+U_NOTREF);
           LocValList *p = LocValList_FindLoc(lv, loc);
           if (p == NULL)
             lv = LocValList_New(lv, loc, ExprnToSet(ex));
@@ -2443,13 +2940,25 @@ static void SaveLocVals(
   }
 }
 
-static RegValue *ExportedR2Val(CmpRec *cmpk, LabelNumber *lab) {
+static RegValue *RegValueForReg(VRegnum r) {
+  ExSet *rvals = valueinreg(r);
+  return (rvals == NULL) ? NULL :
+                           RegValue_New(NULL, r, ExSet_Copy(rvals));
+}
+
+static RegValue *ExportedR2Val(BlockHead *bfrom, CmpRec *cmpk, LabelNumber *lab) {
   if (!is_exit_label(lab) && !blk_scanned_(lab->block)) {
-    BlockHead *b = lab->block;
-    if ((blkflags_(b) & BLK2EXIT) && blklength_(b) <= 1) {
-      ExSet *rvals = valueinreg(cmpk->r2);
-      if (rvals != NULL)
-        return RegValue_New(NULL, cmpk->r2, ExSet_Copy(rvals));
+    BlockHead *bto = lab->block;
+    if ((blkflags_(bto) & BLK2EXIT && blklength_(bto) <= 1) ||
+        (cmpk->mask != Q_AL && (blkflags_(bfrom) & BLKREXPORTED)))
+      return RegValueForReg(cmpk->r2);
+    else if (blklength_(bfrom) == 0) {
+      RegValue *rv = knownregs, *p = NULL;
+      for (; rv != NULL; rv = cdr_(rv)) {
+        RegValue *q = RegValueForReg(rv->reg);
+        if (q != NULL) { cdr_(q) = p; p = q; }
+      }
+      return p;
     }
   }
   return NULL;
@@ -2470,13 +2979,17 @@ static void RewriteNext(BlockHead *b, LabelNumber *oldlab, LabelNumber *newlab,
     if (blknext_(b) == oldlab)
       ok = YES, blknext_(b) = newlab;
   }
-  if (!ok) syserr("RewriteNext %ld: %ld", blklabname_(b), lab_name_(oldlab));
+  if (!ok) syserr(cse_rewritenext, blklabname_(b), lab_name_(oldlab));
   if (!is_exit_label(newlab)) {
     BlockHead *newdest = newlab->block;
-    if (cse_AddPredecessor(newlab, b))
+    if (cse_AddPredecessor(newlab, b) && !blk_scanned_(newlab->block)) {
+      RegValue *rv =  sv->exportedregs;
+      RegValue *newrv = rv == NULL ? NULL :
+          RegValue_New(NULL, rv->reg, ExSet_Copy(rv->value));
       SavedLocVals_Add(newdest, sv->exporter, LocValList_Copy(sv->locvals),
-                                StoreAccessList_Copy(sv->storeaccesses), sv->exportedregs);
-    else {
+                                StoreAccessList_Copy(sv->storeaccesses),
+                                newrv);
+    } else {
       SavedLocVals *newsv = blk_locvals_(newdest);
       for (; newsv != NULL; newsv = cdr_(newsv))
         if (newsv->exporter == b) {
@@ -2493,17 +3006,18 @@ static void ExportLocVals(BlockHead *block, CmpRec *cmpk, bool sideeffectfree) {
   SavedLocVals *sv = blk_locvals_(block);
   LocValList *locvals = NULL;
   if (sideeffectfree &&
-      !(blkflags_(block) & (BLKLOOP|BLK2EXIT|BLKSWITCH)) &&
+      !(blkflags_(block) & (BLKLOOP|BLK2EXIT|BLKSWITCH|BLKREXPORTED)) &&
       !is_exit_label(blknext_(block)) && !blk_scanned_(blknext_(block)->block)) {
     LabelNumber *lab = blklab_(block);
-    for (; sv != NULL; sv = cdr_(sv)) {
-      BlockHead *prev = sv->exporter;
-      if (debugging(DEBUG_CSE) && CSEDebugLevel(2))
-        cc_msg("Block %ld successor rewritten from %ld to %ld\n",
-               blklabname_(prev), lab_name_(lab), lab_name_(blknext_(block)));
-      RewriteNext(prev, lab, blknext_(block), sv);
-      KillArc(prev, lab);
-    }
+    if (lab != blknext_(block))
+      for (; sv != NULL; sv = cdr_(sv)) {
+        BlockHead *prev = sv->exporter;
+        if (debugging(DEBUG_CSE) && CSEDebugLevel(2))
+          cc_msg("Block %ld successor rewritten from %ld to %ld\n",
+                 blklabname_(prev), lab_name_(lab), lab_name_(blknext_(block)));
+        RewriteNext(prev, lab, blknext_(block), sv);
+        KillArc(prev, lab);
+      }
   }
   for (sv = blk_locvals_(block); sv != NULL; sv = cdr_(sv)) {
     LocValList *lv = sv->locvals;
@@ -2533,8 +3047,7 @@ static void ExportLocVals(BlockHead *block, CmpRec *cmpk, bool sideeffectfree) {
       if (blkflags_(block) & BLKSWITCH) {
         int32 n = blktabsize_(block);
         LabelNumber **table = (LabelNumber **)CSEAlloc(n * sizeof(LabelNumber *));
-        memcpy((void *)table, (void *)blktable_(block),
-               (size_t)n * sizeof(LabelNumber *));
+        memcpy(table, blktable_(block), (size_t)n * sizeof(LabelNumber *));
         while (--n > 0) {
           LabelNumber *lab = table[n];
           if (lab != NULL) {
@@ -2558,9 +3071,9 @@ static void ExportLocVals(BlockHead *block, CmpRec *cmpk, bool sideeffectfree) {
         else
           op = op1 = J_NOOP;
         SaveLocVals(block, blknext1_(block), locvals, op1, cmpk->r2vals, cmpk->m,
-                    NULL, ExportedR2Val(cmpk, blknext1_(block)));
+                    NULL, ExportedR2Val(block, cmpk, blknext1_(block)));
         SaveLocVals(block, blknext_(block), locvals, op, cmpk->r2vals, cmpk->m,
-                    NULL, ExportedR2Val(cmpk, blknext_(block)));
+                    NULL, ExportedR2Val(block, cmpk, blknext_(block)));
 
       } else {
       /* Remove from storeaccesses everything that isn't live, since
@@ -2579,8 +3092,17 @@ static void ExportLocVals(BlockHead *block, CmpRec *cmpk, bool sideeffectfree) {
           else
             slp = &cdr_(sl);
         }
-        SaveLocVals(block, blknext_(block), locvals, J_NOOP, NULL, 0, storeaccesses,
-                    cmpk->mask == Q_AL ? NULL : ExportedR2Val(cmpk, blknext_(block)));
+        { RegValue *exportedr = NULL;
+          if (cmpk->mask != Q_AL)
+            exportedr = ExportedR2Val(block, cmpk, blknext_(block));
+          else if (blklength_(block) != 0) {
+            Icode *ic = &blkcode_(block)[blklength_(block)-1];
+            if (loads_r1(ic->op))
+              exportedr = RegValueForReg(ic->r1.r);
+          }
+          SaveLocVals(block, blknext_(block), locvals, J_NOOP, NULL, 0,
+                      storeaccesses, exportedr);
+        }
       }
     }
   }
@@ -2604,13 +3126,15 @@ static void MaybeKillBranchToBlock(BlockHead *block, ExSet *e1, int32 m) {
               BlockHead *prev = sv->exporter;
               LabelNumber *lab = blklab_(block);
               LabelNumber *nextlab = ComparisonDest(e1k_(c1->exprn), m, block);
-              if (debugging(DEBUG_CSE) && CSEDebugLevel(2))
-                cc_msg("Block %ld successor rewritten from %ld to %ld\n",
-                       blklabname_(prev), lab_name_(lab), lab_name_(nextlab));
+              if (lab != nextlab) {
+                if (debugging(DEBUG_CSE) && CSEDebugLevel(2))
+                  cc_msg("Block %ld successor rewritten from %ld to %ld\n",
+                         blklabname_(prev), lab_name_(lab), lab_name_(nextlab));
 
-              RewriteNext(prev, lab, nextlab, sv);
-              KillArc(prev, lab);
-              break;
+                RewriteNext(prev, lab, nextlab, sv);
+                KillArc(prev, lab);
+                break;
+              }
             }
           }
         }
@@ -2665,9 +3189,6 @@ static bool store_isvolatile(Icode *c, Icode *limit)
 
 static void cse_scanblock(BlockHead *block)
 {
-#define find_adconv(m) \
-  find_exprn(J_ADCONV, (Exprn *) m, 0, NULL, U_NOTDEF+U_NOTREF)
-
   Icode *c, *limit;
   CmpRec cmpk;
   LocSet *locs = NULL;
@@ -2677,6 +3198,7 @@ static void cse_scanblock(BlockHead *block)
   LabelNumber *exit1 = blknext1_(block); /* a compare) before we reach the end.  */
 #endif
   bool sideeffectfree = YES;
+  int callcount = 0;
   VRegSetP setnotused = NULL;
   bool istop = block == top_block;
   cmpk.mask = Q_AL;
@@ -2691,6 +3213,7 @@ static void cse_scanblock(BlockHead *block)
     Exprn *node = NULL;
     int32 op = c->op;
     VRegInt r1 = c->r1, r2 = c->r2, m = c->m;
+    int32 atmp;
     bool isload = NO,
          isvolatile = NO,
          symmetric = NO;
@@ -2705,11 +3228,7 @@ static void cse_scanblock(BlockHead *block)
 
     if (reads_r1(op)) { e1 = valueinreg(r1.r); cseset_delete(r1.r, setnotused, NULL); }
     if (reads_r2(op)) { e1 = valueinreg(r2.r); cseset_delete(r2.r, setnotused, NULL); }
-    if (reads_r3(op)) {
-        e2 = valueinreg(m.r);
-        cseset_delete(m.r, setnotused, NULL);
-    } else
-        e2 = (ExSet *)DUFF_ADDR;
+    if (reads_r3(op)) { e2 = valueinreg(m.r); cseset_delete(m.r, setnotused, NULL); }
 
     if (loads_r1(op)) {
       if (isproccall_(op)) {
@@ -2724,7 +3243,7 @@ static void cse_scanblock(BlockHead *block)
         for (i=0; i<NFLTARGREGS; i++)
           cseset_delete(R_FA1+i, setnotused, NULL);
 #endif
-      } else
+      } else if (op != J_INIT && op != J_INITF && op != J_INITD)
         cseset_insert(r1.r, setnotused, NULL);
     }
     switch (op & J_TABLE_BITS) {
@@ -2749,6 +3268,27 @@ static void cse_scanblock(BlockHead *block)
       }
       break;
 #endif
+    /* use 'sign bit clear' to map signed div/rem to shift/and ops.     */
+    case J_DIVK:
+      if (!opisshifted(op) && OpInSetFn(e1,SignBitClear)) {
+        int32 k = power_of_two(m.i);
+        if (k != -1) {
+          c->m.i = m.i = k;
+          c->op = op = op & ~(J_DIVK|J_UNSIGNED|J_SIGNED) | (J_SHRK|J_UNSIGNED);
+          OpRewritten(c);
+        }
+      }
+      break;
+    case J_REMK:
+      if (!opisshifted(op) && OpInSetFn(e1,SignBitClear)) {
+        int32 k = power_of_two(m.i);
+        if (k != -1) {
+          c->m.i = m.i = (1<<k) - 1;
+          c->op = op = op & ~(J_REMK|J_UNSIGNED|J_SIGNED) | J_ANDK;
+          OpRewritten(c);
+        }
+      }
+      break;
 
 #ifdef TARGET_HAS_ROTATE
 /* It is probably best to treat ROTATEs like SHIFT.  There are hence    */
@@ -2802,9 +3342,9 @@ static void cse_scanblock(BlockHead *block)
           ExSet *c1 = MOVKinSet(e1);
           if (c1 != NULL) {
             shift &= SHIFT_MASK;
-            /* We should use a utility function for such bit masks...   */
-            if (e1k_(c1->exprn) == (shift==0 ? -1 : (1L << (32-shift)) - 1))
-            { c->op = op = J_SHRK | J_UNSIGNED;
+            if ((e1k_(c1->exprn) & 0xffffffff) ==
+                 (1L << (32 - shift)) - 1L) {
+              c->op = op = J_SHRK | J_UNSIGNED;
               c->r2 = m;
               c->m.i = m.i = shift;
               OpRewritten(c);
@@ -2814,12 +3354,7 @@ static void cse_scanblock(BlockHead *block)
           }
         } else if (shift == 0)
 #endif
-#ifndef TARGET_IS_XAP
           {
-          /* The following code replaces both (x>>y) & ~(-1<<32-y) and  */
-          /* (x>>y) & (1<<32-y)-1 with (unsigned)x >> y.                */
-          /* This is good on all hosts, but the code below doesn't work */
-          /* on the XAP w.r.t 16-bit int/32-bit long.                   */
           Exprn *shex = SHRR_IsLogical(e1, e2);
           if (shex != NULL && IsLive(shex)) {
             Icode *ip = &useicode_(exuses_(shex));
@@ -2831,7 +3366,20 @@ static void cse_scanblock(BlockHead *block)
             OpRewritten(c);
           }
         }
-#endif
+      }
+      break;
+
+    case J_ANDK:
+      if (m.i != -1)
+      { int32 k = ~m.i;
+        int32 lowones = logbase2(k & -k);
+        if (TopBitsKnownZero(e1, 32 - lowones)) {
+          c->op = op = J_MOVR;
+          c->m = m = r2;
+          c->r2.r = r2.r = GAP;
+          OpRewritten(c);
+          e2 = e1; e1 = NULL;
+        }
       }
       break;
     }
@@ -2844,6 +3392,16 @@ static void cse_scanblock(BlockHead *block)
         c->r2.i = r2.i = k_setresultregs_(r2.i, 2);
 #endif
     case J_CALLR:
+      if (e2 != NULL) {
+      /* (won't be if op is J_CALLK) */
+        ExSet *e = OpInSet(e2, J_ADCON, 0);
+        if (e != NULL) {
+          c->op = op = J_CALLK;
+          c->m.b = m.b = e1b_(e->exprn);
+          OpRewritten(c);
+          e2 = NULL;
+        }
+      }
     case J_OPSYSK:  /* @@@ pure OPSYSK */
       { int32 i;
         sideeffectfree = NO;
@@ -2857,6 +3415,7 @@ static void cse_scanblock(BlockHead *block)
         { ExSet *arg[NANYARGREGS==0 ? 1 : NANYARGREGS];
           int32 val;
           int32 nargs = k_argregs_(r2.i);
+          DbleBin dres;
           for (i = 0 ; i < nargs; i++)
             arg[i] = valueinreg(k_argisfp_(r2.i,i) ? R_FA1+i :
 #ifdef TARGET_FP_ARGS_IN_FP_REGS
@@ -2865,9 +3424,11 @@ static void cse_scanblock(BlockHead *block)
                                 R_A1+i);
 #endif
           if (evaluablecall((Expr *)m.b, r1.r, r2.i, arg, &val)) {
+#if 0
             c = trytokillargs(c, blkcode_(block), (c+1) < limit);
             currenticode = c;
-            c->m.i  = val;
+#endif
+            m.i  = val;
             r1 = c->r1;
             goto ForgeMOVK;
           }
@@ -2882,15 +3443,14 @@ static void cse_scanblock(BlockHead *block)
 
             ExSet *v1 = MOVKinSet(arg[0]);
             if (v1 != NULL && e1k_(v1->exprn) == 10) {
-              const VRegnum a1 = R_A1, a2 = R_A1+1;
               Icode *a1p = NULL, *a2p = NULL;
               Icode *p = c, *base = blkcode_(block);
               for (; --p >= base; ) {
                 if (loads_r1(p->op)) {
-                  if (a1p == NULL && p->r1.r == a1) {
+                  if (a1p == NULL && p->r1.r == R_A1) {
                     a1p = p;
                     if (a2p != NULL) break;
-                  } else if (a2p == NULL && p->r1.r == a2) {
+                  } else if (a2p == NULL && p->r1.r == R_A1+1) {
                     a2p = p;
                     if (a1p != NULL) break;
                   }
@@ -2898,7 +3458,7 @@ static void cse_scanblock(BlockHead *block)
               }
               if (a1p != NULL && a2p != NULL) {
                 arg[0] = arg[1];
-                a2p->r1.r = a1;
+                a2p->r1.r = R_A1;
                 a1p->r1.r = vregister(INTREG);
                 r2.i = c->r2.i = k_argdesc_(1, 0, 1, 0, 2, r2.i & K_FLAGS);
                 m.b = c->m.b =
@@ -2913,6 +3473,39 @@ static void cse_scanblock(BlockHead *block)
             }
           }
 #endif
+#ifdef SOFTWARE_FLOATING_POINT
+          if (software_floating_point_enabled &&
+              k_resultregs_(r2.i) > 1 &&
+              EvalSFP_D((Expr *)m.b, nargs, arg, &dres)) {
+            Icode *prev2 = c-2,
+                  *prev1 = c-1;
+            if (prev2 > blkcode_(block) &&
+                loads_r1(prev2->op) && prev2->r1.r < nargs &&
+                loads_r1(prev1->op) && prev1->r1.r < nargs) {
+              FloatCon *fc = real_of_string("expr", 0);
+              VRegnum r = vregister(ADDRREG);
+              fc->floatlen = bitoftype_(s_double);
+              fc->floatbin.db = dres;
+              prev2->op = J_ADCOND; prev2->r1.r = r; prev2->r2.r = GAP; prev2->m.f = fc;
+              prev1->op = J_LDRK+J_ALIGN4; prev1->r1.r = R_A1; prev1->r2.r = r; prev1->m.i = 0;
+              op = c->op = J_LDRK+J_ALIGN4; r1.r = c->r1.r = R_A1+1; r2.r = c->r2.r = r; m.i = c->m.i = 4;
+              currenticode = prev2;
+              { Exprn *base = find_exprn(J_ADCOND, (Exprn *)canonicalfpconst(fc), 0, NULL, 0);
+                Location *loc; LocSet *locs;
+                currenticode = prev1;
+                loc = find_memloc(loctype(op), base, 0, J_LDRK, LOC_REALBASE);
+                locs = LocSet_New(NULL, loc);
+                setreg(R_A1, locs_read(locs, 0, op), YES);
+                currenticode = c;
+                loc = find_memloc(loctype(op), base, 4, J_LDRK, LOC_REALBASE);
+                locs = LocSet_New(NULL, loc);
+                values = locs_read(locs, 0, op);
+              }
+              break;
+            }
+          }
+#endif
+
 /* It is not clear to AM that we need vregsort below, the reg suffices! */
           if (k_resultregs_(r2.i) > 1 && r1.r != R_A1) {
             values = FindRes2CallSet(m.b, vregsort(r1.r), r2.i, arg, c);
@@ -2922,6 +3515,7 @@ static void cse_scanblock(BlockHead *block)
         } else {
           corruptmem();
         }
+        callcount++;
 /* @@@ This set of things amounts to  'corrupt all non-callee-save registers'.
    Is there a better way to express this now? */
 /* /* @@@ REVIEW/bugfix in the light of ACN code to preserve such regs in */
@@ -2948,26 +3542,52 @@ static void cse_scanblock(BlockHead *block)
       break;
 
     case J_ADCON:
-    case J_FNCON:
-    case J_ADCONV:
-      node = find_exprn(op, (Exprn *)m.b, 0, NULL, 0);
+      node = find_unaryb(op, m.b, 0);
+      if (m.b != datasegment &&
+          ((bindstg_(m.b) & (bitofstg_(s_static)+u_loctype+b_undef+b_fnconst)) == bitofstg_(s_static)) &&
+          bindaddr_(m.b) == 0) {
+        values = ExprnToSet(node);
+        node = find_unaryb(op, datasegment, 0);
+        values = ExSet_Insert(node, values);
+      }
       break;
 
-    case J_PUSHW:
+    case J_FNCON:
+    case J_ADCONV:
+      node = find_unaryb(op, m.b, 0);
+      break;
+
     case J_PUSHR:
     case J_PUSHF:
     case J_PUSHL:
     case J_PUSHD:
+      sideeffectfree = NO;
       break;
 
     case J_LDRVK:  case J_LDRLVK:
     case J_LDRFVK: case J_LDRDVK:
     case J_LDRBVK: case J_LDRWVK:
-      { Exprn *base = find_adconv(m.b);
+TransformedToLDRVK:
+      { Exprn *base = find_unaryb(J_ADCONV, m.b, U_NOTDEF+U_NOTREF);
         isvolatile = load_isvolatile(c,limit);
         locs = LocSet_New(NULL,
-                    find_loc(loctype(op), base, r2.r, j_to_ldrk(op), 0));
+                    find_memloc(loctype(op), base, r2.i, j_to_ldrk(op), 0));
         values = locs_read(locs, 0, op);
+        if (op == J_LDRVK) {
+          StoreAccessList *a = storeaccesses;
+          for (; a != NULL; a = cdr_(a))
+            if (a->ic->op != J_NOOP && stores_r1(a->ic->op)) {
+              if (IsLive(locs->loc->load) && LocSet_Member(locs->loc, a->locs)) {
+                c->op = op = J_MOVR;
+                c->r2.r = r2.r = GAP;
+                c->m = m = a->ic->r1;
+                OpRewritten(c);
+              } else
+                a = NULL;
+              break;
+            }
+          if (a != NULL) break;
+        }
       }
       isload = YES;
       break;
@@ -2975,13 +3595,14 @@ static void cse_scanblock(BlockHead *block)
     case J_STRVK:  case J_STRLVK:
     case J_STRFVK: case J_STRDVK:
     case J_STRBVK: case J_STRWVK:
-      { Exprn *base = find_adconv(m.b);
+TransformedToSTRVK:
+      { Exprn *base = find_unaryb(J_ADCONV, m.b, U_NOTDEF+U_NOTREF);
         ExSet *val = valueinreg(r1.r);
         isvolatile = store_isvolatile(c,limit);
         sideeffectfree = NO;
         locs = LocSet_New(NULL,
-                    find_loc(loctype(op), base, r2.r, j_to_ldrk(op), 0));
-        storein_i(r1.r, val, locs, isvolatile);
+                    find_memloc(loctype(op), base, r2.i, j_to_ldrk(op), 0));
+        if (storein_i(r1.r, val, locs, isvolatile)) KillRedundantStore();
       }
       break;
 
@@ -3014,11 +3635,21 @@ static void cse_scanblock(BlockHead *block)
       e1 = readreg(r2.r);
 TransformedToLDRK:
       { ExSet *p = e1;
+        AdconRec ad;
+        J_OPCODE adcon = AdconInSet(p, &ad);
+        if (adcon == J_ADCONV) {
+          c->op = op = J_addvk(op);
+          c->r2.i = r2.i = m.i + ad.k;
+          c->m.b = m.b = ad.base;
+          OpRewritten(c);
+          goto TransformedToLDRVK;
+        } else if (adcon == J_ADCON && (ad.k & 3) == 0)
+          c->op = op |= J_BASEALIGN4;
         isvolatile = load_isvolatile(c,limit);
         locs = NULL;
         for (; p != NULL; p = cdr_(p)) {
           Location *loc =
-            find_loc(loctype(op), p->exprn, m.i, j_to_ldrk(op), LOC_REALBASE);
+            find_memloc(loctype(op), p->exprn, m.i, j_to_ldrk(op), LOC_REALBASE);
           if (loc != NULL) locs = LocSet_New(locs, loc);
         }
       }
@@ -3046,7 +3677,8 @@ TransformedToLDRK:
         }
         isvolatile = store_isvolatile(c,limit);
         locs = rr_locs(op, e1, e2);
-        if (locs != NULL) storein_i(r1.r, valuesToStore, locs, isvolatile);
+        if (locs != NULL && storein_i(r1.r, valuesToStore, locs, isvolatile))
+          KillRedundantStore();
       }
       break;
 
@@ -3058,45 +3690,55 @@ TransformedToLDRK:
       e1 = readreg(r2.r);
 TransformedToSTRK:
       { AdconRec ad;
-        isvolatile = store_isvolatile(c,limit);
-        if (AdconInSet(e1, &ad) == J_ADCONV) {
-          Exprn *base = find_adconv(ad.base);
+        J_OPCODE adcon = AdconInSet(e1, &ad);
+        if (adcon == J_ADCONV) {
           op = c->op = J_addvk(op);
           r2.r = c->r2.r = m.i + ad.k;
           m.b = c->m.b = ad.base;
           OpRewritten(c);
-
-          locs = LocSet_New(NULL,
-                        find_loc(loctype(op), base, r2.r, j_to_ldrk(op), 0));
-          storein_i(r1.r, valuesToStore, locs, isvolatile);
-        } else
-          storeink(r1.r, valuesToStore, loctype(op), m.i, j_to_ldrk(op), e1, isvolatile);
+          e1 = valuesToStore;
+          goto TransformedToSTRVK;
+        } else if (adcon == J_ADCON && (ad.k & 3) == 0)
+          c->op = op |= J_BASEALIGN4;
+        isvolatile = store_isvolatile(c,limit);
+        if (storeink(r1.r, valuesToStore, loctype(op), m.i, j_to_ldrk(op), e1, isvolatile))
+          KillRedundantStore();
       }
       break;
 
-    case J_LDRBV1: case J_LDRWV1:
     case J_LDRV1: case J_LDRLV1: case J_LDRFV1: case J_LDRDV1:
-      op = J_V1toV(op);
-    case J_LDRBV: case J_LDRWV:
+      break;
     case J_LDRV: case J_LDRLV: case J_LDRFV: case J_LDRDV:
       isvolatile = load_isvolatile(c,limit);
-      locs = LocSet_New(NULL, find_loc(LOC_VAR, NULL, m.i, j_to_ldrk(op), 0));
+      locs = LocSet_New(NULL, find_varloc(m.b, j_to_ldrk(op), 0));
       values = locs_read(locs, 0, op);
       isload = YES;
       break;
 
-    case J_STRBV: case J_STRWV:
     case J_STRV: case J_STRLV: case J_STRFV: case J_STRDV:
       isvolatile = store_isvolatile(c,limit);
       sideeffectfree = NO;
-      locs = LocSet_New(NULL, find_loc(LOC_VAR, NULL, m.i, j_to_ldrk(op), 0));
-      storein_i(r1.r, e1, locs, isvolatile);
+      locs = LocSet_New(NULL, find_varloc(m.b, j_to_ldrk(op), 0));
+      if (storein_i(r1.r, e1, locs, isvolatile))
+        KillRedundantStore();
       break;
 
+    ForgeMOVR:
+      e2 = ExSet_Copy(e1); e1 = NULL;
+      c->op = op = J_MOVR;
+      c->m.r = m.r = r2.r;
+      c->r2.r = r2.r = GAP;
+      OpRewritten(c);
+
     case J_MOVR:
-/*      if (EvalUnary(op, &c->m.i, e2)) goto ForgeMOVK;*/
+#ifdef never
+>>      if (EvalUnary(op, &atmp, e2))
+>>      {   m.i = atmp;
+>>          goto ForgeMOVK;
+>>      }
+#endif
       if (isany_realreg_(m.r) && e2 == NULL) {
-        node = find_exprn(CSE_LOADR, (Exprn *)m.r, 0, NULL, U_NOTDEF2+U_NOTREF);
+        node = find_loadr(m.r, U_NOTDEF2+U_NOTREF);
         if (istop) {
         /* handle the MOVR virtreg, realreg jopcodes present at function entry
            to initialise argument binders (really, these ought to be STRVs)
@@ -3105,25 +3747,33 @@ TransformedToSTRK:
           for (; bl != NULL; bl = bl->bindlistcdr)
             if (r1.r == bindxx_(bl->bindlistcar)) {
               /* j_to_ldrk(J_LDRK) */
-              Location *loc = find_loc(LOC_VAR, NULL, (int32)bl->bindlistcar,
+              Location *loc = find_varloc(bl->bindlistcar,
 /* TARGET_IS_ALPHA? */                 J_LDRK|J_ALIGN4, 0);
-              storein(GAP, loc, ExprnToSet(node), NO);
+              if (storein(GAP, loc, ExprnToSet(node), NO))
+                KillRedundantStore();
               break;
             }
         }
         break;
-      } 
-      else if (isany_realreg_(r1.r)) {
+      }
+      else if (isany_realreg_(r1.r))
+#ifdef TARGET_IS_MIPS
+      /* Just like on the XAP, we cannot keep $2 (R_IP2) live over      */
+      /* an op such as ANDR, ANDK or STRK which may need to use it.     */
+      if (!(mips_opt & 1) || mips_opt_zh(7))
+#endif
+      {
 #ifndef TARGET_IS_XAP         /* can't keep phys reg r0 live over shift */
         ExSet *e = OpInSet(e2, CSE_LOADR, 0);
         if (e != NULL && exloadr_(e->exprn) == r1.r) {
           m.r = c->m.r = r1.r;
           OpRewritten(c);
+          values = e2;
           break;
         }
 #endif
       }
-      /* drop through! */
+      /* drop through */
     case J_MOVFR: case J_MOVDR:
       if (e2 != NULL) {
         values = e2;
@@ -3143,26 +3793,60 @@ TransformedToSTRK:
          Also, they may (depending on target) destroy some registers.
          Because this is in flux, there are no written rules.
        */
-      e1 = valueinreg(r1.r);
-      { ExSet *c1 = OpInSet(e1, J_ADCON, 0);
+      e2 = valueinreg(r1.r);
+      { ExSet *c1 = OpInSet(e2, J_ADCON, 0);
         sideeffectfree = NO;
-        if (c1 == NULL) c1 = OpInSet(e1, J_ADCONV, 0);
+        if (c1 == NULL) c1 = OpInSet(e2, J_ADCONV, 0);
         if (c1 == NULL) {
           corruptmem();
         } else {
-/* @@@ Deal with J_ALIGNMENT better here!                               */
-/* Note that this can take a long time for large structs.               */
-          int32 i = 0, mem, span; J_OPCODE ldop;
-          if (alignof_struct < 4)
-              mem = MEM_B, span = 1, ldop = J_LDRBK|J_ALIGN1;
-          else
-              mem = MEM_I, span = 4, ldop = J_LDRK|J_ALIGN4;
-          for (; i < m.i; i += span) {
-            /* ldop == j_to_ldrk(J_LDRK or J_LDRBK) */
-            Location *loc = find_loc(LOC_(mem), c1->exprn, i, ldop, LOC_REALBASE);
-            setlocvalue(loc, NULL, NULL);
+          if (m.i <= 32 && (m.i & 3) == 0) {
+            ExSet *vals[8];
+            int32 i;
+            for (i = m.i>>2; --i >= 0; ) {
+              LocSet *locs = NULL;
+              ExSet *p;
+              vals[i] = NULL;
+              for (p = e1; p != NULL; p = cdr_(p)) {
+                Location *loc =
+                  find_memloc(LOC_(MEM_I), p->exprn, 4*i, J_LDRK, LOC_REALBASE);
+                if (loc != NULL) {
+                  locs = LocSet_New(locs, loc);
+                  ensureoldstore(loc, 0);
+                }
+              }
+              if (locs != NULL) vals[i] = locs_read(locs, U_NOTREF+U_NOTDEF2, J_LDRK);
+            }
+            { bool redundant = YES;
+              for (i = m.i>>2; --i >= 0; )
+                if (!storeink(GAP, vals[i], LOC_(MEM_I), 4*i, J_LDRK, e2, NO))
+                  redundant = NO;
+              if (redundant) KillRedundantStore();
+            }
+          } else {
+            StoreAccessList *a = storeaccesses;
+            for (; a != NULL; a = cdr_(a)) {
+              LocSet *locs = a->locs;
+              for (; locs != NULL; locs = cdr_(locs)) {
+                Location *loc = locs->loc;
+                if (!(loctype_(loc) & LOC_anyVAR)) {
+                  Exprn *b = locbase_(loc);
+                  int32 off = locoff_(loc);
+                  if (ExSet_Member(locbase_(loc), e1) &&
+                      0 <= off && off < m.i) {
+                    a->needed = YES;
+                    break;
+                  }
+                }
+              }
+            }
+            corruptlocswithbase(c1->exprn, m.i);
           }
         }
+      }
+      { int i;
+        for (i = 0; i < NARGREGS; i++)
+          cse_corrupt_register(R_A1+i);
       }
       node = NULL;
       break;
@@ -3170,12 +3854,12 @@ TransformedToSTRK:
 
     case J_SETSPENV:
     case J_SETSPGOTO:
-      setsplist = (SetSPList*)CSEList3((int32)setsplist,
-                                       (int32)cse_currentblock,
-                                       (int32)currenticode);
+      setsplist = (SetSPList*)CSEList3((IPtr)setsplist,
+                                       (IPtr)cse_currentblock,
+                                       (IPtr)currenticode);
     case J_ENTER:
     case J_INIT: case J_INITF: case J_INITD:
-    case J_INFOLINE: case J_INFOSCOPE: case J_INFOBODY: case J_INFOCOM:
+    case J_INFOLINE: case J_INFOSCOPE: case J_INFOBODY:
     case J_COUNT:
     case J_WORD:
     case J_ORG:
@@ -3190,11 +3874,52 @@ TransformedToSTRK:
       cmpk.r2vals = e1;
       break;
 
-    case J_CMPFK: case J_CMPDK:
+    case J_CMPFK:
+      { ExSet *c1 = MOVFKinSet(e1);
+        int r;
+        if (c1 != NULL && fcompare(&r, &e1f_(c1->exprn)->floatbin.fb, &m.f->floatbin.fb)) {
+          RemoveComparison(r, 0, block);
+          break;
+        }
+      }
       e2 = ExprnToSet((Exprn *)canonicalfpconst(m.f));
+      goto CmpF;
 
-    case J_CMPFR: case J_CMPDR:
-      if (e1 != NULL && e2 != NULL) {
+    case J_CMPDK:
+      { ExSet *c1 = MOVDKinSet(e1);
+        int r;
+        if (c1 != NULL && dcompare(&r, e1f_(c1->exprn), m.f)) {
+          RemoveComparison(r, 0, block);
+          break;
+        }
+      }
+      e2 = ExprnToSet((Exprn *)canonicalfpconst(m.f));
+      goto CmpF;
+
+    case J_CMPFR:
+      { ExSet *c1 = MOVFKinSet(e1);
+        ExSet *c2 = MOVFKinSet(e2);
+        int r;
+        if (c1 != NULL && c2 != NULL &&
+            fcompare(&r, &e1f_(c1->exprn)->floatbin.fb, &e1f_(c2->exprn)->floatbin.fb)) {
+          RemoveComparison(r, 0, block);
+          break;
+        }
+      }
+      goto CmpF;
+
+    case J_CMPDR:
+      { ExSet *c1 = MOVDKinSet(e1);
+        ExSet *c2 = MOVDKinSet(e2);
+        int r;
+        if (c1 != NULL && c2 != NULL &&
+            dcompare(&r, e1f_(c1->exprn), e1f_(c2->exprn))) {
+          RemoveComparison(r, 0, block);
+          break;
+        }
+      }
+
+CmpF: if (e1 != NULL && e2 != NULL) {
         if (ExSetsOverlap(e1, e2)) {
           RemoveComparison(0, 0, block);
         }
@@ -3224,12 +3949,8 @@ TransformedToSTRK:
           int32 index = e1k_(c1->exprn);
           int32 baseop = op & J_TABLE_BITS;
           if ((baseop == J_CHKLK || baseop == J_CHKLR) ? (index >= m.i) :
-                                                         (index <= m.i)) {
-            c->op = J_NOOP;
-            OpRewritten(c);
-            node = NULL;
-            break;
-          }
+                                                         (index <= m.i))
+            goto KillOp;
         }
       }
       values = FindRKSet(op, e1, m.i, 0);
@@ -3237,14 +3958,16 @@ TransformedToSTRK:
 
     case J_CHKNEK:
       { ExSet *c1 = MOVKinSet(e1);
-        if (c1 != NULL && e1k_(c1->exprn) != m.i) {
-          c->op = J_NOOP;
-          OpRewritten(c);
-          node = NULL;
-          break;
-        }
+        if (c1 != NULL && e1k_(c1->exprn) != m.i)
+          goto KillOp;
       }
       values = FindRKSet(op, e1, m.i, 0);
+      break;
+
+    KillOp:
+      op = c->op = J_NOOP;
+      OpRewritten(c);
+      node = NULL;
       break;
 
     case J_CHKNEFR:
@@ -3284,7 +4007,7 @@ TransformedToSTRK:
               r2.r = c->r2.r = m.r;
               goto ConvertToCMPK;
             }
-          } else if (ExSetsOverlap(e1, e2)) {
+          } else if (!opisshifted(op) && ExSetsOverlap(e1, e2)) {
             RemoveComparison(0, 0, block);
             break;
           } else if (!opisshifted(op) && (cond == Q_EQ || cond == Q_NE || !(op & Q_UBIT)) &
@@ -3332,15 +4055,15 @@ ConvertToCMPK:
                         e1k_(c1->exprn) == m.i) ) )
 
           RemoveComparison(1, 0, block);
+        else if ((mask == Q_LT || mask == Q_GE) &&
+                 m.i == 0 && TopBitsKnownZero(e1, 1))
+          RemoveComparison(1, 0, block);
         else {
-#ifndef TARGET_LACKS_3WAY_COMPARE
-/* AM doesn't really understand this fix provided by HCM.               */
-          if (sideeffectfree && setnotused == NULL && mask != Q_XXX && !(flags & BLKREXPORTED))
+          if (sideeffectfree && setnotused == NULL && !(flags & BLKREXPORTED))
             MaybeKillBranchToBlock(block, e1, m.i);
-#endif
           if (!immed_cmp(m.i)) {
-            op = J_MOVK | (op & J_WBIT);
-            node = find_movk(op, m.i, 0);
+            op = J_MOVK;
+            node = find_movk(m.i, 0);
           }
 #ifdef TARGET_ALLOWS_COMPARE_CSES
           else if (e1 != NULL) {
@@ -3386,16 +4109,12 @@ ConvertToCMPK:
       break;
 
     case J_MOVDIR:
-      /* this is useful to CSE two pure f.p. calls (on J_POP demise)    */
-      /* @@@ is there a simpler way to do this?  find_exprn?            */
-      /* (The current code simulates the old PUSHD/POP pair.)           */
-      if (e2)
-      {   ExSet *e, *ee;
-          e = LiveExSet(ExSet_Copy(ee = newexprnpart(CSE_WORD2, e2)));
-          setreg(r2.r, e, YES);
-          e = LiveExSet(ExSet_Copy(ee = newexprnpart(CSE_WORD1, e2)));
-          setreg(r1.r, e, YES);
-          /* should we set 'node' here? */
+      if (e2 != NULL)
+      {   /* General code (at the end of the switch) will deal with setting
+             r1, but doesn't understand ops which set r2.
+           */
+          setreg(r2.r, newexprnpart(CSE_WORD2, e2), YES);
+          values = newexprnpart(CSE_WORD1, e2);
           break;
       }
       /* drop through */
@@ -3406,12 +4125,16 @@ ConvertToCMPK:
       break;
 
     case J_MOVDFR:
-      { ExSet *c1 = MOVFKinSet(e2);
+      { ExSet *c1 = MOVDKinSet(e2);
         if (c1 != NULL) {
-          m.f = real_of_string(m.f->floatstr ? m.f->floatstr : "<expr>",
-                               bitoftype_(s_double));
-          fltrep_widen(&((FloatCon *)e1k_(c1->exprn))->floatbin.fb, &m.f->floatbin.db);
-          goto ForgeMOVDK;
+          FloatCon *fc = e1f_(c1->exprn);
+          FloatBin f;
+          if (fltrep_narrow(&fc->floatbin.db, &f) == flt_ok) {
+            m.f = real_of_string(fc->floatstr ? fc->floatstr : "<expr>", 0);
+            m.f->floatlen = bitoftype_(s_double)|bitoftype_(s_short);
+            m.f->floatbin.fb = f;
+            goto ForgeMOVFK;
+          }
         }
       }
       if (e2 != NULL)
@@ -3425,7 +4148,7 @@ ConvertToCMPK:
           m.f = a;
           goto ForgeMOVDK;
         }
-        values = FindRKSet(op, e1, (int32)canonicalfpconst(m.f), 0);
+        values = FindRKSet(op, e1, (IPtr)canonicalfpconst(m.f), 0);
       }
       break;
 
@@ -3433,7 +4156,7 @@ ConvertToCMPK:
       if (e1 != NULL && e2 != NULL) {
         ExSet *c2 = MOVDKinSet(e2);
         if (c2 != NULL) {
-          FloatCon *a = EvalBinary_D(J_RTOK(op), e1, (FloatCon *)e1k_(c2->exprn));
+          FloatCon *a = EvalBinary_D(J_RTOK(op), e1, e1f_(c2->exprn));
           if (a != NULL) {
             m.f = a;
             goto ForgeMOVDK;
@@ -3451,20 +4174,19 @@ ConvertToCMPK:
       c->m = m;
       c->r2.r = GAP;
       OpRewritten(c);
-    case J_MOVDK:
     case J_ADCOND:
+    case J_MOVDK:
       node = find_exprn(op, (Exprn *)canonicalfpconst(m.f), 0, NULL, 0);
       break;
 
     case J_MOVFDR:
-      { ExSet *c1 = MOVDKinSet(e2);
+      { ExSet *c1 = MOVFKinSet(e2);
         if (c1 != NULL) {
-          FloatBin f;
-          if (fltrep_narrow(&((FloatCon *)e1k_(c1->exprn))->floatbin.db, &f)) {
-            m.f = real_of_string(m.f->floatstr ? m.f->floatstr : "<expr>",
-                                 bitoftype_(s_double)|bitoftype_(s_short));
-            goto ForgeMOVFK;
-          }
+          FloatCon *fc = e1f_(c1->exprn);
+          m.f = real_of_string(fc->floatstr ? fc->floatstr : "<expr>", 0);
+          m.f->floatlen = bitoftype_(s_double);
+          fltrep_widen(&fc->floatbin.fb, &m.f->floatbin.db);
+          goto ForgeMOVDK;
         }
       }
       if (e2 != NULL)
@@ -3478,7 +4200,7 @@ ConvertToCMPK:
           m.f = a;
           goto ForgeMOVFK;
         }
-        values = FindRKSet(op, e1, (int32)canonicalfpconst(m.f), 0);
+        values = FindRKSet(op, e1, (IPtr)canonicalfpconst(m.f), 0);
       }
       break;
 
@@ -3486,7 +4208,7 @@ ConvertToCMPK:
       if (e1 != NULL && e2 != NULL) {
         ExSet *c2 = MOVFKinSet(e2);
         if (c2 != NULL) {
-          FloatCon *a = EvalBinary_F(J_RTOK(op), e1, (FloatCon *)e1k_(c2->exprn));
+          FloatCon *a = EvalBinary_F(J_RTOK(op), e1, e1f_(c2->exprn));
           if (a != NULL) {
             m.f = a;
             goto ForgeMOVFK;
@@ -3504,8 +4226,8 @@ ConvertToCMPK:
       c->m = m;
       c->r2.r = GAP;
       OpRewritten(c);
-    case J_MOVFK:
     case J_ADCONF:
+    case J_MOVFK:
       node = find_exprn(op, (Exprn *)canonicalfpconst(m.f), 0, NULL, 0);
       break;
 
@@ -3513,100 +4235,141 @@ ConvertToCMPK:
       node = find_exprn(op, (Exprn *)m.s, 0, NULL, 0);
       break;
 
-    case J_MOVI1WR:
-      /* The special case MOVI1WR is used just before proc call on the  */
-      /* XAP to split a long arg into two ints.   Treat it specially.   */
-      /* This artefact may no longer be required.                       */
-      if (isany_realreg_(c->r1.r) && isany_realreg_(c->m.r)) break;
-      /* N.B. following code appears not to work for __frac values.  Why?    */
-    case J_MOVI0WR:
-      op |= J_WBIT;             /* ensure ForgeMOVK makes right length  */
-      /* drop through */
     case J_NEGR:
     case J_NOTR:
     case J_FIXFR: case J_FIXDR:
-    case J_MOVWIR:
-      if (EvalUnary(op, &c->m.i, e2)) goto ForgeMOVK;
+      if (EvalUnary(op, &atmp, e2))
+      {   m.i = atmp;
+          goto ForgeMOVK;
+      }
       /* drop through */
     case J_NEGFR: case J_NEGDR:
     case J_FLTFR: case J_FLTDR:
       if (e2 != NULL)
         values = FindRKSet(op, e2, 0, 0);
       break;
-     
+
     case J_INLINE1: case J_INLINE1F: case J_INLINE1D:
       if (e1 != NULL)
         values = FindRKSet(op, e1, m.i, 0);
       break;
 
-    case J_ADDR: case J_MULR: case J_ANDR: case J_ORRR: case J_EORR:
-#ifdef EXTENSION_FRAC
-    case J_XMULR:
-#endif
+    case J_EORR:
       symmetric = YES;
-    case J_SUBR: case J_DIVR: case J_RSBR: case J_REMR:
-#ifdef EXTENSION_FRAC
-    case J_XDIVR:
-#endif
+    case J_SUBR:
+    case J_RSBR:
+      if (!opisshifted(op) && ExSetsOverlap(e1, e2)) {
+        m.i = 0;
+        goto ForgeMOVK;
+      }
+      goto BinaryR;
+
+    case J_ANDR: case J_ORRR:
+      symmetric = YES;
+      if (!opisshifted(op) && ExSetsOverlap(e1, e2))
+        goto ForgeMOVR;
+      goto BinaryR;
+
+    case J_ADDR: case J_MULR:
+      symmetric = YES;
+    case J_DIVR: case J_REMR:
     case J_SHLR: case J_SHRR: case J_RORR:
+BinaryR:
       if (e1 != NULL && e2 != NULL) {
         ExSet *c2 = MOVKinSet(e2);
         if (c2 != NULL) {
           int32 a2 = shiftedval(op, e1k_(c2->exprn));
           ExSet *c1 = MOVKinSet(e1);
           if (c1 != NULL &&
-              EvalBinary_I(J_RTOK(unshiftedop(op)), &c->m.i, c1->exprn, a2)) {
+              EvalBinary_I(J_RTOK(unshiftedop(op)), &atmp, c1->exprn, a2)) {
+            m.i = atmp;
             goto ForgeMOVK;
           } else if (jop_canRTOK(unshiftedop(op))) {
-            op = c->op = J_RTOK(unshiftedop(op));
-            c->m.i = a2;
-            OpRewritten(c);
-            values = FindRKSet(op, e1, a2, 0);
-            break;
+            op = unshiftedop(op);
+            m.i = a2;
+            goto ForgeIOpK;
           }
         }
         if (!opisshifted(op) && symmetric) {
           ExSet *c1 = MOVKinSet(e1);
           if (c1 != NULL && jop_canRTOK(op)) {
-            op = c->op = J_RTOK(op);
-            c->r2.i = m.r;
-            c->m.i = m.i = e1k_(c1->exprn);
-            OpRewritten(c);
-            values = FindRKSet(op, e2, m.i, 0);
-            break;
+            e1 = e2;
+            c->r2.r = r2.r = m.r;
+            m.i = e1k_(c1->exprn);
+            goto ForgeIOpK;
           }
         }
         values = FindRRSet(op, e1, e2, 0);
       }
       break;
 
+    ForgeIOpK:
+      c->op = op = J_RTOK(op);
+      c->m.i = m.i;
+      e2 = NULL;
+      OpRewritten(c);
+      /* fall through to handle rewrite as OpK */
+
     case J_ADDK: case J_MULK: case J_ANDK: case J_ORRK: case J_EORK:
     case J_SUBK: case J_DIVK: case J_RSBK: case J_REMK:
-#ifdef EXTENSION_FRAC
-    case J_XMULK:
-    case J_XDIVK:
-#endif
     case J_SHLK: case J_SHRK: case J_RORK:
     case J_EXTEND:
       if (e1 != NULL) {
         ExSet *c1 = MOVKinSet(e1);
-        if (c1 != NULL && EvalBinary_I(op, &c->m.i, c1->exprn, m.i) ) {
+        if (c1 != NULL && EvalBinary_I(op, &atmp, c1->exprn, m.i) ) {
+          m.i = atmp;
           goto ForgeMOVK;
         } else {
+          switch (op & ~Q_MASK) {
+          case J_ORRK:
+            if (m.i == -1) goto ForgeMOVK;
+          case J_ADDK: case J_SUBK: case J_EORK:
+            if (m.i == 0) goto ForgeMOVR;
+            break;
+          case J_MULK: case J_DIVK:
+            if (m.i == 1) goto ForgeMOVR;
+            break;
+          case J_ANDK:
+            if (m.i == 0) goto ForgeMOVK;
+            if (m.i == -1) goto ForgeMOVR;
+            { int32 x = m.i + 1;
+              if ((x & (-x)) == x) {
+                int32 bits = logbase2(x);
+                if (BottomBitsKnownZero(e1, bits)) {
+                  m.i = 0;
+                  goto ForgeMOVK;
+                } else if (TopBitsKnownZero(e1, 32-bits))
+                  goto ForgeMOVR;
+              }
+              x = ~m.i + 1;
+              if ((x & (-x)) == x) {
+                int32 bits = logbase2(x);
+                if (TopBitsKnownZero(e1, 32-bits)) {
+                  m.i = 0;
+                  goto ForgeMOVK;
+                } else if (BottomBitsKnownZero(e1, bits))
+                  goto ForgeMOVR;
+              }
+            }
+            break;
+          }
           values = FindRKSet(op, e1, m.i, 0);
         }
       }
       break;
 
     ForgeMOVK:
-      op = c->op = J_MOVK | (op & J_WBIT);
+      op = c->op = J_MOVK;
       c->r2.r = GAP;
+      c->m.i = m.i;
       OpRewritten(c);
     case J_MOVK:
       /* J_STRV and TARGET_IS_ALPHA? */
-      node = find_movk(op, c->m.i,
-                       (c+1 < limit && (c+1)->op == (J_STRV|J_ALIGN4)) ||
-                               isany_realreg_(r1.r) ? U_NOTDEF2+U_NOTREF : 0);
+      node = find_movk(c->m.i, immed_op(m.i, op) &&
+                               ( c+1 == limit ||
+                                 (c+1)->op == (J_STRV|J_ALIGN4) ||
+                                 isany_realreg_(r1.r) ) ? U_NOTDEF2+U_NOTREF
+                                                        : 0);
       break;
 
     default:
@@ -3615,6 +4378,26 @@ ConvertToCMPK:
       break;
 
     } /* switch */
+
+/* ECN: Previously cse_scanblock had builtin knowledge of what register are
+ *      corrupted. For Thumb where many jopcodes affect registers this is not
+ *      sensible so we have a separate mechanism below. Someone may like to
+ *      generalise this.
+ */
+#ifdef TARGET_IS_THUMB
+    {
+      RealRegSet r;
+      RealRegister i;
+      unsigned32 s;
+
+      CorruptsRegisters(c, &r);
+      s = r.map[0];
+      for (i = 0; s; i++) {
+        if (s & 1) cse_corrupt_register(i);
+        s >>= 1;
+      }
+    }
+#endif
 
     if (values == NULL && node != NULL)
       values = ExprnToSet(node);
@@ -3636,7 +4419,7 @@ ConvertToCMPK:
 /* J_MOVDIR sets r1 (and this causes setreg(r1,NULL,YES) below), but    */
 /* the previous PUSHD/POP/POP sequence didn't.  Hence next line's hack. */
 /* Without the hack K_PURE fn calls don't get CSE'd.                    */
-    if (loads_r1(op) && op != J_MOVDIR) {
+    if (loads_r1(op)) {
     /* what I really want to say here is try for a local cse only if nothing
        in values suggests it's not sensible
      */
@@ -3646,17 +4429,15 @@ ConvertToCMPK:
       if ( !isvolatile &&
            values != NULL &&
            !register_movep(op) &&
-           ExSet_Map(values, WorthTryingLocalCSE, &wtlrec) ) {
+           (node = ExSet_Some(values, WorthTryingLocalCSE, &wtlrec)) != NULL ) {
 
-        node = values->exprn;
-        /* the first is as good as any - definitely only want one */
         if (exop_(node) == J_RESULT2) {
           Exprn *e1 = e1_(node);
           if (cseset_member(exid_(e1), availableexprns))
-            isload &= !addlocalcse(e1, 1, block);
+            isload = isload & !addlocalcse(e1, 1, block);
         } else if (exop_(node) != CSE_WORD1 && exop_(node) != CSE_WORD2) {
           if (cseset_member(exid_(node), availableexprns))
-            isload &= !addlocalcse(node, 0, block);
+            isload = isload & !addlocalcse(node, 0, block);
         }
         /* If addlocalcse returned NO, maybe we should think about
            patching the load (if isload).  Or maybe we should do it
@@ -3714,32 +4495,48 @@ ConvertToCMPK:
   if (debugging(DEBUG_CSE) && CSEDebugLevel(1))
     cse_printexits(flags, exit, exit1);
 #endif
+  /* Take account of evaluated function calls. Since no calls have been
+     introduced, we need merely to clear the BLKxCALL bits if appropriate
+   */
+  if (callcount < 1)
+    blkflags_(block) &= ~(BLKCALL+BLK2CALL);
+  else if (callcount == 1)
+    blkflags_(block) &= ~BLK2CALL;
+  if (setnotused != NULL && !is_exit_label(exit)) {
+    blkflags_(block) |= BLKREXPORTED;
+    if (debugging(DEBUG_CSE) || debugging(DEBUG_CG)) {
+      cc_msg("Block %ld marked RExported: ", (long)blklabname_(block));
+      cse_printset(setnotused);
+      cc_msg("\n");
+    }
+  }
   blk_available_(block) = availableexprns;
   blk_wanted_(block) = wantedexprns;
   blk_killed_(block) = killedlocations;
-#undef find_adconv
 }
 
 static void csescan_setup(void)
 {
-    memclr((void *)exprnindex, EXPRNINDEXSIZE * sizeof(Exprn **));
+    memclr(exprnindex, EXPRNINDEXSIZE * sizeof(Exprn **));
     cse_tab = (Exprn **) CSEAlloc(HASHSIZE * sizeof(Exprn **));
-    memclr((void *)cse_tab, HASHSIZE * sizeof(Exprn **));
-    memclr((void *)locindex, LOCINDEXSIZE * sizeof(Location **));
+    memclr(cse_tab, HASHSIZE * sizeof(Exprn **));
+    memclr(locindex, LOCINDEXSIZE * sizeof(Location **));
     locations = (Location **) CSEAlloc(LOCHASHSIZE * sizeof(Location **));
-    memclr((void *)locations, LOCHASHSIZE * sizeof(Location **));
+    memclr(locations, LOCHASHSIZE * sizeof(Location **));
     cseidsegment = CSEIDSEGSIZE;
     heapptr = (Exprn *)CSEAlloc(sizeof(Exprn));
     exop_(heapptr) = J_HEAPPTR;
     heapptr->nodeid = mknodeid_(0, EX_ALIAS|E_UNARYK);
     exuses_(heapptr) = NULL;
     exwaslive_(heapptr) = YES;
+    exleaves_(heapptr) = NULL;
     csealiasid = csealiaslimit = 1;
     csenonaliasid = 0; csenonaliaslimit = CSEIDSEGSIZE;
     locationid = 0;
     floatconlist = NULL;
     knownregs = NULL;
     loadrs = NULL;
+    movcbaseid = MOVCLOC; movctargets = NULL;
 #ifdef TARGET_ALLOWS_COMPARE_CSES
     compares = NULL;
 #endif
@@ -3788,7 +4585,7 @@ static void pruneandrenumberexprns(BlockHead *top)
                    expression is lifted.
                  */
                 if (use == NULL) syserr(syserr_prune);
-                if (cdr_(use) == NULL && !(flags_(use) & U_LOCALCSE) &&
+                else if (cdr_(use) == NULL && !(flags_(use) & U_LOCALCSE) &&
                     blknest_(use->block) <= 1) {
                     if (debugging(DEBUG_CSE)) {
                         cc_msg(" %ld", exid_(ex));
@@ -3851,7 +4648,6 @@ static void addkilledexprns(int32 locno, VoidStar arg)
 {
     Location *loc = loc_(locno);
     VRegSetP *s = (VRegSetP *) arg;
-    cseset_union(*s, loc->users);
     cseset_union(*s, loc->aliasusers);
 }
 
@@ -3888,7 +4684,8 @@ void cse_scanblocks(BlockHead *top)
     pruneandrenumberexprns(top);
 #endif
 
-    {   VRegSetP universe = NULL, callkills = NULL;
+    {   MOVCTarget *mt;
+        VRegSetP universe = NULL, callkills = NULL;
         int32 ul;
         {   int32 i;
             for (i = 1 ; i < cseidsegment ; i++)
@@ -3907,6 +4704,14 @@ void cse_scanblocks(BlockHead *top)
                     if (q == 0) break;
                     if (ispublic(q))
                         cseset_union(callkills, q->users);
+                    if (!(loctype_(q) & LOC_anyVAR)) {
+                        Exprn *base = locbase_(q);
+                        for (mt = movctargets; mt != NULL; mt = cdr_(mt))
+                            if (mt->base == base) {
+                                cseset_insert(locid_(q), mt->locswithbase, NULL);
+                                break;
+                            }
+                    }
                 }
             }
         }
@@ -3918,15 +4723,17 @@ void cse_scanblocks(BlockHead *top)
          * only after the first pass.
          */
             VRegSetP s = NULL;
-            bool calls;
-            VRegSetP locs = cseset_delete(CALLLOC, blk_killed_(p), &calls);
-            if (calls) s = cseset_copy(callkills);
+            bool present;
+            VRegSetP locs = cseset_delete(CALLLOC, blk_killed_(p), &present);
+            if (present) s = cseset_copy(callkills);
 #ifdef TARGET_ALLOWS_COMPARE_CSES
-            { bool cc;
-              locs = cseset_delete(CCLOC, blk_killed_(p), &cc);
-              if (cc) cseset_union(s, compares);
-            }
+            locs = cseset_delete(CCLOC, blk_killed_(p), &present);
+            if (present) cseset_union(s, compares);
 #endif
+            for (mt = movctargets; mt != NULL; mt = cdr_(mt)) {
+                locs = cseset_delete(mt->id, blk_killed_(p), &present);
+                if (present) cseset_union(locs, mt->locswithbase);
+            }
             cseset_map(locs, addkilledexprns, (VoidStar) &s);
             cseset_discard(locs);
             if (s != NULL) cseset_union(s, loadrs);
@@ -3951,6 +4758,8 @@ void cse_scanblocks(BlockHead *top)
 #ifdef TARGET_ALLOWS_COMPARE_CSES
         cseset_discard(compares);
 #endif
+        for (mt = movctargets; mt != NULL; mt = cdr_(mt))
+            cseset_discard(mt->locswithbase);
     }
     {   int32 i;
         for (i = 0 ; i < LOCINDEXSIZE ; i++) {

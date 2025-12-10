@@ -6,9 +6,9 @@
  */
 
 /*
- * RCS $Revision: 1.31 $  Codemist 13
- * Checkin $Date: 93/09/29 14:51:56 $
- * Revising $Author: lsmith $
+ * RCS $Revision: 1.85 $  Codemist 13
+ * Checkin $Date: 1996/01/05 18:02:29 $
+ * Revising $Author: sdouglas $
  */
 
 #include "globals.h"
@@ -21,12 +21,6 @@
 #include "aeops.h"
 #include "errors.h"
 
-/* stolen from sem.c:                                                */
-#define int_decodelength_(m, xs, xi, xl, xll) \
-    (m & bitoftype_(s_short)) ? \
-        ((m & bitoftype_(s_long)) ? xll : xs) : \
-        ((m & bitoftype_(s_long)) ? xl : xi)
-
 /* AM nov-88: add code to allow mcrep fns to return a flag if the     */
 /* object requires double alignment (e.g. some structs)               */
 /* As a transition this is only enabled if alignof_double > alignof_int. */
@@ -38,7 +32,7 @@
 /* optimise0() is called after parsing an expression (generally by syn.c) */
 /* which has been type-checked on the way by sem.c.  It does tree-like    */
 /* optimisations, such as removing casts between objects which have the   */
-/* same run-time representation (e.g. char* -> int* -> long)              */
+/* same run-time representation (e.g. char* -> int* -> long)          */
 
 /* expression optimiser:
  * Current aims for optimise():
@@ -56,15 +50,16 @@
  */
 
 /* forward references... */
-static void optimiselist(ExprList *);
+static Expr *optimisefnap(Expr *);
 
 /* The following routine fixes LDS's bug (in 1.57) alluded to above.  */
 /* It is not the final word, since we can clearly sometimes do better */
 /* at detecting same pointers, but is intended to keep LDS happy with */
-/* 'minimal change to code'.                                          */
+/* 'minimal change to code'.                          */
 static bool same_pointedto_types(Expr *e, Expr *e1)
 {   TypeExpr *x = prunetype(typeofexpr(e));
     TypeExpr *x1 = prunetype(typeofexpr(e1));
+    if (x == x1) return 1;
     /* Careful not to pass arrays/structs/fns to mcrepofexpr()      */
     /* (and thence sizeoftype which can issue error messages).      */
     /* The next line duplicates previous behaviour on t_fnap types. */
@@ -77,257 +72,82 @@ static bool same_pointedto_types(Expr *e, Expr *e1)
     return mcrepofexpr(e) == mcrepofexpr(e1);
 }
 
-#ifdef SIMPLIFY_OPTIMISE_CHAR_AND_SHORT_ARITHMETIC
-/*
- * The code here exhibits obscure failures, and is (maybe) being superseded
- * by code in regalloc.c, so is now included only if explicitly requested.
- */
-
-static int32 mc_int_width(Expr *e)
+bool is_same(Expr *a, Expr *b)
+/* Expressions are considered the same if they compute the same value    */
+/* and do not have any side-effects.                     */
 {
-    /* A small integer iff e has integer type of width 1, 2 or 4.        */
-    /* Otherwise somewhat bigger than 1 << MCR_SORT_SHIFT (> 2**24).     */
-    return mcrepofexpr(e) & ~(5L << MCR_SORT_SHIFT);
-}
-
-/* @@@ LDS 14Aug89 - making this ARM-dependent is provisionsal - other   */
-/* targets could benefit from the manipulations done here. However, I    */
-/* just haven't managed to bend my brain round the relevant abstractions.*/
-/* AM/ACN should tidy up here for other back ends and maybe consider     */
-/* integrating optimise2() with optimise1()... I found this too daunting.*/
-/* I apologise for the plethora of magic numbers, but I seem to be       */
-/* following a grand tradition set by cg and simplify via mcrepofexpr(). */
-
-static TypeExpr *te_plain(int32 w)
-{   int32 m = bitoftype_(s_signed) | bitoftype_(s_unsigned);
-/* w == 1 denotes te_signedchar; w == 2 denotes te_short.                */
-    if (w == 2)
-        m |= bitoftype_(s_short) | bitoftype_(s_int);
-    else if (w == 1)
-        m |= bitoftype_(s_char);
-    else
-        syserr(syserr_te_plain, w);
-    return primtype_(m);
-}
-
-static Expr *clone_node(Expr *e, TypeExpr *t)
-{   int32 h0 = h0_(e);
-    switch (h0)
-    {
-case s_cond:
-case s_rangecheck:
-        return mk_expr3(h0, t, arg1_(e), arg2_(e), arg3_(e));
-case s_dot:
-        if (isbitfield_type(typeofexpr(e)))
-            return mk_exprbdot(h0, t, arg1_(e), exprdotoff_(e),
-                               exprbsize_(e), exprmsboff_(e));
-        else
-            return mk_exprwdot(h0, t, arg1_(e), exprdotoff_(e));
-default:
-        if (ismonad_(h0) || h0 == s_cast)
-            return mk_expr1(h0, t, arg1_(e));
-        else if (isdiad_(h0) ||
-                 h0 == s_fnap || h0 == s_let || h0 == s_checknot)
-            return mk_expr2(h0, t, arg1_(e), arg2_(e));
-        syserr(syserr_clone_node, h0);
+    AEop op;
+    for (;;)
+    {   if ((op = h0_(a)) != h0_(b)) return NO;
+        if (isvolatile_expr(a) || isvolatile_expr(b)) return NO;
+        switch (op)
+        {
+    case s_binder:
+            return a == b;  /* volatile attribute already checked */
+    case s_integer:
+            return intval_(a) == intval_(b);
+    case_s_any_string
+    case s_floatcon:
+            return a == b;  /* improve? */
+    case s_dot:
+            if (exprdotoff_(a) != exprdotoff_(b)) return NO;
+            a = arg1_(a), b = arg1_(b);
+            continue;
+    case s_cast:
+/* equivtype is probably too strong on the next line (we should         */
+/* probably use a more machine-oriented test on types) but, before      */
+/* changing it to the logical mcrepofexpr()=mcrepofexpr(), note that    */
+/* casts on empty arrays to pointers can cause mcrepofexpr() to cc_err. */
+/* @@@ Then again, perhaps is_same should be elided by cse.c now?       */
+            if (!equivtype(type_(a), type_(b))) return NO;
+    case s_addrof:
+    case s_bitnot:
+    case s_boolnot:
+    case s_neg:
+    case s_content:
+    case s_monplus:
+            a = arg1_(a);
+            b = arg1_(b);
+            continue;
+    case s_andand:
+    case s_oror:
+    case s_equalequal:
+    case s_notequal:
+    case s_greater:
+    case s_greaterequal:
+    case s_less:
+    case s_lessequal:
+    case s_comma:
+    case s_and:
+    case s_times:
+    case s_plus:
+    case s_minus:
+    case s_div:
+    case s_leftshift:
+    case s_or:
+    case s_rem:
+    case s_rightshift:
+    case s_xor:
+            if (!is_same(arg1_(a), arg1_(b))) return NO;
+            a = arg2_(a);
+            b = arg2_(b);
+            continue;
+    default:
+            return NO;
+        }
     }
-    return e;
 }
-
-/* The purpose of the following function is to do tree-transformations   */
-/* which change explicitly (un)signed load/store-B/Ws into plain ops and */
-/* introduce explicit (narrowing) casts higher up the tree. On the ARM   */
-/* this is a win - and well nigh essential for Unix which requires chars */
-/* to be signed chars make extensive use of shorts - all anathema to ARM.*/
-/* It's sad that much of optimise1 has to be copied here...              */
-
-static Expr *optimise2(Expr *e, int32 mc_width)
-{
-/* mc_width is the width of the narrow integer context in which 'e' is   */
-/* to be evaluated, as seen from the back-end's point of view. mc_width  */
-/* == 0 if the width is unknown or the context is not narrow integer.    */
-    if (debugging(DEBUG_AETREE) && syserr_behaviour > 0)
-    {   cc_msg("optimise2(..., %ld): ", mc_width);
-        pr_expr(e);
-        cc_msg(" ...of type... ");
-        pr_typeexpr(typeofexpr(e), 0);
-        cc_msg("\n");
-    }
-    switch (h0_(e))
-    {
-case s_fnap:
-        {   ExprList *x;
-            arg1_(e) = optimise2(arg1_(e), 0);
-            for (x = exprfnargs_(e);  x != 0;  x = cdr_(x))
-                exprcar_(x) = optimise2(exprcar_(x), 0);
-        }
-        break;
-case s_comma:
-        arg1_(e) = optimise2(arg1_(e), -1);
-        /* drop through */
-case s_let:
-        arg2_(e) = optimise2(arg2_(e), mc_width);
-        break;
-case s_assign:
-case s_displace:
-        {   Expr *a1 = arg1_(e), *a2 = arg2_(e);
-            int32 w1 = mc_int_width(e), w2 = (w1 <= 2) ? w1 : 0;
-            TypeExpr *t1 = typeofexpr(e);
-/* N.B. The following call may change typeofexpr(a1) in case s_displace. */
-            arg1_(e) = a1 = optimise2(a1,
-                (h0_(e) == s_displace && mc_width >= 0 ? w2 : 0));
-            if (h0_(a1) == s_binder)
-/* @@@ LDS 07-Dec-89 - The value stored into a binder is expected by cg.c  */
-/* to be 'clean', whether the binder's value will be in a register or in   */
-/* memory. A cg.c peephole and cg's value loading strategy depend on this. */
-                w2 = 0;
-            arg2_(e) = a2 = optimise2(a2, w2);
-            if (w2 == 0) break;             /* not narrow or already clean */
-            w2 = mc_int_width(a2);
-            if (w2 < w1) t1 = typeofexpr(a2);     /* char in short context */
-            if (mc_width == 0 || w1 < mc_width)
-                /* NB: t1 is type_(a1) BEFORE optimising a1 */
-                e = mk_expr1(s_cast, t1, clone_node(e, te_int));
-        }
-        break;
-case s_cond:
-/* @@@ LDS - we could do better here sometimes, but it's hard work to do */
-/* so I don't atempt it for the moment.                                  */
-        if (mc_width > 0) mc_width = 0;
-        arg2_(e) = optimise2(arg2_(e), mc_width);
-        arg3_(e) = optimise2(arg3_(e), mc_width);
-        arg1_(e) = optimise2(arg1_(e), 0);                /* N.B. 0 here */
-        break;
-case s_content:
-case s_dot:
-/* in the following line, 0, NOT mc_width IS correct (think about it!).  */
-        arg1_(e) = optimise2(arg1_(e), 0);
-        /* DROP THROUGH */
-case s_binder:
-        {   int32 ew;
-            if (mc_width > 0 &&                   /* in a narrow context */
-                (ew = mc_int_width(e)) <= 2 &&    /* and a narrow exprn  */
-                ew >= mc_width &&               /* which is not narrower */
-                !isvolatile_expr(e))                 /* and not volatile */
-/* @@@ LDS - the following causes cg to generate a 'plain' load of a     */
-/* narrow type, rather than a signed or unsigned one. See cg_cast1().    */
-            {   if (h0_(e) == s_binder)
-                    e = mk_expr1(s_cast, te_plain(ew), e);
-                else if (h0_(e) == s_content)
-                    e = mk_expr1(s_content, te_plain(ew), arg1_(e));
-                else /* s_dot */
-                {   if (isbitfield_type(typeofexpr(e)))
-/* Surely this case is a syserr, since bitfields have now gone!.        */
-                        e = mk_exprbdot(s_dot, te_plain(ew), arg1_(e),
-                                exprdotoff_(e), exprbsize_(e), exprmsboff_(e));
-                    else
-                        e = mk_exprwdot(s_dot, te_plain(ew), arg1_(e),
-                                exprdotoff_(e));
-                }
-            }
-        }
-        break;
-case s_cast:
-        {   Expr *a1 = arg1_(e);
-            int32 ew = mc_int_width(e);
-            if (mc_width < 0 ||                  /* cast in void context */
-                mc_width > 0 &&             /* OR narrow integer context */
-                ew <= 4 &&              /* & this cast is to an int type */
-                ew >= mc_width &&               /* which is not narrower */
-                mc_int_width(a1) <= 4)          /* & castee has int type */
-            {   /* omit the cast */
-                e = optimise2(a1, mc_width);
-                break;
-            }
-            if (ew == 0)                                 /* cast to void */
-                mc_width = -1;
-            else if (ew > 4)                         /* cast to floating */
-                mc_width = 0;
-            else if (mc_width == 0 && ew <= 2 || ew < mc_width)
-                mc_width = ew;
-            arg1_(e) = a1 = optimise2(a1, mc_width);
-/* The following predicate checks whether this cast has been rendered    */
-/* redundant by a cast introduced by the call to optimise2(), above..    */
-/* NOTE: in the following predicate, DO NOT change ... < ew to ... <= ew */
-/* lest AM's problem with (int)(unsigned)d recur.                        */
-            if (ew <= 4 && h0_(a1) == s_cast && mc_int_width(a1) < ew) e = a1;
-        }
-        break;
-case s_equalequal:
-case s_notequal:
-        {   Expr *a1 = arg1_(e), *a2 = arg2_(e);
-            mc_width = 0;                      /* int context by default */
-            if (h0_(a1) != s_integer && h0_(a2) == s_integer)
-            {   a1 = a2;                  /* if either arg is an integer */
-                a2 = arg1_(e);            /* a1 is now an integer...     */
-            }
-/* Here we do a special case for signed chars, very important for Unix.  */
-            if (h0_(a1) == s_integer &&
-                  (unsigned32) intval_(a1) <=            /* int const... */
-                    ((unsigned char)(-1) >> 1) &&     /* ...<= SCHAR_MAX */
-                      mc_int_width(a2) == 1)       /* compared with char */
-                mc_width = 1;               /* so set context width to 1 */
-        }
-        /* and drop through with mc_width set appropriately */
-case s_and:
-case s_times:
-case s_plus:
-case s_minus:
-case s_or:
-case s_xor:
-        arg2_(e) = optimise2(arg2_(e), mc_width);
-        /* drop through */
-case s_neg:
-case s_bitnot:
-case s_monplus:
-        arg1_(e) = optimise2(arg1_(e), mc_width);
-        break;
-#ifdef RANGECHECK_SUPPORTED
-case s_rangecheck:
-        if (arg3_(e) != NULL) arg3_(e) = optimise2(arg3_(e), 0);
-        /* drop through */
-case s_checknot:
-        arg1_(e) = optimise2(arg1_(e), 0);
-        if (arg2_(e) != NULL) arg2_(e) = optimise2(arg2_(e), 0);
-        break;
-#endif
-default:
-        {   AEop op = h0_(e);
-            if (isdiad_(op))
-                arg2_(e) = optimise2(arg2_(e), 0);
-            if (isdiad_(op) || ismonad_(op))
-                arg1_(e) = optimise2(arg1_(e), 0);
-        }
-        break;
-    }
-    if (debugging(DEBUG_AETREE) && syserr_behaviour > 0) {
-        cc_msg(" => "); pr_expr(e); cc_msg("\n");
-    }
-    return e;
-}
-
-#else /* SIMPLIFY_OPTIMISE_CHAR_AND_SHORT_ARITHMETIC */
-
-#define optimise2(e, width) (e)
-
-#endif /* SIMPLIFY_OPTIMISE_CHAR_AND_SHORT_ARITHMETIC */
 
 static Expr *optimise_cast(Expr *e)
 {   Expr *a1 = arg1_(e);
     int32 e_mode = mcrepofexpr(e), e_len;
     int32 a_mode = mcrepofexpr(a1), a_len;
+    TypeExpr *te = princtype(typeofexpr(e));
+    if (h0_(te) == t_content) te = typearg_(te);
+    if (isfntype(te)) return e;  /* leave in casts to fn type */
 
-/* a cast to the same type is ineffectual                                */
+/* a cast to the same type is ineffectual                             */
     if (e_mode == a_mode) return a1;
-/* leave casts to function type alone                                    */
-    {   TypeExpr *te = princtype(typeofexpr(e));
-#ifdef EXTENSION_FRAC
-/* also leave all casts to __frac type as length change is NOT a noop.   */
-        if (isprimtype_(te,s_frac)) return e;
-#endif
-        if (h0_(te) == t_content) te = typearg_(te);
-        if (isfntype(te)) return e;
-    }
 
     e_len = e_mode & MCR_SIZE_MASK;
     e_mode >>= MCR_SORT_SHIFT;
@@ -337,28 +157,22 @@ static Expr *optimise_cast(Expr *e)
 /* A cast is ineffectual if it does not change the m/c representation.   */
     if (e_mode < 2 && a_mode < 2)        /* cast of integral to integral */
     {
-        if (sizeof_int != 2)            /* TARGET_IS_XAP */
-          /* extra guard by the above because code for:                  */
-          /* >>>>>>> int g(); long f() { return g(); } <<<<<<<           */
-          /* is otherwise wrong.                                         */
-          /* Of course this is a representation issue of short within    */
-          /* long (cf. dec alpha too).                                   */
-          if (e_mode == a_mode && e_len > a_len)
+        if (e_mode == a_mode && e_len > a_len)
             return a1;         /* vacuous signedness-preserving widening */
 
 /* Things like (int)(unsigned char)x are NOT vacuous, even though cg     */
 /* will generate no code for them, because (double)(int)(unsigned char)x */
 /* (double)(unsigned char)x and (double)(signed char)x are all different.*/
-/* Even (unsigned int)(int) has a role: consider:-                       */
+/* Even (unsigned int)(int) has a role: consider:-                   */
 /* double d;  (double)(unsigned)(int)d; - what can be elided? Nothing!   */
     }
 
     if (h0_(a1) == s_cast)
     {
-/* The inner casts are irrelevant in the following cases:                */
-/*     (float) (double) x                                                */
+/* The inner casts are irrelevant in the following cases:               */
+/*     (float) (double) x                                           */
 /*     (char)  (short)  x   (char) (int) x   (short) (int) x             */
-/* So are the corresponding unsigned cases.                              */
+/* So are the corresponding unsigned cases.                     */
         if (e_mode <  2 && a_mode <  2 && e_len < a_len ||
             e_mode == 2 && a_mode == 2 && e_len < a_len)
         {
@@ -377,6 +191,71 @@ static Expr *optimise_cast(Expr *e)
 
 static SynBindList *new_binders;
 
+static bool Div_SignBitClear(Expr *x, int32 rep) {
+ /* We don't try too hard here at present: look for just widening of an
+    unsigned type and positive constants.
+  */
+    if (h0_(x) == s_cast) {
+        int32 xrep = mcrepofexpr(arg1_(x));
+        return (xrep >> MCR_SORT_SHIFT) == 1 &&
+               (xrep & MCR_SIZE_MASK) < (rep & MCR_SIZE_MASK);
+    } else if (h0_(x) == s_integer)
+        return intval_(x) > 0;
+    else
+        return NO;
+}
+
+static Expr *Div_CastToUnsigned(Expr *x, TypeExpr *t) {
+/* (signbitclear(x, ..) is true) */
+    return (h0_(x) == s_cast) ?
+        mk_expr1(s_cast, t, arg1_(x)) :
+        mkintconst(t, intval_(x), 0);
+}
+
+static Expr *IgnoreSignednessChange(Expr *e) {
+    int32 e_mode = mcrepofexpr(e);
+    int32 e_len = e_mode & MCR_SIZE_MASK;
+    e_mode &= MCR_SORT_MASK;
+    if (e_mode == MCR_SORT_SIGNED || e_mode == MCR_SORT_UNSIGNED)
+        while (h0_(e) == s_cast) {
+            int32 a_mode = mcrepofexpr(arg1_(e));
+            int32 a_len = a_mode & MCR_SIZE_MASK;
+            a_mode &= MCR_SORT_MASK;
+            if (a_len == e_len &&
+                (a_mode == MCR_SORT_SIGNED || a_mode == MCR_SORT_UNSIGNED))
+                e = arg1_(e);
+            else
+                return e;
+        }
+    return e;
+}
+
+static Expr *RemovableSignOrZeroExtension(Expr *a, int32 mask) {
+    if (h0_(a) == s_and && h0_(arg2_(a)) == s_integer &&
+        (~intval_(arg2_(a)) & mask) == 0)
+        return arg1_(a);
+
+    a = IgnoreSignednessChange(a);
+    if (h0_(a) == s_rightshift && h0_(arg2_(a)) == s_integer) {
+        int32 sl = 0, sr = intval_(arg2_(a));
+        if ((((unsigned32)-1 >> sr) & mask) == mask) {
+            a = IgnoreSignednessChange(arg1_(a));
+            if (h0_(a) == s_leftshift) {
+                if (h0_(arg2_(a)) != s_integer)
+                    return NULL;
+                sl = intval_(arg2_(a));
+                a = arg1_(a);
+            }
+            if (sl < sr) {
+                TypeExpr *t = typeofexpr(a);
+                return mk_expr2(s_rightshift, t, a, mkintconst(t, sr - sl, 0));
+            } else if (sl == sr)
+                return a;
+        }
+    }
+    return NULL;
+}
+
 /* Beware highly: optimise currently side-effects the tree.
    Moreover, s_invisible and (more serious) nodes for ++, += etc can
    share sub-structure.  Only binders I believe in the latter case
@@ -386,38 +265,408 @@ static SynBindList *new_binders;
 
 static Expr *BinaryOp(AEop op, TypeExpr *t, Expr *e1, Expr *e2) {
 /* e1 and e2 known to be of sort s_integer. This is not a call to mkbinary()
-   because that may generate unwanted warnings about overflow. Also, we would
-   need to fiddle with the types of constants in pointer expressions to avoid
-   incorrect extra scaling.
+ * because that may generate unwanted warnings about overflow. Also, we would
+ * need to fiddle with the types of constants in pointer expressions to avoid
+ * incorrect extra scaling.
  */
     int32 k1 = intval_(e1),
           k2 = intval_(e2);
-    switch (h0_(e1) == s_integer && h0_(e2) == s_integer ? op : -1) {
+    switch (op) {
     case s_times: k1 *= k2; break;
     case s_plus:  k1 += k2; break;
     case s_minus: k1 -= k2; break;
     case s_and:   k1 &= k2; break;
     case s_or:    k1 |= k2; break;
     case s_xor:   k1 ^= k2; break;
+    case s_andand:  k1 = k1 && k2; break;
+    case s_oror:    k1 = k1 || k2; break;
     default:      syserr("BinaryOp %ld", op);
     }
     return mkintconst(t, k1, 0);
 }
 
-static Expr *optalloctemps(Expr *e)
-{    return (new_binders == 0) ? e :
-        mk_expr2(s_let, typeofexpr(e), (Expr*)new_binders, e);
+static int in_args = 0;
+
+static Expr *optimise1(Expr *e, bool valneeded);
+static Expr *optimise1b(Expr *e, Expr *a1, Expr *a2, bool valneeded);
+
+static Expr *mkb(AEop op, TypeExpr *t, Expr *a1, Expr *a2, bool valneeded) {
+    Expr *e = mk_expr2(op, t, a1, a2);
+    if (debugging(DEBUG_AETREE) && syserr_behaviour > 0) {
+        pr_exproftype("optimise1b: ", e);
+    }
+    e = optimise1b(e, a1, a2, valneeded);
+    if (debugging(DEBUG_AETREE) && syserr_behaviour > 0) {
+        pr_exproftype("optimise1b= ", e);
+    }
+    return e;
+}
+
+static Expr *optimise1b(Expr *e, Expr *a1, Expr *a2, bool valneeded) {
+    AEop op = h0_(e);
+    TypeExpr *te = type_(e);
+/* floating point tree optimisations moved here from cfe/sem.c    */
+/* beware IEEE conformance, in that we optimise X+0.0 to X (NaN/-0).    */
+    if (op == s_minus)
+    { if (is_fpzero(a1)) { h0_(e) = s_neg; arg1_(e) = a2; return e; }
+      if (is_fpzero(a2)) return a1;
+      if (is_intzero(a2)) return a1;
+      if (is_intzero(a1)) return mk_expr1(s_neg, te, a2);
+      if (h0_(a2) == s_neg) {
+          /* a - -b => a + b */
+        h0_(e) = s_plus;
+        a2 = arg1_(a2);
+      } else
+      /* should also do -a - b => -(a + b)? */
+      if (h0_(a2) == s_integer) {
+        h0_(e) = op = s_plus;
+        a2 = mkintconst(type_(a2), -intval_(a2), 0);
+      } else if (h0_(a1) == s_plus && h0_(a2) == s_plus) {
+        Expr *a12 = arg2_(a1),
+             *a22 = arg2_(a2);
+        if (h0_(a12) == s_integer) {
+          if (h0_(a22) == s_integer) {
+            /* (a+k) - (b+k1) => (a-b) + (k1-k) */
+            a1 = mk_expr2(s_minus, te, arg1_(a1), arg1_(a2));
+            a2 = BinaryOp(s_minus, te, a12, a22);
+          } else {
+            /* (a+k) - b => (a-b) + k */
+            a1 = mk_expr2(s_minus, te, arg1_(a1), a2);
+            a2 = a12;
+          }
+        } else if (h0_(a22) == s_integer) {
+            /* a - (b+k) => (a-b) + -k */
+            a1 = mk_expr2(s_minus, te, a1, arg1_(a2));
+            a2 = mkintconst(te, -intval_(a22), 0);
+        } else
+          goto symmetric_done;
+        h0_(e) = op = s_plus;
+      } else
+        goto symmetric_done;
+    } else if (op == s_div) {
+    /* We deliberately avoid doing anything with 0/x here  */
+    /* else a divide by zero could go undetected at runtime*/
+    /* (we could turn it into (divcheck(x), 0), but        */
+    /* probably to little gain)                            */
+      TypeExpr *t = prunetype(te);
+      int32 rep = mcrepoftype(t);
+      /* Turn a signed division whose operands are both  */
+      /* known to be positive into an unsigned division  */
+      /* whose result is cast to signed. Rationale: s/w  */
+      /* implementations of unsigned divide are likely to*/
+      /* be a little faster, and if the divisor is a     */
+      /* constant power of two the improvement is        */
+      /* substantial                     */
+      if ((rep & MCR_SORT_MASK) == MCR_SORT_SIGNED &&
+        Div_SignBitClear(a1, rep) &&
+        Div_SignBitClear(a2, rep) &&
+        h0_(t) == s_typespec) {
+        TypeExpr *t1 = primtype_(typespecmap_(t) | bitoftype_(s_unsigned));
+        a1 = Div_CastToUnsigned(a1, t1);
+        a2 = Div_CastToUnsigned(a2, t1);
+        return optimise1(mk_expr1(s_cast,
+                                  t,
+                                  mk_expr2(s_div, t1, a1, a2)),
+                         valneeded);
+      }
+      if (h0_(a2) == s_integer) {
+        if (h0_(a1) == s_div && h0_(arg2_(a1)) == s_integer) {
+          /* (a/k)/k1 => a/(k*k1) */
+          a2 = BinaryOp(s_times, te, arg2_(a1), a2);
+          a1 = arg1_(a1);
+        }
+        if (intval_(a2) == 1) return a1;
+        if (intval_(a2) == -1 &&
+            (rep & MCR_SORT_MASK) == MCR_SORT_SIGNED) {
+          return mkunary(s_neg, a1);
+        }
+      }
+      goto symmetric_done;
+    }
+/* N.B. symmetric things only until symmetric_done...         */
+    if (h0_(a1) == s_integer || h0_(a1) == s_floatcon)
+    { Expr *w = a1;       /* move any const to arg2    */
+      a1 = a2;      /* note both can't be consts.   */
+      a2 = w;
+    }
+    if (op == s_and)
+    { if (is_intzero(a2)) return mkintconst(te, 0, 0);
+      if (is_intminusone(a2)) return a1;
+    }
+    if (op == s_or)
+    { if (is_intzero(a2)) return a1;
+      if (is_intminusone(a2)) return mkintconst(te, -1, 0);
+    }
+    if (op == s_xor)
+    { if (is_intzero(a2)) return a1;
+      if (is_intminusone(a2)) return mk_expr1(s_bitnot, te, a1);
+    }
+    if (op == s_plus)
+    { if (is_fpzero(a2)) return a1;
+      if (is_intzero(a2)) return a1;
+    }
+    if (op == s_times)
+    { if (is_fpone(a2)) return a1;
+      if (is_fpminusone(a2))
+          { h0_(e) = s_neg; arg1_(e) = a1; return e; }
+      if (is_intzero(a2)) return mkintconst(te, 0, 0);
+      if (is_intone(a2)) return a1;
+      if (is_intminusone(a2)) return mk_expr1(s_neg, te, a1);
+    }
+    if (h0_(a1) == op && h0_(arg2_(a1)) == s_integer) {
+      Expr *k1 = arg2_(a1);
+      if (h0_(a2) == s_integer) {
+      /* ((a op n) op m)  => a op (n op m) */
+        a1 = arg1_(a1);
+        a2 = BinaryOp(op, te, a2, k1);
+/* This can convert (e.g.)  (a + 1) + (-1) into  (a + 0) which does not  */
+/* get simplified further here. The codegenerator will treat this as     */
+/* just a, and the seemingly spurious +0 will serve to preserve the      */
+/* proper type of the expression.                                    */
+      } else if (h0_(a2) == op && h0_(arg2_(a2)) == s_integer) {
+      /* ((a op n) op (b op m)) => (a op b) op (m op n)) */
+        a1 = mkb(op, te, arg1_(a1), arg1_(a2), valneeded);
+        a2 = BinaryOp(op, te, arg2_(a2), k1);
+      } else {
+        a1 = mkb(op, te, arg1_(a1), a2, valneeded);
+        a2 = k1;
+      }
+    }
+    if (h0_(a2) == op && h0_(arg2_(a2)) == s_integer) {
+    /* a op (b op n) => (a op b) op n */
+      a1 = mkb(op, te, a1, arg1_(a2), valneeded);
+      a2 = arg2_(a2);
+    }
+    if (h0_(a2) == s_integer) {
+      if (op == s_and) {
+        AEop op2 = h0_(a1);
+        Expr *a, *a11 = arg1_(a1);
+        int32 k = intval_(a2);
+        /* ((a & k1) op b) & k  where (~k1 & k) == 0
+         *    => (a op b) & k
+         * (((a << n) >> n) op b) & k  (top n bits of k are 0)
+         *    => (a op b) & k
+         * (((a << n) >> m) op b) & k  (m > n, top m bits of k are 0)
+         *    => ((a >> (m-n)) op b) & k
+         *
+         * additionally, for the first case and op == + or -,
+         * k must be 2^p-2^q. For simplicity, at no great cost,
+         * we require k = 2^p-1 for all cases.
+         */
+
+        if ((op2 == s_and || op2 == s_or || op2 == s_xor) &&
+            (a = RemovableSignOrZeroExtension(a11, k)) != NULL)
+          arg1_(a1) = a;
+
+        else if (op2 == s_plus || op2 == s_minus) {
+          int32 n = k+1;
+          if ((n & -n) == n &&
+              (a = RemovableSignOrZeroExtension(a11, k)) != NULL)
+            arg1_(a1) = a;
+        }
+        /* ((a << n) >> n) & k  (top n bits of k are 0)
+         *    => a & k
+         * ((a << n) >> m) & k  (m > n, top m bits of k are 0)
+         *    => (a >> (m-n)) & k
+         * (the apparent transformation of (a & k) & k1 has already
+         *  been handled above).
+         */
+        else if ((a = RemovableSignOrZeroExtension(a1, k)) != NULL)
+          a1 = a;
+
+      /* (a | k1) & k => (a & k) | (k & k1) */
+        if (op2 == s_or && h0_(arg2_(a1)) == s_integer) {
+          Expr *x1 = a1;
+          a1 = mkb(s_and, type_(x1), arg1_(x1), a2, valneeded);
+          a2 = BinaryOp(s_and, te, arg2_(x1), a2);
+          h0_(e) = op = s_or;
+        }
+      }
+    /* (a & ~k) | k gets transformed here to a | k, to cheer up
+     * a common bitfield-setting case
+     */
+      if (op == s_or &&
+          h0_(a1) == s_and && h0_(arg2_(a1)) == s_integer &&
+        intval_(a2) == ~intval_(arg2_(a1)))
+        a1 = arg1_(a1);
+
+      if (op == s_times) {
+      /* (a << n) * m =>  a * (m << n)
+       *  if (m << n) doesn't overflow
+       */
+        if (h0_(a1) == s_leftshift && h0_(arg2_(a1)) == s_integer) {
+          int32 shift = intval_(arg2_(a1));
+          int32 n1 = intval_(a2), n2 = ((unsigned32)1 << shift);
+          int32 n3 = n1 * n2;
+          if ((n1 ^ n3 >= 0) && (n3 / n2 == n1)) {
+            a1 = arg1_(a1);
+            a2 = mkintconst(te_int, n3, 0);
+          }
+        }
+        if (h0_(a1) == s_plus && h0_(arg2_(a1)) == s_integer) {
+        /* (a + m) * n => (a * n) + (m * n) */
+          Expr *x1 = a1;
+          a1 = mk_expr2(s_times, type_(x1), arg1_(x1), a2);
+          a2 = BinaryOp(s_times, te, arg2_(x1), a2);
+          h0_(e) = op = s_plus;
+        } else if (h0_(a1) == s_neg) {
+        /* (- a) * n => - (a * n) */
+          return mk_expr1(s_neg, te, mk_expr2(s_times, te, arg1_(a1), a2));
+        }
+      }
+    }
+    if (op == s_plus) {
+    /* a + -b => a - b; -a + b => b-a */
+        if (h0_(a2) == s_neg)
+            h0_(e) = s_minus, a2 = arg1_(a2);
+        else if (h0_(a1) == s_neg) {
+            Expr *t = a2;
+            h0_(e) = s_minus, a2 = arg1_(a1);
+            a1 = t;
+        }
+    }
+    if (op == s_or &&
+        h0_(a1) == s_and && h0_(arg2_(a1)) == s_integer &&
+        h0_(a2) == s_and && h0_(arg2_(a2)) == s_integer) {
+
+      int32 k1 = intval_(arg2_(a1)),
+            k = intval_(arg2_(a2));
+      if (is_same(arg1_(a1), arg1_(a2))) {
+      /* (x & k1) | (x & k) => x & (k1 | k)
+       * Motivation: clean up expansion of bitfield &= k.
+       */
+        return mkb(s_and, te, arg1_(a1), mkintconst(te, k | k1, 0), valneeded);
+
+      } else if (k1 == ~k) {
+       /* (x & ~k) | ((x op y) & k) => x op (y & k)
+        *  op = or, xor, or
+        *  op = plus or minus and k is the top n bits (some n)
+        *  *not* op = and, which will clear bits outside k.
+        * Motivation: clean up expansion of bitfield op=.
+        */
+        AEop op2 = h0_(arg1_(a1));
+        if (op2 == s_and || op2 == s_or || op2 == s_xor ||
+            op2 == s_plus || op2 == s_minus) {
+          Expr *t = a1; a1 = a2; a2 = t;
+          k = k1;
+        }
+        op2 = h0_(arg1_(a2));
+        if (( (op2 == s_and || op2 == s_or || op2 == s_xor) ||
+              ( (op2 == s_plus || op2 == s_minus) &&
+                k + (k & -k) == 0)
+            ) &&
+            is_same(arg1_(a1), arg1_(arg1_(a2)))) {
+          Expr *y = arg2_(arg1_(a2));
+          TypeExpr *t = type_(a2);
+          h0_(e) = op2;
+          a1 = arg1_(a1);
+          if (op2 == s_and) {
+          /* for op = and, the replacement is x & ~(~y & k)    */
+          /* (equivalently, x & (y | ~k), but assuming k is    */
+          /* compact and ~k isn't, the former is a better form.*/
+            if (h0_(y) == s_bitnot)
+              y = arg1_(y);
+
+            else if (h0_(y) == s_leftshift && h0_(arg2_(y)) == s_integer &&
+                     ((((int32)1 << intval_(arg2_(y))) - 1) & k) == 0 &&
+                     h0_(IgnoreSignednessChange(arg1_(y))) == s_bitnot) {
+              Expr *shval = arg2_(y);
+              y = IgnoreSignednessChange(arg1_(y));
+              y = mk_expr2(s_leftshift, t, arg1_(y), shval);
+
+            } else
+              y = mk_expr1(s_bitnot, t, y);
+
+            a2 = mk_expr1(s_bitnot, t,
+                   mk_expr2(s_and, t, y, arg2_(a2)));
+
+          } else
+#ifdef TARGET_HAS_SCALED_OPS
+            /* if y has the form (z << n), change the transformation
+             * result x op (y & k)  to  x op ((z & (k >> n)) << n)
+             * (to allow the shift to be included in op)
+             */
+          if (h0_(y) == s_leftshift && h0_(arg2_(y)) == s_integer)
+            a2 = mk_expr2(s_leftshift, t,
+                   mk_expr2(s_and, t, arg1_(y),
+                     mkintconst(t, (unsigned32)k >> intval_(arg2_(y)), 0)),
+                   arg2_(y));
+          else
+#endif
+          if (h0_(y) == s_integer)
+            a2 = mkintconst(t, k & intval_(y), 0);
+          else
+            a2 = mk_expr2(s_and, t, y, arg2_(a2));
+        }
+      }
+    }
+#define swaprelop(op) (((op)==s_greater||(op)==s_less) ? \
+                       (s_greater+s_less) - (op) : \
+                       (s_greaterequal+s_lessequal) - (op));
+    if (op == s_andand && isinequality_(h0_(a1))
+                       && isinequality_(h0_(a2))) {
+        Expr *a1v = arg2_(a1), *a1k = arg1_(a1); int32 op1 = h0_(a1);
+        Expr *a2v = arg1_(a2), *a2k = arg2_(a2); int32 op2 = h0_(a2);
+        if (h0_(a1v) == s_integer) a1v = arg1_(a1), a1k = arg2_(a1),
+            op1 = swaprelop(op1);
+        if (h0_(a2v) == s_integer) a2v = arg2_(a2), a2k = arg1_(a2),
+            op2 = swaprelop(op2);
+        if (h0_(a1k) == s_integer && h0_(a2k) == s_integer &&
+            is_same(a1v, a2v))
+        {   int32 k1 = intval_(a1k), k2 = intval_(a2k);
+            if (op1 == s_greater || op1 == s_greaterequal)
+            {   {   int32 t = op1; op1 = swaprelop(op2); op2 = swaprelop(t); }
+                {   int32 t = k1; k1 = k2; k2 = t; }
+            }
+            /* cc_msg("range %d %d x && %d %d x\n", k1, op1, k2, op2); */
+            if (op1 == s_less && k1 != 0x7fffffff) op1 = s_lessequal, k1++;
+            if (op2 == s_lessequal && k2 != 0x7fffffff) op2 = s_less, k2++;
+            if (op1 == s_lessequal && op2 == s_less && k2-k1 > 0)
+            {   return mkb(s_less, te_boolean,
+                           mk_expr2(s_minus, te_uint, a1v,
+                                    mkintconst(te_uint, k1, 0)),
+                           mkintconst(te_uint, k2-k1, 0), valneeded);
+            }
+        }
+    }
+    if (op == s_oror && h0_(a1) == s_equalequal
+                     && h0_(a2) == s_equalequal) {
+        Expr *a1v = arg2_(a1), *a1k = arg1_(a1);
+        Expr *a2v = arg1_(a2), *a2k = arg2_(a2);
+        if (h0_(a1v) == s_integer) a1v = arg1_(a1), a1k = arg2_(a1);
+        if (h0_(a2v) == s_integer) a2v = arg2_(a2), a2k = arg1_(a2);
+        if (h0_(a1k) == s_integer && h0_(a2k) == s_integer &&
+            is_same(a1v, a2v))
+        {   int32 k1 = intval_(a1k), k2 = intval_(a2k);
+            if (k2<k1) { int32 k=k1; k1=k2; k2=k; }
+            if (k2==k1+1)
+            {   return mkb(s_less, te_boolean,
+                           mk_expr2(s_minus, te_uint, a1v,
+                                    mkintconst(te_uint, k1, 0)),
+                           mkintconst(te_uint, k2-k1+1, 0), valneeded);
+            }
+        }
+    }
+symmetric_done:
+    arg1_(e) = a1;
+    arg2_(e) = a2;
+    return e;
+}
+
+static int32 checkdotoff(Expr const *e) {
+    int32 off = exprdotoff_(e);
+    if (off == OFFSET_UNSET) { syserr("undefined dot offset"); off = 0; }
+    return off;
 }
 
 static Expr *optimise1(Expr *e, bool valneeded)
 {   AEop op = h0_(e);
     Expr *e1;
     if (debugging(DEBUG_AETREE) && syserr_behaviour > 0) {
-      if (op != s_return) {
-        cc_msg("optimise1: "); pr_expr(e);
-        cc_msg(" of type "); pr_typeexpr(typeofexpr(e), 0);
-        cc_msg("\n");
-      }
+#ifndef NO_RETURN_EXPRESSIONS
+      if (op != s_return)
+#endif
+        pr_exproftype("optimise1: ", e);
     }
     switch (op)
     {
@@ -439,16 +688,15 @@ static Expr *optimise1(Expr *e, bool valneeded)
         case s_throw:
             if (arg1_(e)) arg1_(e) = optimise1(arg1_(e), YES);
             break;
-#ifndef CPLUSPLUS               /* soon dropped for C too.              */
+#ifndef NO_RETURN_EXPRESSIONS  /* perhaps soon dropped for C too.       */
         case s_return:
             e = arg1_(e);
             if (h0_(e) != s_fnap) { e = optimise1(e, YES); break; }
             /* drop through */
 #endif
         case s_fnap:
-            arg1_(e) = optimise1(arg1_(e), YES);
-            optimiselist(exprfnargs_(e));
-#ifndef CPLUSPLUS
+            e = optimisefnap(e);
+#ifndef NO_RETURN_EXPRESSIONS
             if (op == s_return) break;
 #endif
             /*
@@ -456,17 +704,42 @@ static Expr *optimise1(Expr *e, bool valneeded)
              * transformation from 'fn()' to (let x; x=fn(),x)'.
              * Note: Temp binders are allocated in optimise0().
              * CPLUSPLUS: beware _ctor/_dtor and temps.
+             * @@@ LDS 18-Oct-94: Partly fixed... reftemps() lifetimes wrong.
              */
-            if ((mcrepofexpr(e) >> MCR_SORT_SHIFT) == 3 && valneeded)
+            if ((mcrepofexpr(e) & MCR_SORT_MASK) == MCR_SORT_STRUCT)
             {   TypeExpr *t = typeofexpr(e);
-                Binder *gen = gentempbinder(t);
-                new_binders = mkSynBindList(new_binders, gen);
-                e = mk_expr2(s_comma,
-                             type_(e),
-                             mk_expr2(s_assign, t, (Expr*)gen, e),
-                             (Expr*) gen);
+                Binder *gen;
+                bool usefancytemp = NO;
+                if (LanguageIsCPlusPlus)
+                {   TypeExpr *pt = princtype(t);
+                    /* use a fancy C++ temp if this is an object of class type
+                       that needs a ctor or has a dtor */
+                    if (isclasstype_(pt) &&
+                        tagbindbits_(typespectagbind_(pt)) & (TB_NEEDSCTOR|TB_HASDTOR))
+                        usefancytemp = YES;
+                }
+                /* Note that this can't happen when optimise0 is called from
+                 * cg, because then all structure-returning functions are on
+                 * the rhs of assignments (assured by the call to optimise0
+                 * before the tree is handed to cg), and for fn calls on the
+                 * rhs of assignments optimise1 isn't called for the fn call,
+                 * just optimisefnap (see below).
+                 * If it could happen, the call to genreftemp / genexprtemp
+                 * below would cause trouble, since the temporaries thus
+                 * created wouldn't be bound.
+                 */
+                if (usefancytemp)
+                    gen = (in_args || !valneeded) ? genexprtemp(t) : genreftemp(t);
+                else
+                {   gen = gentempbinder(t);
+                    new_binders = mkSynBindList(new_binders, gen);
+                }
+                e = mk_expr2(s_assign, t, (Expr*)gen, e);
+                if (valneeded)
+                    e = mk_expr2(s_comma, t, e, (Expr*)gen);
             }
             break;
+        case s_init:
         case s_assign:
             arg1_(e) = optimise1(arg1_(e), YES);
 /* Nastiness here in C++: consider:                                     */
@@ -482,36 +755,35 @@ static Expr *optimise1(Expr *e, bool valneeded)
 /* Use 'isproperclass()' to determine this.                             */
 /* @@@ hmm, for such a b with a vbase, we would have generated a fncall */
 /* instead of an assign already (or a partial assign).                  */
-            if (h0_(arg2_(e)) == s_fnap &&
+
 /* AM finds it hard to believe the following disjunction can fail.      */
-                (h0_(arg1_(e)) == s_binder  ||
-                 h0_(arg1_(e)) == s_content ||
-                 h0_(arg1_(e)) == s_dot))               /* s_dotstar?   */
-            {
+            if (h0_(arg1_(e)) == s_binder  ||
+                h0_(arg1_(e)) == s_content ||
+                h0_(arg1_(e)) == s_dot)                /* s_dotstar?    */
+            {   Expr *a2 = arg2_(e);
+                if (h0_(a2) == s_fnap)
 /* Specifically avoid the temp introduction (case s_fnap above) for     */
 /* struct-returning functions whose result is directly                  */
 /* assigned to a binder or via s_content...                             */
-                Expr *funct = arg2_(e);
-                arg1_(funct) = optimise1(arg1_(funct), YES);
-                optimiselist(exprfnargs_(funct));
+                {   arg2_(e) = optimisefnap(a2);
+                    break;
+                }
+                if (h0_(a2) == s_let)
+                {   Expr *a22 = arg2_(a2);
+                    if (h0_(a22) == s_fnap)
+                    {   arg2_(a2) = optimisefnap(a22);
+                        break;
+                    }
+                }
             }
-            else
             {   Expr *a1 = arg1_(e),
                      *a2 = optimise1(arg2_(e), YES);
-/* The next line is a bit of a hack: it removes casts before indirect   */
-/* stores to byte/halfword.  This to avoid CSE helpfully commoning up   */
-/* the AND #255 (et al) ops, which then optimise to a MOV.  This is     */
-/* in principle harmless, but can result in extra reg use; e.g.         */
-/* f(int x, char *p, short *q) { p[1]=x; p[2]=x; q[3]=x; q[4]=x; return x;} */
-/* Only do it if the (cast) result value is not needed.                 */
-                if (!valneeded && h0_(a2) == s_cast && h0_(a1) == s_content)
-                {   int32 a21rep = mcrepofexpr(arg1_(a2)), a1rep;
-                    if ((a21rep >> MCR_SORT_SHIFT) < 2 &&
-                        (a21rep & MCR_SIZE_MASK) == sizeof_int &&
-                        ((a1rep = mcrepofexpr(a1)) >> MCR_SORT_SHIFT) < 2 &&
-                        (a1rep & MCR_SIZE_MASK) < sizeof_int)
-                      a2 = arg1_(a2);
-                }
+                if ( !valneeded &&
+                     h0_(a2) == s_cast &&
+                     mcrepofexpr(arg1_(a2)) < MCR_SORT_FLOATING &&
+                     (mcrepofexpr(a1) & MCR_SIZE_MASK) == 1 &&
+                     h0_(a1) != s_binder)
+                  a2 = arg1_(a2);
                 arg2_(e) = a2;
             }
             break;
@@ -523,9 +795,9 @@ static Expr *optimise1(Expr *e, bool valneeded)
                         optimise1(mk_expr1(s_addrof, type_(e), arg2_(e1)), YES));
                 break;
             }
-            if (h0_(e1) == s_assign)
+            if (h0_(e1) == s_assign || h0_(e1) == s_init)
             {   /* & a = b -> (a = b, & a) */
-/* @@@ AM: this is wrong for side-effects in 'a'!!!?                    */
+/* @@@ AM: this is wrong for side-effects in 'a'!!!?            */
                 e = mk_expr2(s_comma, type_(e), e1,
                     optimise1(mk_expr1(s_addrof, type_(e), arg1_(e1)), YES));
                 break;
@@ -547,22 +819,21 @@ static Expr *optimise1(Expr *e, bool valneeded)
 /* looked after in a special way when I do something like &(a . b)       */
 /* Note this can only be legal if a as an lvalue so the result (&a)+nb   */
 /* will still be OK - so things like structure-returning functions are   */
-/* not involved here.                                                    */
-/* AM Nov 92: Hmm, struct fn results now have temps, so OK?              */
+/* not involved here.                      */
+/* AM Nov 92: Hmm, struct fn results now have temps, so OK?           */
             if (h0_(e1) == s_dot) {
                 e = mk_expr2(s_plus, type_(e),
 /* beware - this means optimise() is invoked twice on arg1_(e) */
                       optimise1(mk_expr1(s_addrof, type_(e), arg1_(e1)), YES),
-                      mkintconst(te_int, exprdotoff_(e1), 0));
+                      mkintconst(te_int, checkdotoff(e1), 0));
                 break;
             }
             if ((h0_(e1) != s_binder) && (h0_(e1) != s_comma)
 #ifdef SOFTWARE_FLOATING_POINT
-                && (h0_(e1) != s_floatcon)
+                && !(software_floating_point_enabled && h0_(e1) == s_floatcon)
 #endif
                )
-                /*
-                 * Check that we have a binder for &.  However, beware we
+                /* Check that we have a binder for &.  However, beware we
                  * might have a structure returning function which will
                  * get transformed above.  Should test for this fully but
                  * testing for s_comma is probably ok !.
@@ -570,9 +841,9 @@ static Expr *optimise1(Expr *e, bool valneeded)
                 syserr("optimise&(%ld,$s)", (long)h0_(e1), h0_(e1));
                 /* syserr(syserr_optimise, (long)h0_(e1)); */
             break;
-#ifdef CPLUSPLUS
+
         case_content:
-#endif
+
         case s_content:  /* get rid of extra &'s and *'s introduced above */
             arg1_(e) = e1 = optimise1(arg1_(e), YES);
             if (h0_(e1) == s_addrof &&
@@ -580,17 +851,17 @@ static Expr *optimise1(Expr *e, bool valneeded)
                 same_pointedto_types(e, arg1_(e1)))
               e = arg1_(e1);
             break;
-#ifndef CPLUSPLUS       /* Nov 92: leave old code for C for now.        */
+#ifdef PRE_CPLUSPLUS_WAY       /* Nov 92: leave old code for C for now.        */
         case s_dot:  /* s_arrow already removed */
             e1 = optimise1(arg1_(e), YES);
             if (h0_(e1) == s_dot) {
-                exprdotoff_(e) += exprdotoff_(e1);
+                exprdotoff_(e) = checkdotoff(e) + checkdotoff(e1);
                 e1 = arg1_(e1);
             } else if (h0_(e1) == s_content) {
                 /* turn *(&foo + x) . y into &foo . (x+y) */
                 Expr *e2 = arg1_(e1);
                 if (h0_(e2) == s_plus && h0_(arg2_(e2)) == s_integer) {
-                    exprdotoff_(e) += intval_(arg2_(e2));
+                    exprdotoff_(e) = checkdotoff(e) + intval_(arg2_(e2));
                     e1 = mk_expr1(s_content, type_(e1), arg1_(e2));
                 }
             }
@@ -598,10 +869,10 @@ static Expr *optimise1(Expr *e, bool valneeded)
             break;
 #else
         case s_dot:     /* replace s_dot with s_content */
-/* NB. all s_dot code can be removed from cg.                           */
-            if ((mcrepofexpr(arg1_(e)) >> MCR_SORT_SHIFT) != 3)
+/* NB. all s_dot code can be removed from cg.            */
+            if ((mcrepofexpr(arg1_(e)) & MCR_SORT_MASK) != MCR_SORT_STRUCT)
             {   /* Fetching a word from a single-word struct!.          */
-                /* Probably just e (see cg_content_for_dot).            */
+                /* Probably just e (see cg_content_for_dot).        */
                 /* @@@ Check 'volatile'.                                */
                 /* Insert cast so types are right (e.g. for cg_fnap).   */
                 /* This code wouldn't work for a byte in a union!       */
@@ -614,7 +885,7 @@ static Expr *optimise1(Expr *e, bool valneeded)
             }
             else
             {   TypeExpr *tp = ptrtotype_(type_(e));
-                Expr *e2 = mkintconst(te_int, exprdotoff_(e), 0);
+                Expr *e2 = mkintconst(te_int, checkdotoff(e), 0);
 /* Beware, assumes optimise(s_fnap(struct)) is address takeable!.       */
                 e = mk_expr1(s_content, type_(e),
                       mk_expr2(s_plus, tp,
@@ -622,7 +893,7 @@ static Expr *optimise1(Expr *e, bool valneeded)
             }
             goto case_content;
         case s_dotstar:
-            if ((mcrepofexpr(arg1_(e)) >> MCR_SORT_SHIFT) != 3)
+            if ((mcrepofexpr(arg1_(e)) & MCR_SORT_MASK) != MCR_SORT_STRUCT)
             {   /* Fetching a word from a single-word struct!.          */
                 /* Replace with (e2, e1), i.e. eval e2 for side-effects */
                 /* and return e1.  Implies p->*NULL == p->*(&S::s)!!    */
@@ -652,7 +923,7 @@ static Expr *optimise1(Expr *e, bool valneeded)
         case s_cond:
             e1 = e;
             arg1_(e) = optimise1(arg1_(e), YES);
-            if ((mcrepofexpr(e) >> MCR_SORT_SHIFT) == 3)
+            if ((mcrepofexpr(e) & MCR_SORT_MASK) == MCR_SORT_STRUCT)
             {   /* The expression is struct-valued */
                 TypeExpr *te = type_(e);
                 TypeExpr *pt = ptrtotype_(te);
@@ -669,169 +940,21 @@ static Expr *optimise1(Expr *e, bool valneeded)
             arg2_(e) = optimise1(arg2_(e), valneeded);
             break;
         case s_cast:
-            /* /* beware the 'EQ' test on the next line!                */
-            arg1_(e) = optimise1(arg1_(e),
-                                 valneeded && typeofexpr(e) != te_void);
+            arg1_(e) = optimise1(arg1_(e), valneeded && mcrepofexpr(e) != 0);
             e = optimise_cast(e);
             break;
-#ifdef EXTENSION_FRAC
-        case s_xdiv:
-        case s_xtimes:
-#endif
-        case s_div:
         case s_and:
         case s_times:
         case s_plus:
         case s_or:
         case s_xor:        /* these are both commutative and associative */
         case s_minus:      /* this isn't -- see goto below */
+        case s_div:        /* nor this */
+        case s_andand:     /* nor this */
+        case s_oror:       /* nor this */
             {   Expr *a1 = optimise1(arg1_(e), YES);
                 Expr *a2 = optimise1(arg2_(e), YES);
-/* floating point tree optimisations moved here from cfe/sem.c          */
-/* beware IEEE conformance, in that we optimise X+0.0 to X (NaN/-0).    */
-                if (op == s_minus)
-                {   if (is_fpzero(a1))
-                        { h0_(e) = s_neg; arg1_(e) = a2; break; }
-                    if (is_fpzero(a2)) { e = a1; break; }
-                    if (is_intzero(a2)) { e = a1; break; }
-                    if (is_intzero(a1)) { e = mkunary(s_neg, a2); break; }
-                    if (h0_(a2) == s_neg)
-                        /* a - -b => a + b */
-                        h0_(e) = s_plus, a2 = arg1_(a2);
-                    /* should also do -a - b => -(a + b)? */
-                    goto symmetric_done;
-                }
-#ifdef EXTENSION_FRAC
-                if (op == s_xdiv) goto symmetric_done;
-#endif
-                if (op == s_div) {
-                /* We deliberately avoid doing anything with 0/x here  */
-                /* else a divide by zero could go undetected at runtime*/
-                /* (we could turn it into (divcheck(x), 0), but        */
-                /* probably to little gain)                            */
-                    if (h0_(a2) == s_integer) {
-                        if (h0_(a1) == s_div && h0_(arg2_(a1)) == s_integer) {
-                            a2 = mkbinary(s_times, arg2_(a1), a2);
-                            a1 = arg1_(a1);
-                        }
-                        if (intval_(a2) == 1) { e = a1; break; }
-                        if (intval_(a2) == -1 &&
-                            (mcrepofexpr(e) >> MCR_SORT_SHIFT) == 0) {
-                            e = mkunary(s_neg, a1); break;
-                        }
-                    }
-                    goto symmetric_done;
-                }
-/* N.B. symmetric things only until symmetric_done...                   */
-                if (h0_(a1) == s_integer || h0_(a1) == s_floatcon)
-                {   Expr *w = a1;       /* move any const to arg2       */
-                    a1 = a2;            /* note both can't be consts.   */
-                    a2 = w;
-                }
-                if (op == s_and)
-                {   if (is_intzero(a2)) { e = mkintconst(type_(e), 0, 0); break; }
-                    if (is_intminusone(a2)) { e = a1; break; }
-                }
-                if (op == s_or)
-                {   if (is_intzero(a2)) { e = a1; break; }
-                    if (is_intminusone(a2)) { e = mkintconst(type_(e), -1, 0); break; }
-                }
-                if (op == s_xor)
-                {   if (is_intzero(a2)) { e = a1; break; }
-                    if (is_intminusone(a2)) { e = mkunary(s_bitnot, a1); break; }
-                }
-                if (op == s_plus)
-                {   if (is_fpzero(a2)) { e = a1; break; }
-                    if (is_intzero(a2)) { e = a1; break; }
-                }
-                if (op == s_times)
-                {   if (is_fpone(a2)) { e = a1; break; }
-                    if (is_fpminusone(a2))
-                        { h0_(e) = s_neg; arg1_(e) = a1; break; }
-                    if (is_intzero(a2)) { e = mkintconst(type_(e), 0, 0); break; }
-                    if (is_intone(a2)) { e = a1; break; }
-                    if (is_intminusone(a2)) { e = mkunary(s_neg, a1); break; }
-                    if (h0_(a2) == s_integer) {
-                        if ((h0_(a1) == s_plus || h0_(a1) == s_minus) &&
-                            h0_(arg2_(a1)) == s_integer)
-                            return optimise1(mkbinary(h0_(a1),
-                                                      mkbinary(s_times, arg1_(a1), a2),
-                                                      mkbinary(s_times, arg2_(a1), a2)),
-                                             valneeded);
-                    }
-                }
-                if (h0_(a1) == op || (op == s_plus && h0_(a1) == s_minus)) {
-                    if (h0_(arg2_(a1)) == s_integer) {
-                        if (h0_(a2) == s_integer) {
-                    /* ((a op n) op m)  => a op (n op m) */
-                            a2 = BinaryOp(h0_(a1), type_(e), a2, arg2_(a1));
-                            a1 = arg1_(a1);
-/* This can convert (e.g.)  (a + 1) + (-1) into  (a + 0) which does not  */
-/* get simplified further here. The codegenerator will treat this as     */
-/* just a, and the seemingly spurious +0 will serve to preserve the      */
-/* proper type of the expression.                                        */
-                        } else if (h0_(a2) == op && h0_(arg2_(a2)) == s_integer) {
-                            Expr *x1 = a1;
-                            a1 = mk_expr2(op, type_(e), arg1_(x1), arg1_(a2));
-                            a2 = BinaryOp(h0_(x1), type_(e), arg2_(a2), arg2_(x1));
-                        } else if ((op == s_plus && h0_(a2) == s_minus) && h0_(arg2_(a2)) == s_integer) {
-                            Expr *x1 = a1;
-                            a1 = mk_expr2(op, type_(e), arg1_(x1), arg1_(a2));
-                            if (h0_(x1) == s_minus) {
-                                a2 = BinaryOp(s_plus, type_(e), arg2_(a2), arg2_(x1));
-                                h0_(e) = op = s_minus;
-                            } else
-                                a2 = BinaryOp(s_minus, type_(e), arg2_(x1), arg2_(a2));
-                        } else {
-                            AEop op2 = h0_(a1);
-                            Expr *x1 = a1;
-                            a1 = mk_expr2(op, type_(e), arg1_(x1), a2);
-                            a2 = arg2_(x1);
-                            h0_(e) = op = op2;
-                        }
-                    }
-                }
-                if (h0_(a2) == op || (op == s_plus && h0_(a2) == s_minus) && h0_(arg2_(a2)) == s_integer) {
-                    AEop op2 = h0_(a2);
-                    a1 = mk_expr2(op, type_(e), a1, arg1_(a2));
-                    a2 = arg2_(a2);
-                    h0_(e) = op = op2;
-                }
-                /* (a & ~k) | k gets transformed here to a | k, to cheer up
-                 * a common bitfield-setting case
-                 */
-                if (op == s_or && h0_(a2) == s_integer &&
-                    h0_(a1) == s_and && h0_(arg2_(a1)) == s_integer &&
-                    intval_(a2) == ~intval_(arg2_(a1)))
-                    a1 = arg1_(a1);
-
-                if (op == s_times && h0_(a2) == s_integer)
-                {   if (h0_(a1) == s_leftshift && h0_(arg2_(a1)) == s_integer)
-                    {   int32 shift = intval_(arg2_(a1));
-                        int32 n1 = intval_(a2), n2 = ((unsigned32)1 << shift);
-                        int32 n3 = n1 * n2;
-                        if ((n1 ^ n3 >= 0) && (n3 / n2 == n1)) {
-                            a1 = arg1_(a1);
-                            a2 = mkintconst(te_int, n3, 0);
-                        }
-                    }
-                    if (h0_(a1) == s_neg) {
-                        e = mkunary(s_neg, mkbinary(s_times, arg1_(a1), a2));
-                        break;
-                    }
-                }
-                if (op == s_plus) {
-                /* a + -b => a - b; -a + b => b-a */
-                    if (h0_(a2) == s_neg)
-                        h0_(e) = s_minus, a2 = arg1_(a2);
-                    else if (h0_(a1) == s_neg) {
-                        Expr *t = a2;
-                        h0_(e) = s_minus, a2 = arg1_(a1);
-                        a1 = t;
-                    }
-                }
-symmetric_done: arg1_(e) = a1;
-                arg2_(e) = a2;
+                e = optimise1b(e, a1, a2, valneeded);
             }
             break;
 #ifdef RANGECHECK_SUPPORTED
@@ -845,68 +968,143 @@ symmetric_done: arg1_(e) = a1;
 #endif
         case s_equalequal:
         case s_notequal:
+          { Expr *a1 = optimise1(arg1_(e), YES);
+            Expr *a2 = optimise1(arg2_(e), YES);
+            if (h0_(a1) == s_integer) { Expr *w = a1; a1 = a2; a2 = w; }
+            if (h0_(a2) == s_integer) {
             /* in comparison of signed char for (in)equality against positive
-               constant <= SCHAR_MAX, cast the signed char to unsigned char
-               (in the belief that zero extension is cheaper than sign extn).
+             * constant <= SCHAR_MAX, cast the signed char to unsigned char
+             * (in the belief that zero extension is cheaper than sign extn).
              */
-            {   Expr *a1 = optimise1(arg1_(e), YES);
-                Expr *a2 = optimise1(arg2_(e), YES);
-                if (h0_(a1) == s_integer) { Expr *w = a1; a1 = a2; a2 = w; }
-                if (h0_(a2) == s_integer &&
-                    intval_(a2) >= 0 && intval_(a2) < (1 << 7))
-                {   TypeExpr *t = prunetype(typeofexpr(a1));
-                    if (h0_(t) == s_typespec) {
-                        SET_BITMAP tm = typespecmap_(t);
-                        if ((tm & (bitoftype_(s_char)|bitoftype_(s_signed))) ==
-                                  (bitoftype_(s_char)|bitoftype_(s_signed)))
-                        {   tm ^= (bitofstg_(s_signed)|bitofstg_(s_unsigned));
-                            a1 = optimise1(mkcast(s_cast, a1, primtype_(tm)), YES);
-                        }
-                    }
+              if (h0_(a1) != s_binder &&
+                  intval_(a2) >= 0 && intval_(a2) < (1 << 7)) {
+                TypeExpr *t = prunetype(typeofexpr(a1));
+                if (h0_(t) == s_typespec) {
+                  SET_BITMAP tm = typespecmap_(t);
+                  if ((tm & (bitoftype_(s_char)|bitoftype_(s_signed))) ==
+                            (bitoftype_(s_char)|bitoftype_(s_signed))) {
+                    tm ^= (bitoftype_(s_signed)|bitoftype_(s_unsigned));
+                    a1 = optimise1(mkcast(s_cast, a1, primtype_(tm)), YES);
+                  }
                 }
-                arg1_(e) = a1;
-                arg2_(e) = a2;
+              }
+              if (intval_(a2) == 0) {
+                a1 = IgnoreSignednessChange(a1);
+                if (h0_(a1) == s_and && h0_(arg2_(a1)) == s_integer) {
+                /* This is meant to improve comparisons of (unsigned) bitfields
+                 * against 0. It turns the lh operand from (a shift n1) & n2
+                 * into a & (n2 opposite_shift n1).
+                 */
+                  int32 n1 = intval_(arg2_(a1));
+                  Expr *a11 = IgnoreSignednessChange(arg1_(a1));
+                  if (h0_(a11) == s_rightshift &&
+                    h0_(arg2_(a11)) == s_integer) {
+                    int32 n2 = intval_(arg2_(a11));
+                    if ((n1 & (-1 << (32 - n2))) == 0 ||
+                        (mcrepofexpr(a11) & MCR_SORT_MASK) == MCR_SORT_UNSIGNED) {
+                      arg1_(a1) = arg1_(a11);
+                      arg2_(a1) = mkintconst(type_(a1), n1 << n2, 0);
+                    }
+                  } else if (h0_(a11) == s_leftshift &&
+                             h0_(arg2_(a11)) == s_integer) {
+                    int32 n2 = intval_(arg2_(a11));
+                    arg1_(a1) = arg1_(a11);
+                    arg2_(a1) = mkintconst(type_(a1), just32bits_((unsigned32)n1) >> n2, 0);
+                  }
+                } else if (h0_(a1) == s_rightshift && h0_(arg2_(a1)) == s_integer) {
+                /* This is meant to improve comparisons of (signed) bitfields
+                 * against 0. It turns the lh operand from (a << n2) >> n1
+                 * (n1 >= n2) into (a & k) where k has n2 ms and (n1-n2) ls 0s
+                 * and other bits 1.
+                 */
+                  int32 n1 = intval_(arg2_(a1)),
+                        n2 = 0,
+                        mask = 0;
+                  Expr *a11 = IgnoreSignednessChange(arg1_(a1));
+                  if (h0_(a11) == s_leftshift && h0_(arg2_(a11)) == s_integer) {
+                    n2 = intval_(arg2_(a11));
+                    a11 = arg1_(a11);
+                    mask = (int32)1 << (32-n2);
+                    /* relying on x<<0 having previously been transformed into x */
+                    /* to avoid an undefined << 32.                              */
+                  }
+                  if (n2 <= n1) {
+                    mask -= (int32)1 << (n1-n2);
+                    h0_(a1) = s_and;
+                    arg1_(a1) = a11;
+                    arg2_(a1) = mkintconst(type_(a1), mask, 0);
+                  }
+                }
+              }
             }
+            arg1_(e) = a1;
+            arg2_(e) = a2;
             break;
-#ifdef SOFTWARE_FLOATING_POINT
-/* We could do this more generally to turn s_displace back to s_assign  */
-/* if !valneeded.                                                       */
-        case s_displace:
-            arg1_(e) = optimise1(arg1_(e), YES),
-            arg2_(e) = optimise1(arg2_(e), YES);
-/* mip/cg.c cannot handle s_displace (postfix ++ and --) for structs.   */
-/* Exploit the fact that LHS of s_displace is side-effect free.         */
-            if (mcrepofexpr(e) == 0x03000008)
-            {   TypeExpr *t = typeofexpr(e);
-                Binder *gen = gentempbinder(t);
-                new_binders = mkSynBindList(new_binders, gen);
-                e = mk_expr2(s_comma, type_(e),
-                        mk_expr2(s_assign, t, (Expr *)gen, arg1_(e)),
-                        mk_expr2(s_comma, type_(e),
-                             mk_expr2(s_assign, t, arg1_(e), arg2_(e)),
-                             (Expr *)gen));
+          }
+        case s_leftshift:
+          /* bitfield op=.
+           * turns ((((x >> n) op y) & m) << n)
+           * [already partly optimised from (((((x >> n) & m) op y) & m) << n)]
+           * into (x op (y << n)) & (m << n)
+           * (also ((((x >> n) & m) | y) << n), y constant, (y & m) == y, a
+           *  mistaken transformation of the above)
+           */
+          { AEop op2;
+            Expr *e0l = optimise1(arg1_(e), YES);
+            Expr *e0r = optimise1(arg2_(e), YES);
+            Expr *e1l, *e1r, *e2l = NULL, *e3r;
+            if (h0_(e0r) == s_integer) {
+              if (h0_(e0l) == s_and && h0_(e1r = arg2_(e0l)) == s_integer) {
+                e1l = arg1_(e0l);
+                op2 = h0_(e1l);
+                if (op2 == s_plus || op2 == s_minus ||
+                    op2 == s_and || op2 == s_or || op2 == s_xor)
+                  e2l = arg1_(e1l);
+                else if (op2 == s_rightshift)
+                  e2l = e1l;
+              } else if (h0_(e0l) == s_or && h0_(e1r = arg2_(e0l)) == s_integer &&
+                         h0_(e1l = arg1_(e0l)) == s_and && h0_(arg2_(e1l)) == s_integer &&
+                         (intval_(e1r) & intval_(arg2_(e1l))) == intval_(e1r)) {
+                op2 = s_or;
+                e2l = arg1_(e1l);
+                e1r = arg2_(e1l);
+                e1l = e0l;
+              }
+              if (e2l != NULL &&
+                  h0_(e2l) == s_rightshift &&
+                  h0_((e3r = arg2_(e2l))) == s_integer) {
+                int32 nr = intval_(e3r),
+                      nl = intval_(e0r);
+                Expr *a21l = arg2_(e1l),
+                     *a1 = op2 == s_rightshift ?
+                             arg1_(e2l) :
+                             mk_expr2(
+                               op2, type_(e0l),
+                               arg1_(e2l),
+                               h0_(a21l) == s_integer ?
+                                 mkintconst(type_(e0l), intval_(a21l) << nr, 0) :
+                                 mk_expr2(s_leftshift, type_(e0l), a21l, e3r)),
+
+                     *a2 = mkintconst(type_(e0l), intval_(e1r) << nr, 0);
+
+                if (nl == nr) {
+                  h0_(e) = s_and;
+                  e0l = a1;
+                  e0r = a2;
+                } else if (nl > nr) {
+                  e0l = mk_expr2(s_and, type_(e0l), a1, a2);
+                  e0r = mkintconst(type_(e0r), nl - nr, 0);
+                }
+              }
             }
+            arg1_(e) = e0l;
+            arg2_(e) = e0r;
             break;
-#endif
+          }
+
         default:
             if (ismonad_(op))
                 arg1_(e) = optimise1(arg1_(e), YES);
-#ifdef SOFTWARE_FLOATING_POINT
-/* struct results cannot leak past || and &&: */
-/* int f(double y) { int ny;
-**   if (y == 0 || (double)(ny = (int)y) != y) return 0;
-**   else return ny; }
-** This code otherwise warns spurious for ny being used before defd.    */
-/* Probably do this sort of thing on non-SOFTWARE_FLOATING_POINT too.   */
-            else if (op == s_andand || op == s_oror)
-            {   SynBindList *old = new_binders;
-                new_binders = 0;
-                arg1_(e) = optalloctemps(optimise1(arg1_(e), YES));
-                new_binders = 0;
-                arg2_(e) = optalloctemps(optimise1(arg2_(e), YES));
-                new_binders = old;
-            }
-#endif
             else if (isdiad_(op))
                 arg1_(e) = optimise1(arg1_(e), YES),
                 arg2_(e) = optimise1(arg2_(e), YES);
@@ -914,18 +1112,52 @@ symmetric_done: arg1_(e) = a1;
             break;
     }
     if (debugging(DEBUG_AETREE) && syserr_behaviour > 0) {
-      if (op != s_return) {
-        cc_msg("optimise1= "); pr_expr(e);
-        cc_msg(" of type "); pr_typeexpr(typeofexpr(e), 0);
-        cc_msg("\n");
-      }
+#ifndef NO_RETURN_EXPRESSIONS
+      if (op != s_return)
+#endif
+        pr_exproftype("optimise1= ", e);
     }
     return e;
 }
 
-static void optimiselist(ExprList *x)
-{   for (; x != 0; x = cdr_(x))
-        exprcar_(x) = optimise1(exprcar_(x), YES);
+static SynBindList *optimiselist(ExprList *x)
+{   SynBindList *letbindings = NULL;
+    for (; x != 0; x = cdr_(x)) {
+        Expr *e = exprcar_(x);
+        if (h0_(e) == s_fnap) {
+        /* Avoid introduction of the temporary done by case s_fnap in        */
+        /* optimise1 for structure-returning functions (produces an          */
+        /* unnecessary and hard to remove structure copy). cg will cause the */
+        /* called function to return its results directly to the argument    */
+        /* place                                                             */
+            e = optimisefnap(e);
+        } else if (h0_(e) == s_let && h0_(arg2_(e)) == s_fnap) {
+            arg2_(e) = optimisefnap(arg2_(e));
+        } else {
+            if ((mcrepofexpr(e) & MCR_SORT_MASK) == MCR_SORT_STRUCT &&
+                h0_(e) == s_let && h0_(arg2_(e)) == s_comma) {
+                SynBindList *bl = exprletbind_(e);
+                Expr *a2 = arg2_(e);
+                if (bl->bindlistcdr == NULL &&
+                    (Expr *)bl->bindlistcar == arg2_(a2)) {
+                    letbindings = mkSynBindList(letbindings, bl->bindlistcar);
+                    e = a2;
+                }
+            }
+            in_args++;
+            e = optimise1(e, YES);
+            in_args--;
+        }
+        exprcar_(x) = e;
+    }
+    return letbindings;
+}
+
+static Expr *optimisefnap(Expr *e) {
+    SynBindList *b;
+    arg1_(e) = optimise1(arg1_(e), YES);
+    b = optimiselist(exprfnargs_(e));
+    return (b == NULL) ? e : mk_exprlet(s_let, type_(e), b, e);
 }
 
 #define U_Read 1
@@ -963,13 +1195,13 @@ static BindUseList *mergeuselists(BindUseList *b1, BindUseList *b2, BindUseList 
 }
 
 static BindUseList *checkvaruse(BindUseList *b, Expr *e) {
-if (debugging(DEBUG_AETREE) && syserr_behaviour > 0) {
-  cc_msg("checkvaruse "); pr_expr(e); cc_msg("\n");
+if (debugging(DEBUG_AETREE) && syserr_behaviour > 1) {
+  eprintf("checkvaruse "); pr_expr(e); eprintf("\n");
 }
     switch (h0_(e)) {
     default: if (h0_(e) > s_binder)
-               cc_warn("syserr soon: checkvar use %ld", h0_(e));
-    case s_addrof:              /* not if &a[b]; though! */
+               cc_warn(simp_warn_checkvar, h0_(e));
+    case s_addrof:            /* not if &a[b]; though! */
              break;
 /* Hmm, I'd rather do via isdiad_ ismonad_, possible? */
     case s_binder:
@@ -979,12 +1211,9 @@ if (debugging(DEBUG_AETREE) && syserr_behaviour > 0) {
 
     case s_andequal: case s_orequal: case s_xorequal:
     case s_timesequal: case s_plusequal: case s_minusequal: case s_divequal:
-    case s_idivequal: case s_remequal: case s_powerequal:
-#ifdef EXTENSION_FRAC
-/*     case s_xtimesequal: case s_xdivequal: */
-#endif
+    case s_idivequal: case s_remequal:
     case s_leftshiftequal: case s_rightshiftequal:
-    case s_assign:
+    case s_assign: case s_init:
         {   Expr *lhs = arg1_(e);
             b = checkvaruse(b, arg2_(e));
             if (h0_(lhs) != s_binder)
@@ -995,7 +1224,8 @@ if (debugging(DEBUG_AETREE) && syserr_behaviour > 0) {
             }
             break;
         }
-    case s_plusplus: case s_postinc: case s_minusminus: case s_postdec:
+    case s_plusplus: case s_minusminus:
+    case s_displace:
         {   Expr *a1 = arg1_(e);
             if (h0_(a1) != s_binder)
                 b = checkvaruse(b, a1);
@@ -1009,9 +1239,6 @@ if (debugging(DEBUG_AETREE) && syserr_behaviour > 0) {
     case s_equalequal: case s_notequal:
     case s_greater: case s_greaterequal: case s_less: case s_lessequal:
     case s_plus: case s_minus: case s_times: case s_div:
-#ifdef EXTENSION_FRAC
-    case s_xtimes: case s_xdiv:
-#endif
     case s_ptrdiff:
     case s_idiv: case s_rem: case s_power:
     case s_and: case s_or: case s_xor: case s_leftshift: case s_rightshift:
@@ -1019,16 +1246,20 @@ if (debugging(DEBUG_AETREE) && syserr_behaviour > 0) {
         b = checkvaruse(b, arg2_(e));
         /* drop though */
 
-#ifndef CPLUSPLUS
+#ifndef NO_RETURN_EXPRESSIONS
     case s_return:
 #endif
-    case s_cast: case s_invisible:
+    case s_cast:
     case s_content:
     case s_monplus: case s_neg: case s_bitnot: case s_boolnot:
     case s_dot:
     case s_ctor:                /* a monad protecting a s_comma */
         b = checkvaruse(b, arg1_(e));
     case_s_any_string
+        break;
+
+    case s_invisible:
+        b = checkvaruse(b, arg2_(e));
         break;
 
     case s_throw:
@@ -1061,12 +1292,11 @@ if (debugging(DEBUG_AETREE) && syserr_behaviour > 0) {
         }
     }
 
-if (debugging(DEBUG_AETREE) && syserr_behaviour > 0) {
+if (debugging(DEBUG_AETREE) && syserr_behaviour > 1) {
   BindUseList *p;
   cc_msg("=>");
   for (p = b; p != NULL; p = cdr_(p))
-  {   cc_msg(" $b,%s",p->b, (p->use-1)*3+"R\0\0W\0\0RW");
-  }
+    cc_msg(" $b,%s", p->b, (p->use-1)*3+"R\0\0W\0\0RW");
   cc_msg("\n");
 }
     return b;
@@ -1081,13 +1311,13 @@ Expr *optimise0(Expr *e)
     if (h0_(e) == s_error) return 0;
     checkvaruse(NULL, e);
     new_binders = 0;
-    res = optimise2(optimise1(e, YES), 0);
+    res = optimise1(e, YES);
     /*
      * If there are any structure returning functions allocate temp binders
      * here at the root of the expression tree.
-     * Now also done at || and &&.
      */
-    return optalloctemps(res);
+    return (new_binders == 0) ? res :
+        mk_expr2(s_let, typeofexpr(res), (Expr*)new_binders, res);
 }
 
 /* The following routine detects when a struct/union has suitable members
@@ -1101,52 +1331,59 @@ Expr *optimise0(Expr *e)
    non-address-taken structs via assignment, this means that on some
    machines we cannot put  struct { char c; } in a register.
    However,  struct { int c:8;} is always OK.
-   For now the rule is that every sub-object only contains int/enum/pointer.
-   Now adapted to look for sizeof_int and sizeof_long (not just size 4).
+   The rule is that every sub-object only contains int/enum/pointer.
+   Return value is 1 if values of this type are allocatable to registers, 2
+   if functions returning a value of this type should do so in an integer
+   register (slightly looser conditions: this also requires that
+   all subfields be integral and have offset zero, but allows shorter types
+   than int).
 */
-static bool integerlikestruct(TagBinder *b, int32 size)
+#define integerlikestruct(s) (slaveablestruct(s) == 1)
+
+static int slaveablestruct(TagBinder *b)
 {   ClassMember *l;
+    int okres = 1;
     if (!integerlike_enabled) return 0;
     for (l = tagbindmems_(b); l != 0; l = memcdr_(l))
     {
-#ifdef CPLUSPLUS
         if (!is_datamember_(l))
         {   /* Reject non-static member functions (particularly ctors)  */
             /* since we can't just copy corresponding objects: consider */
             /* e.g. class A { A *p; A() { p = this; }};                 */
             if (!(bindstg_(l) & (bitofstg_(s_static)|bitofstg_(s_typedef))))
-                /* need a macro for non-static member fn?               */
+                /* need a macro for non-static member fn?              */
                 return 0;
         }
         else
-#endif
-        /* isbitfield_type() is not required -- see BITFIELD below.     */
+        if (isbitfield_type(memtype_(l)))
+        {   /* bits are OK (sem.c turns to int)                         */
+            /* @@@ beware PCC mode/C++ char bitfields &c                */
+        }
+        else
         {   TypeExpr *t = princtype(memtype_(l));
             SET_BITMAP m;
             switch (h0_(t))
-            {   default: return 0;                  /* array not OK     */
-                case t_content:
-                case t_ref:     if (sizeof_ptr != size) return 0;
-                                break;
-                case t_fnap:    break;              /* ignore mem fns   */
-                                                    /* C++ virtual fn?  */
+            {   default: return 0;                      /* array not OK      */
+                case t_content: break;        /* pointers are OK    */
+                case t_ref:     break;                  /* and so are refs         */
+                case t_fnap:    break;                /* so are mem fns         */
                 case s_typespec:
-                    m = typespecmap_(t) & ~BITFIELD;
+                    if (memwoff_(l) != 0) return 0;
+                    m = typespecmap_(t);
+                    if (m & bitoftype_(s_enum))
+                        m = typeofenumcontainer(typespectagbind_(t));
                     switch (m & -m)
                     {   default: return 0;
                         case bitoftype_(s_char):
-                            if (sizeof_char != size) return 0;
+                            okres = 2;
                             break;
                         case bitoftype_(s_int):
-                        case bitoftype_(s_enum):
-                            if (int_decodelength_(m, sizeof_short, sizeof_int,
-                                                  sizeof_long, sizeof_longlong)
-                                    != size) return 0;
-                            break;
+                            if (m & bitoftype_(s_short)) okres = 2;
+                            break;                /* 4 bit int ok   */
                         case bitoftype_(s_struct):
                         case bitoftype_(s_class):
                         case bitoftype_(s_union):
-                            if (!integerlikestruct(typespectagbind_(t), size))
+                            if (!slaveablestruct(typespectagbind_(t)))
                                 return 0;
                             break;
                     }
@@ -1154,10 +1391,10 @@ static bool integerlikestruct(TagBinder *b, int32 size)
             }
         }
     }
-    return 1;
+    return okres;
 }
 
-static int32 mcrepofexpr1(Expr *e)
+static int32 mcrepofexpr1(Expr *e, bool container)
 /* keep in step with sizeoftype */
 {   TypeExpr *x = prunetype(typeofexpr(e));
     SET_BITMAP m;
@@ -1167,35 +1404,43 @@ case s_typespec:
         m = typespecmap_(x);
         switch (m & -m)    /* LSB - unsigned/long etc. are higher */
         {
+    case bitoftype_(s_enum):
+            if (container)
+                m = typeofenumcontainer(typespectagbind_(x));
+            goto mcrepofint;
     case bitoftype_(s_char):
             if ((m & (bitoftype_(s_signed)|bitoftype_(s_unsigned))) == 0)
                 m |= (feature & FEATURE_SIGNED_CHAR) ?
                          bitoftype_(s_signed) : bitoftype_(s_unsigned);
             /* drop through */
     case bitoftype_(s_int):
-    case bitoftype_(s_enum):
+    case bitoftype_(s_bool):
+    mcrepofint:
             {
                 return sizeoftype(x) +
                     (m & bitoftype_(s_unsigned) ?
-                     m & bitoftype_(s_signed) ? 0x4000000 : 0x1000000 : 0);
+                          m & bitoftype_(s_signed) ? MCR_SORT_PLAIN :
+                                                     MCR_SORT_UNSIGNED :
+                                                  MCR_SORT_SIGNED);
             }
     case bitoftype_(s_double):
             {   int32 n = sizeoftype(x);
 /* The tests here generate no code if alignof_double==alignof_int.      */
                 return (alignof_double > alignof_int && n == sizeof_double) ?
-                       0x2000000 + MCR_ALIGN_DOUBLE + n : 0x2000000 + n;
+                       MCR_SORT_FLOATING + MCR_ALIGN_DOUBLE + n :
+                       MCR_SORT_FLOATING + n;
             }
     case bitoftype_(s_struct):
     case bitoftype_(s_class):
     case bitoftype_(s_union):
             {   int32 n = sizeoftype(x);
-                if ((n == sizeof_int || n == sizeof_long) &&
-                        integerlikestruct(typespectagbind_(x), n))
-                    return 0x0000000 + n;
+                if (n == 4 && integerlikestruct(typespectagbind_(x)))
+                    return MCR_SORT_SIGNED + n;
                 else
                     return (alignof_double > alignof_int &&
                             alignoftype(x) == alignof_double) ?
-                           0x3000000 + MCR_ALIGN_DOUBLE + n : 0x3000000 + n;
+                           MCR_SORT_STRUCT + MCR_ALIGN_DOUBLE + n :
+                           MCR_SORT_STRUCT + n;
             }
     case bitoftype_(s_void):
                 /*
@@ -1209,53 +1454,97 @@ case s_typespec:
 default:
 /*      case t_fnap: */
             syserr(syserr_mcrepofexpr, (long)h0_(x),(long)typespecmap_(x));
-            return 0x0000000 + sizeof_ptr;
+            return MCR_SORT_SIGNED + sizeof_ptr;
 case t_subscript:
 /* The following checks that restriction that mcrepofexpr() spiritually     */
 /* should never be applied to array typed expressions.  Two exceptions:     */
 /* s_binder's (for flowgraf.c sizing) and s_strings (optimise removes their */
-/* implicit '&').                                                           */
+/* implicit '&').                                                     */
+#ifdef TARGET_IS_INTERPRETER
+            if (!isstring_(h0_(e)))
+#else
             if (h0_(e)!=s_binder && !isstring_(h0_(e)))
                 syserr(syserr_mcreparray, (long)h0_(e));
             if (h0_(e) == s_binder)
+#endif
             {   int32 n = sizeoftype(x);
+                if (n & ~MCR_SIZE_MASK)
+                    cc_err(simplify_err_outsizearray, (Binder *)e),
+                    n = MCR_SIZE_MASK;
                 return (alignof_double > alignof_int &&
                         alignoftype(x) == alignof_double) ?
-                       0x3000000 + MCR_ALIGN_DOUBLE + n : 0x3000000 + n;
+                       MCR_SORT_STRUCT + MCR_ALIGN_DOUBLE + n :
+                       MCR_SORT_STRUCT + n;
             }
             /* s_string falls into pointer code */
 case t_content:
 case t_ref:
-            return TARGET_ADDRESSES_UNSIGNED ? 0x1000000 + sizeof_ptr :
-                                               0x0000000 + sizeof_ptr;
+            return TARGET_ADDRESSES_UNSIGNED ? MCR_SORT_UNSIGNED + sizeof_ptr :
+                                                 MCR_SORT_SIGNED + sizeof_ptr;
     }
 }
 
-int32 mcrepofexpr(Expr *e)
-{
-#ifdef CPLUSPLUS
+static int32 mcrepofexpr2(Expr *e, bool container)
+{   int32 r;
+
+#ifndef PRE_CPLUSPLUS_WAY
     /* temp. nasty hack for optimise(s_dot/s_dotstar) and cppfe/vargen  */
     /* solution: make type of datasegment struct-of-size 0x00ffffff?    */
-    int32 r = (e == (Expr *)datasegment || e == (Expr *)constdatasegment)
-              ? 0x03000000 : mcrepofexpr1(e);
+        r = (e == (Expr *)datasegment || e == (Expr *)constdatasegment)
+              ? MCR_SORT_STRUCT+0 : mcrepofexpr1(e, container);
 #else
-    int32 r = mcrepofexpr1(e);
+        r = mcrepofexpr1(e, container);
 #endif
+
 #ifdef SOFTWARE_FLOATING_POINT
 /* Fake floating point values so that they are thought of as structures. */
-    if (r == 0x02000004)
-         return 0x00000004;
-    else if (r == 0x02000008 || r == 0x02000008+MCR_ALIGN_DOUBLE)
-         return 0x03000008;
+    if (software_floating_point_enabled) {
+        if (r == MCR_SORT_FLOATING + 4)
+            return MCR_SORT_SIGNED + 4;
+        if (r == MCR_SORT_FLOATING + 8 ||
+            r == MCR_SORT_FLOATING + MCR_ALIGN_DOUBLE + 8)
+            return MCR_SORT_STRUCT + 8;
+    }
 #endif
     return r;
+}
+
+int32 mcrepofexpr(Expr *e)
+{   return mcrepofexpr2(e, YES);
 }
 
 int32 mcrepoftype(TypeExpr *t)
 {
 /* This returns the machine representation of a type. Done by forgery of */
-/* an expression and a call to mcrepofexpr().                            */
+/* an expression and a call to mcrepofexpr().             */
     return mcrepofexpr(mk_expr2(s_invisible, t, 0, 0));
+}
+
+bool returnsstructinregs_t(TypeExpr *t) {
+/* t is known to be a function type, but not necessarily one returning a */
+/* structure value.                                    */
+    TypeExpr *restype = prunetype(typearg_(t));
+    if (typefnaux_(t).flags & bitoffnaux_(s_structreg)) {
+        int32 resultwords = sizeoftype(restype) / MEMCPYQUANTUM;
+        return (resultwords >= 1 && resultwords <= NARGREGS);
+    } else {
+#if defined SOFTWARE_FLOATING_POINT && \
+    defined SOFTWARE_FLOATING_POINT_RETURNS_DOUBLES_IN_REGISTERS
+        if (software_floating_point_enabled) {
+            return isprimtype_(restype, s_double);
+        }
+#endif
+        if (h0_(restype) == s_typespec && (typespecmap_(restype) & CLASSBITS) &&
+            sizeoftype(restype) <= 4 && slaveablestruct(typespectagbind_(restype)) == 2)
+                return YES;
+        return NO;
+    }
+}
+
+bool returnsstructinregs(Expr *fn) {
+    TypeExpr *t = prunetype(typeofexpr(fn));
+    if (h0_(t) != s_content) return NO; /* syserr will follow */
+    return returnsstructinregs_t(typearg_(t));
 }
 
 /* end of simplify.c */

@@ -6,9 +6,9 @@
  */
 
 /*
- * RCS $Revision: 1.5 $
- * Checkin $Date: 93/10/12 12:41:22 $
- * Revising $Author: irickard $
+ * RCS $Revision: 1.7 $
+ * Checkin $Date: 1994/02/07 16:02:00 $
+ * Revising $Author: hmeekings $
  */
 
 #ifdef __STDC__
@@ -35,10 +35,6 @@
 #  endif
 #endif
 
-#ifdef VENDOR_SPRINTF_BANNER
-#  undef STATIC_BANNER
-#endif
-
 /* AM: company-specific version strings should appear in options.h.     */
 #undef VERSION_STRING
 #ifdef RELEASE_VSN
@@ -59,13 +55,9 @@
 
 #ifdef STATIC_BANNER
 
-#ifndef VERSION_DATE
-#  define VERSION_DATE __DATE__
-#endif
-
 static char cc_banner[] =  "Norcroft " \
                            TARGET_SYSTEM " " TARGET_MACHINE " " LANGUAGE \
-                           " vsn " VERSION_STRING " [" VERSION_DATE "]\0\0\0";
+                           " vsn " VERSION_STRING " [" __DATE__ "]\0\0\0";
 
 char *version_banner(void)
 {
@@ -81,45 +73,14 @@ char *version_banner(void)
 
 static char cc_banner[128] = "";        /* expression instead of 128?   */
 
-#ifdef VERSION_DATE_UK_NUMERIC
-static char *uk_numeric_date()
-{   static char d[] = __DATE__;         /* e.g. "Jul 19 1995"           */
-    static char r[] = "dd/mm/yy";
-    static char m[] =
-            "Jan01Feb02Mar03Apr04May05Jun06Jul07Aug08Sep09Oct10Nov11Dec12";
-    char *p;
-    for (p = m; p < m+60; p += 5)
-        if (memcmp(d, p, 3) == 0)
-        {   r[0] = d[4] == ' ' ? '0' : d[4];
-            r[1] = d[5];
-            r[3] = p[3];
-            r[4] = p[4];
-            r[6] = d[9];
-            r[7] = d[10];
-            return r;
-        }
-    return d;
-}
-#define VERSION_DATE uk_numeric_date()
-#endif
-
-#ifndef VERSION_DATE
-#  define VERSION_DATE __DATE__
-#endif
-
 char *version_banner(void)
 {   if (cc_banner[0]=='\0')
-    {   sprintf(cc_banner,
-#ifdef VENDOR_SPRINTF_BANNER
-                           VENDOR_SPRINTF_BANNER
-#else
-                           "Norcroft %s %s %s vsn %s [%s]\0\0\0",
+      {
+        sprintf(cc_banner, "Norcroft %s %s %s vsn %s [%s]\0\0\0",
                            TARGET_SYSTEM, TARGET_MACHINE, LANGUAGE,
-                           VERSION_STRING, VERSION_DATE
-#endif
-               );
+                           VERSION_STRING, __DATE__);
       }
-    return cc_banner;
+    return(cc_banner);
 }
 
 #endif /* STATIC_BANNER */

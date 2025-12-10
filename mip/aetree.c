@@ -5,9 +5,9 @@
  */
 
 /*
- * RCS $Revision: 1.15 $
- * Checkin $Date: 93/09/29 18:28:18 $
- * Revising $Author: irickard $
+ * RCS $Revision: 1.44 $
+ * Checkin $Date: 1995/10/31 15:51:07 $
+ * Revising $Author: hmeekings $
  */
 
 #ifdef __STDC__
@@ -17,19 +17,26 @@
 #endif
 #include <stddef.h>
 #include <ctype.h>
+#include <string.h>
 
 #include "globals.h"
 #include "aetree.h"
 #include "defs.h"
 #include "store.h"
 #include "aeops.h"
+#include "bind.h"
 #include "builtin.h"
+/*/* The following inclusion of sem.h for isbitfield() and moan_nonconst() */
+/*   shows a structural weakness. Mid-end code should not depend on the    */
+/*   front-end in this sort of way.                                        */
+#include "sem.h"
+#include "errors.h"
 
 AEop tagbindsort(TagBinder *b)
-{   return attributes_(b) & bitoftype_(s_enum) ? s_enum :
-           attributes_(b) & bitoftype_(s_struct) ? s_struct :
-           attributes_(b) & bitoftype_(s_class) ? s_class :
-           attributes_(b) & bitoftype_(s_union) ? s_union : s_nothing;
+{   return tagbindbits_(b) & bitoftype_(s_enum) ? s_enum :
+           tagbindbits_(b) & bitoftype_(s_struct) ? s_struct :
+           tagbindbits_(b) & bitoftype_(s_class) ? s_class :
+           tagbindbits_(b) & bitoftype_(s_union) ? s_union : s_nothing;
 }
 
 /* Expr parse tree constructors */
@@ -60,7 +67,7 @@ Expr *mk_expr_valof(AEop op, TypeExpr *t, Cmd *c)
 }
 #endif
 
-Expr *mk_exprwdot(AEop op, TypeExpr *t, Expr *a1, int32 a2)
+Expr *mk_exprwdot(AEop op, TypeExpr *t, Expr *a1, IPtr a2)
 {
     return (Expr *) syn_list5(op, t, (FileLine *)0, a1, a2);
 }
@@ -78,9 +85,6 @@ DeclRhsList *mkDeclRhsList(Symstr *sv, TypeExpr *t, SET_BITMAP s)
     declinit_(p) = 0; /* p->decbits = 0; */
     p->declstg  = s;  p->declbind = 0;
     p->fileline.f = NULL; p->fileline.l = 0;
-#ifdef TARGET_KEEP_COMMENT
-    p->fileline.comment = 0;
-#endif
 #ifdef PASCAL /*ECN*/
     p->synflags = 0;
 #endif
@@ -93,18 +97,14 @@ TypeExpr *mk_typeexpr1(AEop op, TypeExpr *t, Expr *a1)
     return (TypeExpr *)syn_list4(op, t, a1, 0);
 }
 
-TopDecl *mkTopDeclFnDef(AEop a, Binder *b, SynBindList *c, Cmd *d, bool e,
-                        FileLine fl)
+TopDecl *mkTopDeclFnDef(AEop a, Binder *b, SynBindList *c, Cmd *d, bool e)
 {
-    TopDecl *p = SynAlloc(sizeof(TopDecl));
-    p->h0 = a;
-    p->v_f.fn.name = b;
-    p->v_f.fn.formals = c;
-    p->v_f.fn.body = d;
-    p->v_f.fn.ellipsis = e;
-    p->v_f.fn.deffl = fl;
-    return p;
-    /* was: return (TopDecl *)syn_list5(a, b, c, d, e); */
+#ifdef TARGET_IS_INTERPRETER
+    /* TopDecl has a couple of extra nodes in interpreter */
+    return (TopDecl *)syn_list7(a, b, c, d, e, 0, 0);
+#else
+    return (TopDecl *)syn_list5(a, b, c, d, e);
+#endif
 }
 
 TypeExpr *mkTypeExprfn(AEop a, TypeExpr *b, SET_BITMAP s, FormTypeList *c,
@@ -154,6 +154,360 @@ FormTypeList *g_mkFormTypeList(FormTypeList *ftcdr, Symstr *ftname,
                                       TypeExpr *fttype, Expr *ftdefault)
 {   return (FormTypeList *)global_list4(SU_Other, ftcdr, ftname, fttype,
                                         ftdefault);
+}
+
+/* comments re globalisation:
+   Binders are globalized or not on creation, the only need for
+   globalize routines is for the type expressions (see globalize_typeexpr()
+   below) which hang from them.
+*/
+
+Expr *globalize_int(int32 n)
+{   /* could insert special code here to use globalize_bool()...        */
+    /* possibly via lit_true or lit_false.                              */
+    return (Expr*)global_list5(SU_Const, s_integer,te_int,(FileLine *)0,n,0);
+}
+
+static FormTypeList *globalize_formals_1(FormTypeList *d, bool defaultvals)
+{   FormTypeList *d1;
+    if (d == NULL) return NULL;
+    d1 = g_mkFormTypeList(0, d->ftname,
+                             globalize_typeexpr(d->fttype),
+                             defaultvals && d->ftdefault ?
+                             globalize_expr(d->ftdefault) : 0);
+    d1->ftcdr = globalize_formals_1(d->ftcdr, defaultvals);
+    return d1;
+}
+
+#define TYPEMEMOHASHSIZE 128
+#define typehash_(t) (h0_(t) + (IPtr)typearg_(t) + ((IPtr)typespecbind_(t))>>2)
+
+static struct te_memo { struct te_memo *cdr; TypeExpr te; }
+    *glob_typeexpr_memo[TYPEMEMOHASHSIZE];
+
+#define EQtype_(t1,t2)   ((t1)->h0==(t2)->h0 && (t1)->typearg==(t2)->typearg \
+                          && (t1)->typespecbind==(t2)->typespecbind)
+
+static TypeExpr *globalize_memo(TypeExpr *t)
+{   struct te_memo *p;
+    int hash = ((int)typehash_(t)) & (TYPEMEMOHASHSIZE - 1);
+    for (p = glob_typeexpr_memo[hash]; p != 0; p = p->cdr)
+        if (EQtype_(t, &p->te)) break;
+    if (p == 0)
+        p = glob_typeexpr_memo[hash] =
+            (struct te_memo*) global_list5(SU_Type, glob_typeexpr_memo[hash],
+                         h0_(t), typespecmap_(t), typespecbind_(t), 0);
+    return &p->te;
+}
+
+#if 0
+static void globaltypehashstats(void)
+{   struct te_memo **p = glob_typeexpr_memo;
+    struct te_memo **limit =
+        p + (sizeof glob_typeexpr_memo / sizeof *glob_typeexpr_memo);
+    int used = 0, maxlen = 0;
+    for (; p < limit; ++p)
+    {   int len = 0;
+        struct te_memo *p2 = *p;
+        for (; p2 != 0; p2 = p2->cdr) ++len;
+        if (maxlen < len) maxlen = len;
+        if (0 < len) ++used;
+        cc_msg("bucket %d, chain length = %d\n", p - glob_typeexpr_memo, len);
+    }
+    cc_msg("glob_typeexpr_memo:  %d of %d buckets used; max chain length = %d\n",
+           used, TYPEMEMOHASHSIZE, maxlen);
+}
+#endif
+
+/*
+ * a temporary home before its demise...
+ */
+
+int32 evaluate(Expr *a)
+{
+/* evaluate the compile-time expression a to yield an integer result     */
+    switch (h0_(a))
+    {
+case s_integer:
+        return(intval_(a));
+default:
+        moan_nonconst(a, bind_msg_const_nonconst, bind_msg_const_nonconst1,
+                      bind_msg_const_nonconst2);
+        return 1;
+    }
+}
+
+/* globalize_typeexpr caches only basic types (including structs/typedefs) */
+/* and pointers/refs to things already cached.  Tough ched arrays/fns.     */
+/* N.B. we should never cache empty arrays as size may get updated.        */
+
+static TypeExpr *globalize_typeexpr_1(TypeExpr *t, bool defaultvals)
+{   static bool glob_incache;
+    TypeExpr *ans;
+#ifdef PASCAL /*ECN*/
+    assert(0);
+#else
+    switch (h0_(t))
+    {
+case t_content:
+case t_ref:
+        {   TypeExpr *gt = globalize_typeexpr(typearg_(t));
+            if (glob_incache)
+            {   TypeExpr temp;
+                h0_(&temp) = h0_(t), typearg_(&temp) = gt,
+                typeptrmap_(&temp) = typeptrmap_(t);
+                /* dbglanginfo field?  Doesn't matter for C! */
+                return globalize_memo(&temp);
+            }
+            return (TypeExpr *)global_list4(SU_Type,
+                                            h0_(t), gt, typeptrmap_(t), 0);
+            /* note that glob_incache is set correctly */
+        }
+case t_subscript:
+            ans = (TypeExpr*) global_list4(SU_Type, t_subscript,
+                                globalize_typeexpr(typearg_(t)),
+                                typesubsize_(t)==0 ? (Expr *)0 :
+                                    globalize_int(evaluate(typesubsize_(t))),
+                                0);
+            glob_incache = 0;
+            return ans;
+case t_fnap:
+            /* the DeclRhsList of formals could well become a ClassMember */
+            ans = g_mkTypeExprfn(t_fnap,
+                               globalize_typeexpr(typearg_(t)),
+                               typeptrmap_(t),
+                               globalize_formals_1(typefnargs_(t), defaultvals),
+                               &typefnaux_(t));
+            glob_incache = 0;
+            return ans;
+case t_ovld: /* all t_ovld types a global */
+            glob_incache = 0;
+            return t;
+case t_coloncolon:
+            ans = (TypeExpr *)global_list4(SU_Type, t_coloncolon,
+                                           globalize_typeexpr(typearg_(t)),
+                                           typespectagbind_(t),
+                                           0);
+            glob_incache = 0;
+            return ans;
+case s_typespec:
+            /* N.B. any binder in typespecbind_(t) is assumed globalised */
+            if (typespecmap_(t) & (bitoftype_(s_typedefname)|ENUMORCLASSBITS)
+                 && (!(typespecmap_(t) & ENUMORCLASSBITS ?
+                         attributes_(typespectagbind_(t)) :
+                         attributes_(typespecbind_(t))) & A_GLOBALSTORE))
+                syserr("globalization failure: $b", typespecbind_(t));
+            glob_incache = 1;
+            return typespecmap_(t) == typespecmap_(te_void) ? te_void :
+                   typespecmap_(t) == typespecmap_(te_int) ? te_int :
+                   typespecmap_(t) == typespecmap_(te_lint) ? te_lint :
+                   typespecmap_(t) == typespecmap_(te_uint) ? te_uint :
+                   typespecmap_(t) == typespecmap_(te_ulint) ? te_ulint :
+                   typespecmap_(t) == typespecmap_(te_float) ? te_float :
+                   typespecmap_(t) == typespecmap_(te_double) ? te_double :
+                   typespecmap_(t) == typespecmap_(te_ldble) ? te_ldble :
+                   globalize_memo(t);
+default:
+            syserr(syserr_globalize1, (VoidStar)t, (long)h0_(t));
+            return t;
+    }
+#endif
+}
+
+FormTypeList *globalize_formals(FormTypeList *d)
+{
+    return globalize_formals_1(d, YES);
+}
+
+TypeExpr *globalize_typeexpr(TypeExpr *t)
+{
+    return globalize_typeexpr_1(t, YES);
+}
+
+TypeExpr *globalize_typeexpr_no_default_arg_vals(TypeExpr *t)
+{
+    return globalize_typeexpr_1(t, NO);
+}
+
+static FileLine *globalize_fileline(Expr *e)
+{   if (hasfileline_(h0_(e)) && e->fileline != NULL)
+    {   FileLine *fl = (FileLine *)GlobAlloc(SU_Other, (int32)sizeof(FileLine));
+        *fl = *e->fileline;
+        return fl;
+    }
+    return NULL;
+}
+
+static Expr *globalize_integer(Expr *e)
+{   Binder *b = (Binder *)arg2_(e);
+/* Don't bother with "globalize_expr(arg2_(e))" for intorig_() field    */
+/* unless the intorig_field is already a global binder... Relied on by  */
+/* C++'s end-of-class default argument binding code. FRIGORAMA!         */
+    if (b != 0 && !(attributes_(b) & A_GLOBALSTORE)) b = 0;
+    return (Expr *)global_list5(SU_Other, s_integer,
+                                globalize_typeexpr(type_(e)),
+                                globalize_fileline(e),
+                                arg1_(e),
+/* preseve global binder => */  b);
+}
+
+StringSegList *globalize_strseg(StringSegList *s)
+{   if (s == NULL) return NULL;
+    return (StringSegList *)global_list3(SU_Other,
+        globalize_strseg(s->strsegcdr),
+        memcpy(GlobAlloc(SU_Other, s->strseglen),
+               s->strsegbase, (size_t)s->strseglen),
+        s->strseglen);
+}
+
+static Expr *globalize_string(AEop op, String *s)
+{
+    return (Expr *)global_cons2(SU_Other,
+        op,
+        globalize_strseg(s->strseg));
+}
+
+static ExprList *globalize_exprlist(ExprList *l)
+{   if (l == NULL) return NULL;
+    return (ExprList *)global_cons2(SU_Other,
+        globalize_exprlist(l->cdr),
+        globalize_expr(exprcar_(l)));
+}
+
+static Binder *globalize_binder(Binder *b)
+{   Binder *p;
+    Symstr *sv;
+
+/* Non-temp binders are global iff they need to be global. Temp ones */
+/* may need to be globalized (cf s_let in globalize_expr() below).   */
+
+    if (attributes_(b) & A_GLOBALSTORE) return b;
+
+    sv = bindsym_(b);
+    if (!isgensym(sv))
+    {   syserr("globalize_binder");
+        return b;
+    }
+    else if (bind_global_(sv) != 0)
+        return bind_global_(sv);
+
+    sv = sym_insert_id(sv->symname);
+    p = global_mk_binder(0, sv, bindstg_(b), globalize_typeexpr(bindtype_(b)));
+    bind_global_(bindsym_(b)) = p;
+    attributes_(p) = (attributes_(b) & ~A_LOCALSTORE) | A_GLOBALSTORE;
+    bindaddr_(p) = bindaddr_(b);
+    bindconst_(p) = bindconst_(b) ? globalize_expr(bindconst_(b)) : 0;
+    return p;
+}
+
+static SynBindList *globalize_bindlist(SynBindList *l)
+{   if (l == NULL) return NULL;
+    return (SynBindList *)global_cons2(SU_Other,
+        globalize_bindlist(l->bindlistcdr),
+        globalize_binder(l->bindlistcar));
+}
+
+Expr *globalize_expr(Expr *e)
+{   AEop op;
+
+    if (!LanguageIsCPlusPlus)
+        /* help eliminate dead code when C only; see globalize_formals  */
+        /* above for why returning NULL is a good idea...               */
+        return NULL;
+
+    switch (op = e ? h0_(e) : s_error)
+    {
+case s_error:
+case s_invisible:         /* shouldn't occur in optimise0() results.    */
+                break;
+case s_binder:
+                return (Expr *)globalize_binder((Binder *)e);
+case s_floatcon:          /* uses global store @@@ DANGEROUS assumption */
+                return e;
+case s_integer:
+                return globalize_integer(e);
+#ifdef EXTENSION_UNSIGNED_STRINGS
+case s_ustring:
+#endif
+case s_wstring:
+case s_string:
+                return globalize_string(h0_(e), (String *)e);
+case s_fnapstruct:
+case s_fnap:
+                return (Expr *) global_list5(SU_Other,
+                    op,
+                    globalize_typeexpr(type_(e)),
+                    globalize_fileline(e),
+                    globalize_expr(arg1_(e)),
+                    globalize_exprlist(exprfnargs_(e)));
+
+case s_let:
+                return (Expr *) global_list5(SU_Other,
+                    op,
+                    globalize_typeexpr(type_(e)),
+                    globalize_fileline(e),
+                    globalize_bindlist(e->arg1.bl),
+                    globalize_expr(arg2_(e)));
+
+#ifdef RANGECHECK_SUPPORTED
+case s_rangecheck:
+#endif
+case s_cond:
+                return (Expr *) global_list6(SU_Other,
+                    op,
+                    globalize_typeexpr(type_(e)),
+                    globalize_fileline(e),
+                    globalize_expr(arg1_(e)),
+                    globalize_expr(arg2_(e)),
+                    globalize_expr(arg3_(e)));
+case s_dot:
+        {       bool is_bitfield = isbitfield_type(type_(e));
+                Expr *r = (Expr *)GlobAlloc(SU_Other,
+                    is_bitfield ? 7L*sizeof(int32) : 5L*sizeof(int32));
+                h0_(r) = op;
+                type_(r) = globalize_typeexpr(type_(e));
+                r->fileline = globalize_fileline(e);
+                arg1_(r) = globalize_expr(arg1_(e));
+                exprdotoff_(r) = exprdotoff_(e);
+                if (is_bitfield)
+                {   exprbsize_(r) = exprbsize_(e);
+                    exprmsboff_(r) = exprmsboff_(e);
+                }
+                return r;
+        }
+default:
+        if (ismonad_(op) || op == s_return || op == s_cast)
+        {
+                return (Expr *) global_list4(SU_Other,
+                    op,
+                    globalize_typeexpr(type_(e)),
+                    globalize_fileline(e),
+                    globalize_expr(arg1_(e)));
+        }
+        else if (isdiad_(op) || op == s_init
+#ifdef RANGECHECK_SUPPORTED
+                 || op == s_checknot
+#endif
+                )
+        {
+                return (Expr *) global_list5(SU_Other,
+                    op,
+                    globalize_typeexpr(type_(e)),
+                    globalize_fileline(e),
+                    globalize_expr(arg1_(e)),
+                    globalize_expr(arg2_(e)));
+        }
+    }
+    syserr("globalize_expr(%p:%.lu)", e, op);
+    return NULL;
+}
+
+void aetree_init(void)
+{   struct te_memo **p = glob_typeexpr_memo;
+    struct te_memo **limit =
+        p + (sizeof glob_typeexpr_memo / sizeof *glob_typeexpr_memo);
+    for (; p < limit; ++p)
+      *p = 0;
 }
 
 /* command nodes... */
@@ -242,11 +596,11 @@ Cmd *mk_cmd_case(FileLine x, Expr *e, Cmd *c1, Cmd *c2)
 }
 
 
-static bool is_fpval(Expr *e, FPConst *fc)
+static bool is_fpval(Expr const *e, FPConst const *fc)
 {
     while (h0_(e) == s_invisible) e = arg2_(e);
     if (h0_(e) == s_floatcon)
-    {   FloatCon *f = (FloatCon *)e;
+    {   FloatCon const *f = (FloatCon const *)e;
         if (f->floatlen == (bitoftype_(s_short) | bitoftype_(s_double)))
             return (f->floatbin.fb.val == fc->s->floatbin.fb.val);
         else if (f->floatlen == bitoftype_(s_double))
@@ -256,24 +610,24 @@ static bool is_fpval(Expr *e, FPConst *fc)
     return NO;
 }
 
-bool is_fpzero(Expr *e)
+bool is_fpzero(Expr const *e)
 {
     return is_fpval(e, &fc_zero);
 }
 
-bool is_fpone(Expr *e)
+bool is_fpone(Expr const *e)
 {
     return is_fpval(e, &fc_one);
 }
 
-bool is_fpminusone(Expr *e)
+bool is_fpminusone(Expr const *e)
 {
     return is_fpval(e, &fc_minusone);
 }
 
 int32 result2;
 
-bool integer_constant(Expr *x)
+bool integer_constant(Expr const *x)
 {
 /* Test if x is an integer constant, and if it is leave its value in result2 */
     if (h0_(x)==s_integer)
@@ -283,17 +637,17 @@ bool integer_constant(Expr *x)
     return NO;
 }
 
-bool is_intzero(Expr *x)
+bool is_intzero(Expr const *x)
 {
     return (integer_constant(x) && result2==0);
 }
 
-bool is_intone(Expr *x)
+bool is_intone(Expr const *x)
 {
     return (integer_constant(x) && result2==1);
 }
 
-bool is_intminusone(Expr *x)
+bool is_intminusone(Expr const *x)
 {
     return (integer_constant(x) && result2==-1);
 }
@@ -318,6 +672,16 @@ bool is_intminusone(Expr *x)
 #endif
 #endif
 
+
+int32 aetree_debugcount;
+
+#define DebugShowBinderTypes (aetree_debugcount > 1)
+#define DebugShowTypedefTypes (aetree_debugcount > 1)
+#define DebugShowRealBinders (aetree_debugcount > 1)
+#define DebugShowPointers (aetree_debugcount > 2)
+
+static void pr_typeexpr_e(TypeExpr *x, Symstr *s, bool nolinebreak);
+
 #define PR_CMD          1
 #define PR_HAND         2
 #define PR_BIND         3
@@ -328,14 +692,13 @@ bool is_intminusone(Expr *x)
 
 static int32 position = 0;
 
-void eprintf(char *s, ...)
-
-{   va_list ap;
+void eprintf(char const *s, ...)
+{   size_t len = strlen(s);
+    va_list ap;
     va_start(ap,s);
-    if (s[0] == '\n' && s[1] == 0) {
-        fputc('\n', stderr); position = 0;
-    } else
-        position += _vfprintf(stderr,s,ap);
+    position += _vfprintf(stderr,s,ap);
+    if (0 < len && s[len - 1] == '\n')
+        position = 0;
     va_end(ap);
 }
 
@@ -345,10 +708,9 @@ void pr_stringsegs(StringSegList *z)
     for (; z!=NULL; z = z->strsegcdr)
     {   char *s = z->strsegbase;
         int32 len = z->strseglen, i;
-        for (i=0; i*sizeof_char<len; i++)
-        {   int ch = sizeof_char==2 ? ((unsigned16 *)s)[i] :
-                                       ((unsigned8 *)s)[i];   /* for isprint */
-            if (ch < 256 && isprint(ch)) putc(ch, stderr);
+        for (i=0; i<len; i++)
+        {   int ch = ((unsigned char *)s)[i];   /* for isprint */
+            if (isprint(ch)) putc(ch, stderr);
             else if (ch=='\n') eprintf("\\n");
             else eprintf("\\%lo", (long)ch);
         }
@@ -357,11 +719,24 @@ void pr_stringsegs(StringSegList *z)
 }
 
 #ifdef ANY_ENABLED
+static void enewline(void)
+{   putc('\n', stderr);
+    position = 0;
+}
+
 static void elinebreak(void)
 {
     if (position>64)
-    {   putc('\n', stderr);
-        position = 0;
+        enewline();
+}
+
+static void elinebreakorspace(void)
+{
+    if (position>64)
+        enewline();
+    else
+    {   putc(' ', stderr);
+        ++position;
     }
 }
 
@@ -384,33 +759,77 @@ static void pr_label(LabBind *x)
 }
 
 static void pr_bind0(Binder *b)
-{
-    Symstr *sv = bindsym_(b);
-    eprintf("%s",symname_(sv));
+{   Symstr *sv = bindsym_(b);
+    if (sv != 0)
+        eprintf("%s", symname_(sv));
+    else
+    {   eprintf("nullbinder<");
+        pr_typeexpr(bindtype_(b), 0);
+        eprintf(">");
+    }
 }
 
+
+static void pr_stg(SET_BITMAP *m)
+{   AEop op = s_auto;
+    for (; op <= s_weak; ++op)
+        if (*m & bitofstg_(op))
+        {   eprintf("%s ", symbol_name_(op));
+            *m &= ~bitofstg_(op);
+        }
+}
+
+
 static void pr_bind1(Binder *b)
-{   Symstr *sv;
-    eprintf("[Bind%p:", (VoidStar )b);
-    eprintf("s=%lx ", (long)bindstg_(b));
-    eprintf("t=");
-    pr_typeexpr(bindtype_(b), 0);
+{   Symstr *sv = bindsym_(b);
+    SET_BITMAP orig_s = bindstg_(b);
+    SET_BITMAP s = orig_s;
+    eprintf(DebugShowPointers ? "[Bind%p:" : "[Bind:", (VoidStar)b);
+    if (sv) eprintf(" %s ", symname_(sv)); else eprintf(" <no name>");
+    pr_stg(&s);
+    if (s != 0) eprintf("s=%lx", (long)s);
+    if (DebugShowBinderTypes)
+    {   eprintf(" t=");
+        pr_typeexpr_e(bindtype_(b), 0, YES);
+        elinebreakorspace();
+    }
+    if (orig_s & (b_impl|b_pseudonym))
+    {   if (DebugShowRealBinders)
+            eprintf("real="), pr_bind1(realbinder_(b));
+    }
+    else if ((orig_s & bitofstg_(s_auto)) && (bindaddr_(b) & BINDADDR_MASK) == BINDADDR_ARG)
+        eprintf(" formal(%ld)", (long)(bindaddr_(b) & ~BINDADDR_MASK));
+    else if ((orig_s & bitofstg_(s_auto)) && (bindaddr_(b) & BINDADDR_MASK) == BINDADDR_LOC)
+        eprintf(" local(%ld)", (long)(bindaddr_(b) & ~BINDADDR_MASK));
+    else if (bindaddr_(b) != 0 && bindaddr_(b) != BINDADDR_UNSET)
+        eprintf(" addr=%ld", (long)bindaddr_(b));
+    eprintf("]");
     elinebreak();
-    eprintf("addr=%ld", (long)bindaddr_(b));
-    sv = bindsym_(b);
-    eprintf(" name=%s]",symname_(sv));
+}
+
+static void pr_tagbindname(TagBinder *b)
+{   if (DebugShowPointers)
+        eprintf("[TagBind%p: %s %s]",
+                (VoidStar)b, symbol_name_(tagbindsort(b)), symname_(bindsym_(b)));
+    else
+        eprintf("%s", symname_(bindsym_(b)));
+    /* do not print member list in case circular type! */
     elinebreak();
 }
 
 static void pr_tagbind(TagBinder *b)
-{   Symstr *sv;
-    eprintf("[TagBind%p:", (VoidStar )b);
-    elinebreak();
-    eprintf("sort=%s ", symbol_name_(tagbindsort(b)));
-    /* do not print member list in case circular type! */
-    sv = bindsym_(b);
-    eprintf(" name=%s]",symname_(sv));
-    elinebreak();
+{   eprintf("%s ", symbol_name_(tagbindsort(b)));
+    pr_tagbindname(b);
+    eprintf(" {\n");
+    {   ClassMember *m;
+        for (m = tagbindmems_(b);  m != NULL;  m = memcdr_(m))
+        {   eprintf("  %s:  ", symname_(memsv_(m)));
+            pr_typeexpr_e(memtype_(m), 0, YES);
+            eprintf(",\n");
+        }
+    }
+    eprintf("};\n");
+    enewline();
 }
 
 static void pr_optexpr(Expr *x, char *s)
@@ -446,13 +865,11 @@ static void pr_list(int32 frep, VoidStar x)
                         break;
         case PR_HAND:   pr_handler((Handler *)x);
                         break;
-#ifdef CPLUSPLUS
         case PR_VTAB:   {   VfnList *v = (VfnList *)x;
                             pr_bind0(v->vfmem);
                             eprintf("[delta=%ld]", v->vfdelta);
                         }
                         break;
-#endif
                 }
                 eprintf(" ");
                 elinebreak();
@@ -460,48 +877,76 @@ static void pr_list(int32 frep, VoidStar x)
         }
 }
 
+static void pr_cv(SET_BITMAP *m)
+{   AEop op = s_const;
+    for (; op <= s_unaligned; ++op)
+        if (*m & bitoftype_(op))
+        {   eprintf("%s ", symbol_name_(op));
+            *m &= ~bitoftype_(op);
+        }
+}
+
 static void pr_typespec(TypeExpr *x)
 {
-    SET_BITMAP m = typespecmap_(x);
-    if(h0_(x)!=s_typespec)
-        {       eprintf("<bad typespec %ld>", (long)h0_(x));
-                return;
+    SET_BITMAP orig_m = typespecmap_(x);
+    SET_BITMAP m = orig_m;
+    AEop op = s_unsigned;
+    eprintf(DebugShowPointers ? "<Type%p: " : "<Type: ", (VoidStar)x);
+    if (h0_(x)!=s_typespec)
+        eprintf("<bad typespec %ld>", (long)h0_(x));
+    else
+    {   pr_cv(&m);
+        for (; s_bool <= op; --op)
+            if (m & bitoftype_(op))
+            {   m &= ~bitoftype_(op);
+                eprintf("%s%s", symbol_name_(op), m == 0 ? "" : " ");
+            }
+        if (m != 0) eprintf("%lx", (long)m);
+        if (orig_m & ENUMORCLASSBITS)
+        {   elinebreakorspace();
+            pr_tagbindname(typespectagbind_(x));
+        } else if (orig_m & bitoftype_(s_typedefname))
+        {   elinebreakorspace();
+            pr_bind1(typespecbind_(x));
+        } else if (typespecbind_(x) != 0)
+        {   elinebreakorspace();
+            eprintf("Odd type binder %p", (VoidStar)typespecbind_(x));
         }
-    eprintf(" %lx ", (long)m);
-    elinebreak();
-    if (m & (CLASSBITS | bitoftype_(s_enum)))
-        pr_tagbind(typespectagbind_(x));
-    else if (m & bitoftype_(s_typedefname))
-        pr_bind1(typespecbind_(x));
-    else if (typespecbind_(x) != 0)
-        eprintf("Odd type binder %p", (VoidStar )typespecbind_(x));
+    }
+    eprintf(">");
+}
+
+static void pr_ptr(TypeExpr *x, Symstr *s)
+{   AEop op = h0_(x);
+    SET_BITMAP m = typeptrmap_(x);
+    eprintf(op == t_content ? "*" :
+            op == t_ref ? "&" :
+            "Unexpected op %ld (%s)", (long)op, symbol_name_(op));
+    pr_cv(&m);
+    if (m != 0) eprintf("%lx ", (long)m);
+    pr_typeexpr_e(typearg_(x),s,YES);
 }
 
 /* this SHOULD print out the typeexpr backwards as a declarator with
    string s (possibly 0) as the declaree innermost.  Some fine day... */
-void pr_typeexpr(TypeExpr *x, Symstr *s)
+static void pr_typeexpr_e(TypeExpr *x, Symstr *s, bool nolinebreak)
 /* s is currently unused */
 {
         switch (h0_(x))
         {
-case s_typespec:eprintf("<TYPE:%p ", (VoidStar )x);
-                pr_typespec(x);
-                eprintf("> ");
+case s_typespec:pr_typespec(x);
                 break;
-case t_coloncolon: eprintf("<"); pr_tagbind(typespectagbind_(x));
-                eprintf("::"); pr_typeexpr(typearg_(x),s);
-                eprintf("> ");
+case t_coloncolon: eprintf("<"); pr_tagbindname(typespectagbind_(x));
+                eprintf("::"); pr_typeexpr_e(typearg_(x),s,YES);
+                eprintf(">");
                 break;
-case t_content: eprintf("*%lx ", (long)typeptrmap_(x));
-                pr_typeexpr(typearg_(x),s);
-                break;
-case t_ref:     eprintf("&*%lx ", (long)typeptrmap_(x));
-                pr_typeexpr(typearg_(x),s);
+case t_content:
+case t_ref:     pr_ptr(x, s);
                 break;
 case t_subscript:
                 pr_typeexpr(typearg_(x),s);
                 eprintf("[");
-                pr_optexpr(typesubsize_(x)," ");
+                pr_optexpr(typesubsize_(x),"");
                 eprintf("]");
                 break;
 case t_fnap:    pr_typeexpr(typearg_(x),s);
@@ -517,7 +962,11 @@ default:        eprintf("[unrecognized typeexpr %p:%ld]",
                         (void *)x, (long)h0_(x));
                 break;
         }
-        elinebreak();
+        if (!nolinebreak) elinebreak();
+}
+
+void pr_typeexpr(TypeExpr *x, Symstr *s)
+{   pr_typeexpr_e(x, s, NO);
 }
 
 void pr_expr(Expr *x)
@@ -542,7 +991,19 @@ case s_binder:
                 pr_bind0((Binder *)x);
 #endif
                 return;
-case s_integer: eprintf("%ld", (long)intval_(x));
+case s_integer: {   TypeExpr *t = princtype(type_(x));
+                    if (isprimtype_(t, s_bool))
+                    {   if (intval_(x)==1)
+                        {   eprintf("true");
+                            return;
+                        }
+                        if (intval_(x)==0)
+                        {   eprintf("false");
+                            return;
+                        }
+                    }
+                }
+                eprintf("%ld", (long)intval_(x));
                 return;
 case s_floatcon:eprintf("<float %s>", ((FloatCon *)x)->floatstr);
                 return;
@@ -781,18 +1242,29 @@ case s_fndef:   eprintf("FNDEF ");
                 eprintf("\n");
                 pr_cmd(x->v_f.fn.body);
                 eprintf("\n");
+case s_eof:
 case s_decl:    break;
 default:        eprintf("<unknown top level %ld>", (long)h0_(x));
                 position = 0;
                 break;
          }
 }
+
+void pr_exproftype(char const *s, Expr *e)
+{   position = 0;
+    eprintf(s); pr_expr(e);
+    eprintf(" of type "); pr_typeexpr_e(typeofexpr(e), 0, YES);
+    eprintf("\n");
+}
+
 #else
 
 /* non-debugging version: */
 void pr_topdecl(TopDecl *x) { IGNORE(x); }
 void pr_expr(Expr *x) { IGNORE(x); }
 void pr_cmd(Cmd *x) { IGNORE(x); }
+void pr_typeexpr(TypeExpr *x, Symstr *s) { IGNORE(x); IGNORE(s); }
+void pr_exproftype(char const *s, Expr *e) { IGNORE(s); IGNORE(e); }
 
 #endif
 

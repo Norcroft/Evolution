@@ -1,12 +1,13 @@
 /*
  * regsets.h, version 1a
  * Copyright (C) Acorn Computers Ltd., 1988.
+ * Copyright (C) Codemist Ltd., 1988.
  */
 
 /*
- * RCS $Revision: 1.7 $
- * Checkin $Date: 93/10/07 17:40:49 $
- * Revising $Author: irickard $
+ * RCS $Revision: 1.8 $
+ * Checkin $Date: 1995/06/20 10:05:11 $
+ * Revising $Author: amycroft $
  */
 
 #ifndef _regsets_h
@@ -19,22 +20,8 @@
 #  include "cgdefs.h"
 #endif
 
-/* Some operations on RegLists
- * (RegLists are defined in cgdefs.h, and are simply Lists for which the data
- *  type is a VRegnum.  These are really generic list operations, but it happens
- *  that we want to do them only on RegLists)
- */
-
-extern RegList *rldiscard(RegList *x);
-/* Discard the head entry of the argument reglist, result is the tail
- */
-
-extern bool member(VRegnum a, RegList *l);
-
-extern RegList *ndelete(VRegnum a, RegList *ll);
-/* Destructively modify the argument reglist by removing from it the first entry
- * whose data field is  a
- */
+/* The following line is a place holder: use discard2 not rldiscard.    */
+#define rldiscard(l) discard2(l)        /* place holder only            */
 
 typedef void RProc2(int32, VoidStar);
 typedef void RProc1(int32);

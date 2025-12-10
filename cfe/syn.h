@@ -5,9 +5,9 @@
  */
 
 /*
- * RCS $Revision: 1.7 $
- * Checkin $Date: 93/10/07 17:49:29 $
- * Revising $Author: irickard $
+ * RCS $Revision: 1.10 $
+ * Checkin $Date: 1995/09/19 10:20:18 $
+ * Revising $Author: enevill $
  */
 
 #ifndef _syn_h
@@ -25,6 +25,7 @@ extern void syn_end_agg(int32 beganbrace);
 extern Expr *syn_rdinit(TypeExpr *t, Binder *whole, int32 flag);
 extern bool syn_canrdinit(void);
 
+extern Expr *rd_expr(int n);
 extern TopDecl *rd_topdecl(void);
 extern void syn_init(void);
 

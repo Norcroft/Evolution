@@ -5,9 +5,9 @@
  */
 
 /*
- * RCS $Revision: 1.5 $
- * Checkin $Date: 93/10/07 17:34:26 $
- * Revising $Author: irickard $
+ * RCS $Revision: 1.8 $
+ * Checkin $Date: 1994/11/29 15:38:20 $
+ * Revising $Author: hmeekings $
  */
 
 #ifndef _flowgraf_LOADED
@@ -23,18 +23,24 @@
 #  include "jopcode.h"
 #endif
 
-extern BindListList *current_env;
-
-/* statistics */
-extern int32 icode_cur, block_cur;
-
 extern BlockHead *top_block, *bottom_block;   /* exported to cg/regalloc */
 
-extern BindList *active_binders;
+extern struct CGState {
+  /* Shared between flowgraf and cg, used during jopcode emission only */
+    BindListList *curenv;
+    BindList *active;
 
-extern Binder *juststored;
+  /* statistics */
+    int32 icode_cur, block_cur;
 
-extern VRegnum justregister;
+    struct {
+        Binder *var;
+        VRegnum reg;
+    } juststored;
+} cgstate;
+
+#define current_env cgstate.curenv
+#define active_binders cgstate.active
 
 extern int32 sizeofbinders(BindList *l, bool countall);
 

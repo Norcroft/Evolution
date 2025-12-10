@@ -6,12 +6,19 @@
  */
 
 /*
- * RCS $Revision: 1.17 $  Codemist 71
- * Checkin $Date: 93/10/01 14:45:44 $
+ * RCS $Revision: 1.48 $  Codemist 70
+ * Checkin $Date: 1995/11/01 16:46:38 $
  * Revising $Author: hmeekings $
  */
 
 /* Find cc_err below for discussion on error messages, and errors.h   */
+
+/*
+ * IDJ: 06-Jun-94: added code to support Acorn's DDE throwback facility:
+ * all errors result in a SWI to DDEUtils module to send errors back
+ * to the editor.  All guarded by #ifdef FOR_ACORN.
+ *
+ */
 
 #include <stddef.h>
 #ifdef __STDC__
@@ -32,22 +39,47 @@
 #include "aeops.h"
 #include "aetree.h"
 #include "lex.h"               /* for curlex... */
-#ifdef CPLUSPLUS
-#  include "bind.h"            /* for isgensym... */
-#endif
+#include "bind.h"            /* for isgensym... */
 #include "util.h"
+#ifdef CPLUSPLUS
+#  include "unmangle.h"
+#else
+#  define unmangle(a,b,c) 0
+#endif
+#include "msg.h"                /* NLS */
 
-#define DEFINE_MSG_COMPRESSION_TABLE 1
+#ifdef FOR_ACORN
+#include "dde.h"
+#include "dem.h"     /* cfront name demangling */
+#define listing()    (listingstream != NULL || dde_throwback_flag != 0)
+#else
+#define listing()    (listingstream != NULL)
+#endif
 
-#include "errors.h"
+#ifndef NLS
+#  undef msg_sprintf
+#  define msg_sprintf _sprintf
+#  undef msg_vfprintf
+#  define msg_vfprintf _vfprintf
+#  define DEFINE_MSG_COMPRESSION_TABLE 1
+#  include "errors.h"
+#  undef DEFINE_MSG_COMPRESSION_TABLE
+#else
+#  include "errors.h"           /* Could set COMPRESSED_MESSAGES */
+#  if defined(COMPRESSED_MESSAGES)
+#    undef COMPRESSED_MESSAGES  /* ... which isn't true for NLS ... */
+#  endif
+#endif
 
-#undef DEFINE_MSG_COMPRESSION_TABLE
-
-int32 sysdebugmask, suppress, feature;
+long sysdebugmask;
+int32 suppress, feature;
 int32 localcg_debugcount;
 FILE *listingstream;
 #ifdef PASCAL /*ECN*/
 int32 rtcheck;
+#endif
+#ifdef FOR_ACORN
+static int32 throwback_idx;   /* id of throwback session */
 #endif
 
 /* The following routines are generic list-manipulation routines.       */
@@ -97,10 +129,25 @@ int32 bitcount(int32 n)
     return(r);
 }
 
+int32 logbase2(int32 n)
+{
+/* n known to be a power of two                                          */
+    int32 r = 0;
+    unsigned32 m = n & 0xffffffff;
+    while ((m & 1)==0) m >>= 1, r++;
+    return r;
+}
+
+int32 power_of_two(int32 n)
+{
+/* If n is an exact power of two this returns the power, else -1         */
+    if (n == 0 || n != (n&(-n))) return -1;
+    return logbase2(n);
+}
+
 /* 'real' in the following represents generic float/double/long double */
 /* real_of_string() uses GLOBAL store for its value.  Is this reasonable? */
 /* Special case flag==0 for real_to_real (and sem.c/fltrep_from_widest()) */
-
 FloatCon *real_of_string(const char *s, int32 flag)
 {   int32 wsize = offsetof(FloatCon,floatstr[0]) + padstrlen(strlen(s));
     FloatCon *x = (FloatCon *) GlobAlloc(SU_Const, wsize);
@@ -108,33 +155,13 @@ FloatCon *real_of_string(const char *s, int32 flag)
     x->h0 = s_floatcon;
     strcpy(x->floatstr, s);
     if (flag)
-    {   x->floatlen = flag;       /* the bitoftype_ / curlex.a2.flag pun!!! */
-/*
- * In earlier versions of this compiler sizeof_double==sizeof_ldble was
- * assumed. It is now hoped that support for long double strictly longer
- * then double is OK, but in the limited case float=double=4, long double=8.
- */
-        fltrep_stod(s, &x->floatbin.db);
-#ifdef EXTENSION_FRAC
-        if (flag & bitoftype_(s_frac))
-        {   int32 n = 0;
-            int ok = flt_dtofrac(&n, &x->floatbin.db);
-            if (!ok) 
-            {   /* The problem case: be gentle to 'frac x = -1.0r;'     */
-                if (n == 0x80000000)
-                    cc_warn("out-of-range 1.0r treated as -1.0r");
-                else
-                    cc_rerr(sem_warn_fix_fail);
-            }
-            if (((flag & bitoftype_(s_short)) ? sizeof_short :
-                 (flag & bitoftype_(s_long)) ? sizeof_long : sizeof_int) == 2)
-                frac_narrow_round(&n);
-            x->floatbin.irep[0] = n;
-        }
-        else
-#endif
-        if (sizeof_double == 4 && (flag & bitoftype_(s_long)) == 0 ||
-              sizeof_float < sizeof_double  &&  flag & bitoftype_(s_short))
+    {   int failed;
+        x->floatlen = flag;       /* the bitoftype_ / curlex.a2.flag pun!!! */
+/* Currently sizeof_double==sizeof_ldble is assumed.                    */
+        failed = fltrep_stod(s, &x->floatbin.db, NULL);
+        if (failed != flt_ok) flt_report_error(failed);
+        if (sizeof_double == 4 ||
+            sizeof_float < sizeof_double  &&  (flag & bitoftype_(s_short)))
             /* so we only need to narrow once  */
             fltrep_narrow_round(&x->floatbin.db, &x->floatbin.fb);
     }
@@ -213,12 +240,17 @@ static int32 errsaven;
 static int32 errsavep;
 #endif
 
+/* VERY HACKED - INTEGRATE THESE CHANGES */
+
+
 static struct uncompression_record
 {
     char *pointer;
     char compressed;
     unsigned char height;
+#ifdef COMPRESSED_MESSAGES
     char stack[MSGSTACKDEPTH];
+#endif
 } errmsg;
 
 #ifdef COMPRESSED_MESSAGES
@@ -230,7 +262,7 @@ static void start_string_char(char *s) /* Compressed but still a string */
     errmsg.compressed = 1;
 }
 
-static int fetch_string_char()
+static int fetch_string_char(void)
 /*
  * This is the same code (pretty well) as pp_fetch_string_char() in
  * "pp.c", but having a separate version here keeps the module structure
@@ -268,7 +300,7 @@ static void start_string_char(char *s)
     errmsg.pointer = s;
 }
 
-static int fetch_string_char()
+static int fetch_string_char(void)
 {
     return *errmsg.pointer++;
 }
@@ -281,44 +313,88 @@ static void unfetch_string_char(int ch)
 
 #endif
 
-static void sstart_string_char(char *s)
+void sstart_string_char(char *s)
 {
     errmsg.height = 0;
     errmsg.pointer = s;
     errmsg.compressed = 0;
 }
 
-static void nprintf(char *errcode, ...)
+static void nprintf(msg_t errcode, ...)
 {
     va_list a;
+#ifndef NLS
     char s[80];
     char *p = s;
-    start_string_char(errcode);
+    start_string_char(msg_lookup(errcode));
 /*
  * Convert error code into a string so that it can be printed. I expect
  * all strings used to be less than 80 characters long.
  */
     while ((*p++ = fetch_string_char()) != 0);
+#endif
+
     va_start(a, errcode);
+#ifdef NLS
+    msg_vfprintf(stderr, errcode, a);
+#else
     _vfprintf(stderr, s, a);
+#endif
     va_end(a);
 }
 
 void summarise(void)
 {
-    if (warncount || recovercount || errorcount || (feature & FEATURE_VERBOSE))
-    {   nprintf(misc_message_sum1(curlex.fl.f, (long)warncount, warncount==1));
-        if (xwarncount && !(feature & FEATURE_PCC))
-            nprintf(misc_message_sum2, (long)xwarncount);
-        nprintf(misc_message_sum3((long)recovercount,recovercount==1));
-        nprintf(misc_message_sum5((long)errorcount,errorcount==1));
+    if (warncount || recovercount || errorcount ||
+        (feature & FEATURE_VERBOSE))
+    {
+      /* The NLS here is very minimal. We only special case 0 or 1 errors
+       * (sufficient for most Western European languages). Generalising
+       * this to any language would require a reworking of the NLS system
+       * to allow some form of parameterised message. (bleugh)
+       */
+
+#ifndef COMPILING_ON_MPW
+      switch (warncount) {
+      case 0: nprintf(misc_message_sum1_zero,curlex.fl.f); break;
+      case 1: nprintf(misc_message_sum1_sing,curlex.fl.f); break;
+      default:
+        nprintf(misc_message_sum1(curlex.fl.f, (long)warncount));
+        break;
+      }
+#else
+      switch (warncount) {
+      case 0: nprintf(misc_message_sum1_zero_mpw,curlex.fl.f); break;
+      case 1: nprintf(misc_message_sum1_sing_mpw,curlex.fl.f); break;
+      default:
+        nprintf(misc_message_sum1_mpw(curlex.fl.f, (long)warncount));
+        break;
+      }
+#endif
+      if (xwarncount && !(feature & FEATURE_PCC))
+        nprintf(misc_message_sum2, (long)xwarncount);
+
+      switch (recovercount) {
+      case 0: nprintf(misc_message_sum3_zero); break;
+      case 1: nprintf(misc_message_sum3_sing); break;
+      default:
+        nprintf(misc_message_sum3,recovercount);
+        break;
+      }
+
+      switch (errorcount) {
+      case 0: nprintf(misc_message_sum5_zero); break;
+      case 1: nprintf(misc_message_sum5_sing); break;
+      default:
+        nprintf(misc_message_sum5,errorcount);
+        break;
+      }
     }
 }
 
-static void check_error_buffer(void)
-{
 #ifndef NO_LISTING_OUTPUT
-    /* don't rely on ANSI realloc(NULL, ..) semantics */
+static void check_error_buffer(void)
+{   /* don't rely on ANSI realloc(NULL, ..) semantics */
     if (errsaves == NULL)
         errsaves = (char *)malloc((size_t)(errsaven = 1024));
     else if (errsavep > errsaven - 200)
@@ -328,23 +404,34 @@ static void check_error_buffer(void)
         listingstream = NULL;
         cc_fatalerr(misc_fatalerr_space1);
     }
-#endif
 }
+#endif
 
-static void announce(char *reason, int32 line)
-{   nprintf(misc_message_lineno(curlex.fl.f, (long)line, reason));
+static void announce(msg_t msg_reason, int32 line)
+{
+  char *reason;
+  reason=msg_lookup(msg_reason);
+#ifndef TARGET_IS_UNIX
+#  ifndef COMPILING_ON_MPW
+    nprintf(misc_message_lineno(curlex.fl.f, (long)line, reason));
+#  else
+    nprintf(misc_message_lineno_mpw(curlex.fl.f, (long)line, reason));
+#  endif
+#else
+    nprintf(misc_message_lineno_unix(curlex.fl.f, (long)line, reason));
+#endif
 #ifndef NO_LISTING_OUTPUT
-    if (listingstream != NULL)
+    if (listing())
     {   check_error_buffer();
         if (list_this_file)
-             errsavep += (_sprintf(&errsaves[errsavep],
-                                  misc_message_announce, reason),
-                          strlen(&errsaves[errsavep]));
+            msg_sprintf(&errsaves[errsavep], misc_message_announce, reason);
         else
-             errsavep += (_sprintf(&errsaves[errsavep],
-                                  misc_message_announce1,
-                                  curlex.fl.f, (long)line, reason),
-                          strlen(&errsaves[errsavep]));
+            msg_sprintf(&errsaves[errsavep], misc_message_announce1,
+                    curlex.fl.f, (long)line, reason);
+        errsavep += strlen(&errsaves[errsavep]);
+#ifdef FOR_ACORN
+        throwback_idx = errsavep;
+#endif
     }
 #endif
 }
@@ -359,24 +446,31 @@ void listing_diagnostics(void)
 #endif
 }
 
-static void errprintf(char *s, ...)
+static void errprintf(char const *s, ...)
 {
+  /* Takes a format, not a tag */
     va_list a;
     va_start(a, s);
     _vfprintf(stderr, s, a);
     va_end(a);
 #ifndef NO_LISTING_OUTPUT
-    if (listingstream != NULL)
+    if (listing())
     {   check_error_buffer();
         va_start(a, s);
-        errsavep += (_vsprintf(&errsaves[errsavep], s, a),
-                     strlen(&errsaves[errsavep]));
+#ifdef FOR_ACORN
+        /* there is no _vsprintf() in Acorn's shared library stub...    */
+        vsprintf(&errsaves[errsavep], s, a);
+#else   /* ...use integer-only variant... which IS exported from armlib */
+        /* or, for non-ARM hosts, is #defined in host.h to be vsprint.  */
+        _vsprintf(&errsaves[errsavep], s, a);
+#endif
+        errsavep += strlen(&errsaves[errsavep]);
         va_end(a);
     }
 #endif
 }
 
-static void qprints(char *s)
+static void qprints(char const *s)
 {   /* used to print symbols (quoted) or syntactic categories */
     if (s[0] == '<' && isalpha(s[1])) errprintf("%s", s);
     else errprintf("'%s'", s);
@@ -406,7 +500,7 @@ case 0:    c = '0'; break;
     s[0] = '\\', s[1] = c, s[2] = 0;
 }
 
-static void escstring(char *d, int32 dl, char *s, int32 sl)
+static void escstring(char *d, int32 dl, char const *s, int32 sl)
 {   /* Used to print strings escaping chars as needed.                  */
     /* Note that s==DUFF_ADDR is OK if sl==0.                           */
     int32 si, di;
@@ -429,31 +523,24 @@ static char *xstgbit_name(SET_BITMAP stg)
 
 static char *xtypebit_name(SET_BITMAP typespec)
 {  AEop s;
-#ifdef EXTENSION_FRAC
-   if (typespec & bitoftype_(s_int) &&
-       typespec & (bitoftype_(s_long)|bitoftype_(s_short)|
-                   bitoftype_(s_frac)|
-                   bitoftype_(s_unsigned)|bitoftype_(s_signed)))
-#else
    /* Hack: the next line helps printing 'long int', but not much else.   */
    if (typespec & bitoftype_(s_long))
-#endif
-   {
-#ifndef EXTENSION_FRAC
-       if (typespec & bitoftype_(s_short))
+   {   if (typespec & bitoftype_(s_short))
           typespec ^= bitoftype_(s_longlong) ^ bitoftype_(s_int) ^
                      (bitoftype_(s_long) | bitoftype_(s_short));
-#endif
        typespec &= ~bitoftype_(s_int);
    }
-   for (s = s_char; s < s_char + NUM_OF_TYPES; s++)
+   for (s = s_bool; s < s_bool + NUM_OF_TYPES; s++)
        if (typespec & bitoftype_(s)) return sym_name_table[s];
    return "???";
 }
 
-static char *xtype_name(TypeExpr *e)
+static char const *xtype_name(TypeExpr const *e)
 {   switch (h0_(e))
-    {   case s_typespec: return xtypebit_name(typespecmap_(e));
+    {   case s_typespec:
+            if (typespecmap_(e) & ENUMORCLASSBITS)
+                return symname_(tagbindsym_(typespectagbind_(e)));
+            return xtypebit_name(typespecmap_(e));
         case t_ovld: return "<overloaded function>";
         case t_fnap: return "<function>";
         case t_content: return "<pointer>";
@@ -463,13 +550,212 @@ static char *xtype_name(TypeExpr *e)
     }
 }
 
-static void ssuperrprintf(va_list a)
+#ifdef  FOR_ACORN
+#ifndef PASCAL
+#ifndef FORTRAN
+int cplusplus_flag;
+#define input_from_cfront  (cplusplus_flag != 0)
+#endif
+#endif
+#endif
+
+static void printsym(char const *format, Symstr const *sym)
+{   char const *name = symname_(sym);
+#ifdef input_from_cfront
+    static char *sbuf;
+    if (input_from_cfront)
+    {   if (!sbuf) sbuf = malloc(MAXDBUF);
+        demangle(name, sbuf);
+        name = sbuf;
+    }
+#endif
+    errprintf(format, name);
+    if (LanguageIsCPlusPlus)
+    {   char buf[256];
+        unmangle(name, buf, sizeof(buf));
+        if (strcmp(name, buf) != 0) errprintf(" [%s]", buf);
+    }
+}
+
+static void printparents(TagBinder const *b)
+{   if (b == 0) return;
+    printparents(b->tagparent);
+    if (!isgensym(tagbindsym_(b)))
+        errprintf("%s::", symname_(tagbindsym_(b)));
+}
+
+static void printbinder(Binder const *b)
+{   if (b == 0) { errprintf("<nullbinder>"); return; }
+    if (h0_(b) == s_binder || h0_(b) == s_member) {
+        printparents(bindparent_(b)); /* for C, always NULL */
+        printsym("%s", bindsym_(b));
+    } else if (h0_(b) == s_tagbind) {
+        printparents(((TagBinder const *)b)->tagparent);
+        printsym("%s", bindsym_(b));
+    } else
+        printsym("'%s'", bindsym_(b));
+}
+
+#ifdef NLS
+
+/* This is a version of va2type that supports the Compiler's '$' specifiers.
+ * $<n>$<f> is supported, but never $<n>$<width etc.><f>
+ */
+static nls_type *va2type(const char *format,va_list args)
+{
+  static nls_type result[9];
+  char fmt[9],type[9];
+  int i,arg;
+  const char *t,*s;
+
+  for (i=0;i<9;i++) type[i]='\0';
+
+  i=0;
+  t=strchr(format,'%'); s=strchr(format,'$');
+  while (t || s) {
+    if (s==NULL || (t && t<s)) {
+      t++;
+      if (*t!='\0' && *t!='%') {
+        int arg=-1;
+
+        if (t[1]=='$' && *t!='0' && isdigit(*t)) {
+          arg=*t-'1';
+          t+=2;                 /* <n>$ */
+        }
+
+        while (*t=='-' || *t=='+' || *t==' ' || *t=='#') t++;
+        if (*t=='*') {
+          t++;
+          if (t[1]=='$' && *t!='0' && isdigit(*t)) {
+            type[*t-'1']='*';
+            t+=2;               /* *<n>$ */
+          } else type[i++]='*';
+        } else
+          while (isdigit(*t)) t++;
+        if (*t=='.') {
+          t++;
+          if (*t=='*') {
+            t++;
+            if (t[1]=='$' && *t!='0' && isdigit(*t)) {
+              type[*t-'1']='*';
+              t+=2;             /* *<n>$ */
+            } else type[i++]='*';
+          } else
+            while (isdigit(*t)) t++;
+        }
+        /* t now points at the format argument, or a preceeding 'l' */
+        if (arg<0) arg=i++;
+        if (*t=='l') type[arg]=*t++; /* 'l' */
+        else type[arg]='%';
+        fmt[arg]=*t;
+      } else if (*t=='%') {
+        t++;
+      }
+
+      t=strchr(t+1,'%');        /* Goto next percent */
+    } else {                    /* s<t */
+      int j=i;
+
+      s++;
+
+      if (isdigit(*s) && *s!='0' && s[1]=='$') {
+        arg=s[0]-'1';
+        s+=2;                   /* <n>$ */
+      } else {
+        arg=i++;                /* Doesn't allow $*<f> etc. */
+      }
+
+      switch (*s) {
+      case '\0': break;
+      case '$': case 'l':       /* $l takes no argument */
+      default:                  /* really an error */
+        s++; i=j;
+        break;
+      case 's': case 'q': case 'r': case 'e':
+      case 'b': case 'c': case 't': case 'g':
+      case 'm':
+        fmt[arg]=*s;
+        type[arg]='$';
+        break;
+      }
+
+      s=strchr(s+1,'$');
+    }
+  }
+
+  for (i=0;type[i] && i<9;i++) {
+    switch (type[i]) {
+    case 'l':                   /* long % */
+      switch (fmt[i]) {
+      case 'd': case 'i': case 'o': case 'u':
+      case 'x': case 'X':
+        result[i].cardinal=va_arg(args,long);
+        break;
+      case 'p': case 's': case 'n':
+        result[i].pointer=va_arg(args,void *);
+        break;
+      case 'f': case 'e': case 'E': case 'g':
+      case 'G':
+        result[i].floating=va_arg(args,double);
+        break;
+      case 'c':
+        result[i].cardinal=va_arg(args,int);
+        break;
+      }
+      break;
+    case '%':
+      switch (fmt[i]) {
+      case 'd': case 'i': case 'o': case 'u':
+      case 'x': case 'X': case 'c':
+        result[i].cardinal=va_arg(args,int);
+        break;
+      case 'p': case 's': case 'n':
+        result[i].pointer=va_arg(args,void *);
+        break;
+      case 'f': case 'e': case 'E': case 'g':
+      case 'G':
+        result[i].floating=va_arg(args,double);
+        break;
+      }
+      break;
+    case '$':
+      switch (fmt[i]) {
+      case 's':
+        result[i].cardinal=va_arg(args,AEop);
+        break;
+      case 'g': case 'm':
+        result[i].cardinal=va_arg(args,SET_BITMAP);
+        break;
+      case 'q': case 'r': case 'e': case 'b':
+      case 'c': case 't':
+        result[i].pointer=va_arg(args,void *);
+        break;
+      }
+      break;
+    case '*':
+      result[i].cardinal=va_arg(args,int);
+      break;
+    }
+  }
+
+  return result;
+}
+
+#endif
+
+
+void ssuperrprintf(va_list a)
 {
     /* This routine behaves like printf but also recognises escape chars of
      * the form $<char> and acts upon them.   It writes its output to
      * stderr, and if listing-file!= NULL also to a buffer associated with
      * the listing file.
      */
+
+#ifdef NLS
+    nls_type *m=va2type(errmsg.pointer,a);
+    int cur_arg_n=0;
+#endif
 
     for (;;)
     {
@@ -482,6 +768,9 @@ static void ssuperrprintf(va_list a)
         int arg_type = no_arg_type, w;
         void *pnt;
         long l_int;
+#ifdef NLS
+        nls_type *cur_arg=NULL,*star_arg;
+#endif
 
         int ch;
         char v[80+12];      /* Buffer for segment of the format string */
@@ -499,6 +788,20 @@ static void ssuperrprintf(va_list a)
 /* an escape sequence (e.g. %-20.20l#x has 10 chars in it and seems a     */
 /* bit excessive. The limit is because of overflow in the buffer v[]      */
             v[n++] = ch;
+#ifdef NLS
+            if (isdigit(*errmsg.pointer) &&
+                errmsg.pointer[1]=='$') { /* nl_ extension */
+              cur_arg=&m[fetch_string_char()-'1'];
+              (void)fetch_string_char();
+            }
+#endif
+
+#ifdef NLS
+#  define ARG(TYPE,X) (TYPE)((cur_arg ? cur_arg : &m[cur_arg_n++])-> ## X)
+#else
+#  define ARG(TYPE,X) va_arg(a,TYPE)
+#endif
+
             for (;;)
             {   ch = fetch_string_char();
                 if (n == 91) syserr(syserr_bad_fmt_dir);
@@ -508,6 +811,15 @@ static void ssuperrprintf(va_list a)
         case 'l':   arg_type |= long_qualifier;
                     continue;
         case '*':   arg_type |= star_qualifier;
+#ifdef NLS
+                    if (isdigit(*errmsg.pointer) &&
+                        errmsg.pointer[1]=='$') {
+                      star_arg=&m[fetch_string_char()-'1'];
+                      (void)fetch_string_char();
+                    } else {
+                      star_arg=&m[cur_arg_n++];
+                    }
+#endif
                     continue;
         /* Note that 'h' indicates that an int should be treated as a */
         /* short value, but the va_arg() call still fetches an int.   */
@@ -525,20 +837,21 @@ static void ssuperrprintf(va_list a)
                     syserr(syserr_bad_fmt_dir);
                 }
                 break;
-            }
-            ch = fetch_string_char();
-        }
+              }
+            ch=fetch_string_char();
+          }
 
         v[n] = 0;           /* terminate format string */
 
-        if (listingstream != NULL) check_error_buffer();
-
+#ifndef NO_LISTING_OUTPUT
+        if (listing()) check_error_buffer();
+#endif
         switch (arg_type)
         {
     default:
     case no_arg_type:
 #ifndef NO_LISTING_OUTPUT
-            if (listingstream != NULL)
+            if (listing())
                 errsavep += (_sprintf(&errsaves[errsavep], v),
                              strlen(&errsaves[errsavep]));
 #endif
@@ -546,9 +859,9 @@ static void ssuperrprintf(va_list a)
             break;
 
     case ptr_arg_type:
-            pnt = va_arg(a, void *);
+            pnt = ARG(void *,pointer);
 #ifndef NO_LISTING_OUTPUT
-            if (listingstream != NULL)
+            if (listing())
                 errsavep += (_sprintf(&errsaves[errsavep], v, pnt),
                              strlen(&errsaves[errsavep]));
 #endif
@@ -561,10 +874,14 @@ static void ssuperrprintf(va_list a)
 /* achieving the same result some other way so that this extra mess here */
 /* wrt format decoding could be discarded.                           ACN */
     case ptr_arg_type + star_qualifier:
-            w = va_arg(a, int);
-            pnt = va_arg(a, void *);
+#ifdef NLS
+            w = star_arg->cardinal;
+#else
+            w = ARG(int,cardinal);
+#endif
+            pnt = ARG(void *,pointer);
 #ifndef NO_LISTING_OUTPUT
-            if (listingstream != NULL)
+            if (listing())
                 errsavep += (_sprintf(&errsaves[errsavep], v, w, pnt),
                              strlen(&errsaves[errsavep]));
 #endif
@@ -572,9 +889,9 @@ static void ssuperrprintf(va_list a)
             break;
 
     case int_arg_type + long_qualifier:
-            l_int = va_arg(a, long);
+            l_int = ARG(long,cardinal);
 #ifndef NO_LISTING_OUTPUT
-            if (listingstream != NULL)
+            if (listing())
                 errsavep += (_sprintf(&errsaves[errsavep], v, l_int),
                              strlen(&errsaves[errsavep]));
 #endif
@@ -582,9 +899,9 @@ static void ssuperrprintf(va_list a)
             break;
 
     case int_arg_type:
-            w = va_arg(a, int);
+            w = ARG(int,cardinal);
 #ifndef NO_LISTING_OUTPUT
-            if (listingstream != NULL)
+            if (listing())
                errsavep += (_sprintf(&errsaves[errsavep], v, w),
                             strlen(&errsaves[errsavep]));
 #endif
@@ -594,21 +911,28 @@ static void ssuperrprintf(va_list a)
 
         if (ch == 0)
         {
-#ifdef CPLUSPLUS
             if (syserr_behaviour==3) abort();
-#endif
             return;        /* Message now complete */
         }
 
         if (ch != '$') unfetch_string_char(ch);
-        else switch (ch = fetch_string_char())
-        {
-    case 0:
+        else {
+          ch=fetch_string_char();
+#ifdef NLS
+          if (isdigit(ch) && *errmsg.pointer=='$') {
+            cur_arg=&m[ch-'1'];
+            (void)fetch_string_char();
+            ch = fetch_string_char();
+          }
+#endif
+
+          switch (ch) {
+          case 0:
             return;
-    case 's':
-            qprints(sym_name_table[va_arg(a,AEop) & 255]);
+          case 's':
+            qprints(sym_name_table[ARG(AEop,cardinal) & 255]);
             break;
-    case 'l':   /* current lexeme */
+          case 'l':   /* current lexeme */
             switch (curlex.sym & 255)
             {   case s_integer:
                     errprintf("'%ld'", (long)curlex.a1.i); break;
@@ -616,7 +940,8 @@ static void ssuperrprintf(va_list a)
                     errprintf("'%s'", curlex.a1.fc->floatstr); break;
                 case s_identifier:
                 case s_pseudoid:
-                    errprintf("'%s'", symname_(curlex.a1.sv)); break;
+                    printsym("'%s'", curlex.a1.sv);
+                    break;
                 case s_string:
                     {   char e[80];
                         escstring(e, 20, curlex.a1.s, curlex.a2.len);
@@ -628,75 +953,78 @@ static void ssuperrprintf(va_list a)
                     break;
             }
             break;
-    case 'r':
-            {   Symstr *r = va_arg(a, Symstr *);
+          case 'q':
+          case 'r':
+            {   Symstr *r = ARG(Symstr *,pointer);
                 if (r==0 || h0_(r) != s_identifier)
                 {   if (r == 0) errprintf("<missing>");
                     else errprintf("<oddity>");
                 }
-                else errprintf("'%s'", symname_(r));
-            }
-            break;
-    case 'b':   /* ordinary binder, but works for tag binder too.       */
-            {   Binder *b = va_arg(a, Binder *);
-                if (b == 0) { errprintf("<nullbinder>"); break; }
-#ifdef CPLUSPLUS
-                if (h0_(b) == s_binder || h0_(b) == s_member)
-                {   TagBinder *cl = bindparent_(b);
-                    if (cl && !isgensym(bindsym_(cl)))
-                    {   errprintf("'%s::%s'",
-                                  symname_(bindsym_(cl)),
-                                  symname_(bindsym_(b)));
-                        break;
-                    }
-                }
-#endif
-                errprintf("'%s'", symname_(bindsym_(b)));
-            }
-            break;
-    case 'c':   /* tag binder -- this will simplify many err msgs.      */
-            {   TagBinder *b = va_arg(a,TagBinder *);
-                errprintf("'%s %s'",
-                          sym_name_table[tagbindsort(b)],
-                          symname_(tagbindsym_(b)));
+                else if (ch == 'r')
+                    printsym("'%s'", r);
+                else
+                    printsym("%s", r);
             }
             break;
     case 'e':
-            {   Expr *e = va_arg(a,Expr *);
+            {   Expr *e = ARG(Expr *,pointer);
                 while (h0_(e) == s_invisible) e = arg1_(e);
-                if (h0_(e) == s_binder || h0_(e) == s_member)
-                    errprintf("'%s'", symname_(bindsym_(((Binder *)e))));
-                else if (h0_(e) == s_string)
+                if (h0_(e) != s_binder && h0_(e) != s_member)
+                {   AEop op = h0_(e);
+                    if (op == s_string
+#ifdef EXTENSION_UNSIGNED_STRINGS
+                        || op == s_ustring || op == s_string
+#endif
+                       )
                     {   char s[80];
                         StringSegList *z = ((String *)e)->strseg;
                         escstring(s, 60, z->strsegbase, z->strseglen);
                         errprintf("'\"%s\"'", s);
                     }
-    /* improve the next line -- I wonder what the best heuristic is. */
-    /* Note that any routines MUST eventually call errprintf, if you */
-    /* ever aspire to have listing output as well as stderr.         */
-                else errprintf("<expr>");
+                    else
+                    {   char *opname = sym_name_table[op & 255];
+                        if (isdiad_(op))
+                            errprintf("<expr> %s <expr>", opname);
+                        else if (op >= s_binder)
+                            errprintf("%s<expr>", opname);
+                        else
+                            errprintf("'%s'", opname);
+                    }
+                }
+                else
+                    printbinder((Binder *)e);
+            }
+            break;
+    case 'b':   /* ordinary binder, but works for tag binder too.       */
+            printbinder(ARG(Binder *,pointer));
+            break;
+    case 'c':   /* tag binder -- this will simplify many err msgs.      */
+            {   TagBinder *b = ARG(TagBinder *,pointer);
+                if (b == 0) break;
+                errprintf("%s ", sym_name_table[tagbindsort(b)]);
+                printbinder((Binder *)b);
             }
             break;
     case 't':
-            qprints(xtype_name(va_arg(a,TypeExpr *)));
+            qprints(xtype_name(ARG(TypeExpr *,pointer)));
             break;
     case 'g':
-            errprintf("'%s'", xstgbit_name(va_arg(a,SET_BITMAP)));
+            errprintf("'%s'", xstgbit_name(ARG(SET_BITMAP,cardinal)));
             break;
     case 'm':
-            errprintf("'%s'", xtypebit_name(va_arg(a,SET_BITMAP)));
+            errprintf("'%s'", xtypebit_name(ARG(SET_BITMAP,cardinal)));
             break;
     default:
             errprintf("$%c", (int)ch);   /* really an error */
             break;
+          }
         }
-    }
-}
+      }
+  }
 
-static void superrprintf(char *errorcode, va_list a)
+static void superrprintf(msg_t errorcode, va_list a)
 {
-    start_string_char(errorcode);
+    start_string_char(msg_lookup(errorcode));
     ssuperrprintf(a);
 }
 
@@ -708,10 +1036,20 @@ void cc_msg(char *s, ...)
     va_end(a);
 }
 
+#ifdef NLS
+void cc_msg_lookup(msg_t s, ...)
+{
+    va_list a;
+    va_start(a, s);
+    sstart_string_char(msg_lookup(s)); ssuperrprintf(a);
+    va_end(a);
+}
+#endif
+
 void syserr(syserr_message_type errorcode, ...)
 {
     va_list a;
-#ifdef NUMERIC_SYSERR_CODES
+#ifdef NUMERIC_SYSERR_CODES     /* Incompatible with NLS? */
     char s[48];
 /*
  * syserr codes are listed in the file errors.h, and are just
@@ -733,20 +1071,22 @@ void syserr(syserr_message_type errorcode, ...)
         case 2: abort();        /* hard stop - would like diagnostics */
                 break;
         default:                /* stop tolerably quietly and tidily */
+#ifndef TARGET_IS_INTERPRETER
                 va_start(a, errorcode);
                 superrprintf(misc_disaster_banner, a);  /* no escapes */
                 va_end(a);
+#endif
                 compile_abort(0);
                 break;
     }
     exit(EXIT_syserr);
 }
 
-void cc_fatalerr_l(int32 n, char *errorcode, va_list a)
+void cc_fatalerr_l(int32 n, msg_t errorcode, va_list a)
 {
     announce(misc_message_fatal, n);
     superrprintf(errorcode, a);
-    errprintf(misc_message_abandoned);
+    errprintf(msg_lookup(misc_message_abandoned));
     if (syserr_behaviour)
     {   show_store_use();
         syserr(syserr_syserr);  /* rethink this msg if syserrs lack strings */
@@ -754,7 +1094,7 @@ void cc_fatalerr_l(int32 n, char *errorcode, va_list a)
     compile_abort(-1);  /* (-1) is not a signal number used by signal() */
 }
 
-void cc_fatalerr(char *errorcode, ...)
+void cc_fatalerr(msg_t errorcode, ...)
 {
     va_list a;
     va_start(a, errorcode);
@@ -762,7 +1102,7 @@ void cc_fatalerr(char *errorcode, ...)
     va_end(a);
 }
 
-void cc_warn_l(int32 n, char *errorcode, va_list a)
+void cc_warn_l(int32 n, msg_t errorcode, va_list a)
 {
     if (!(feature & FEATURE_NOWARNINGS))
     {
@@ -770,10 +1110,14 @@ void cc_warn_l(int32 n, char *errorcode, va_list a)
         announce(misc_message_warning, n);
         superrprintf(errorcode, a);
         errprintf("\n");
+#ifdef FOR_ACORN
+        if (dde_throwback_flag != 0)
+            dde_throwback_send(THROWBACK_WARN, n, &errsaves[throwback_idx]);
+#endif
     }
 }
 
-void cc_warn(char *errorcode, ...)
+void cc_warn(msg_t errorcode, ...)
 {
     va_list a;
     va_start(a, errorcode);
@@ -781,7 +1125,7 @@ void cc_warn(char *errorcode, ...)
     va_end(a);
 }
 
-void cc_ansi_warn(char *errorcode, ...)
+void cc_ansi_warn(msg_t errorcode, ...)
 /* called to issue a warning that's suppressed in pcc mode */
 {
     va_list a;
@@ -791,7 +1135,7 @@ void cc_ansi_warn(char *errorcode, ...)
     va_end(a);
 }
 
-void cc_pccwarn(char *errorcode, ...)
+void cc_pccwarn(msg_t errorcode, ...)
 /* This counts as a warning in pcc mode, but a recoverable error in */
 /* ANSI mode.  Hence it should ONLY be called when the compiler     */
 /* can claim to repair the construct. In PCC mode ONLY the warning  */
@@ -811,17 +1155,27 @@ void cc_pccwarn(char *errorcode, ...)
     superrprintf(errorcode, a);
     va_end(a);
     errprintf("\n");
+#ifdef FOR_ACORN
+    if (dde_throwback_flag!= 0)
+        dde_throwback_send(
+            (feature & FEATURE_PCC) ? THROWBACK_WARN : THROWBACK_ERROR,
+                curlex.fl.l, &errsaves[throwback_idx]);
+#endif
 }
 
-void cc_rerr_l(int32 n, char *errorcode, va_list a)
+void cc_rerr_l(int32 n, msg_t errorcode, va_list a)
 {
     ++recovercount;
     announce(misc_message_error, n);
     superrprintf(errorcode, a);
     errprintf("\n");
+#ifdef FOR_ACORN
+    if (dde_throwback_flag != 0)
+        dde_throwback_send(THROWBACK_ERROR, n, &errsaves[throwback_idx]);
+#endif
 }
 
-void cc_rerr(char *errorcode, ...)
+void cc_rerr(msg_t errorcode, ...)
 {
     va_list a;
     va_start(a, errorcode);
@@ -830,7 +1184,7 @@ void cc_rerr(char *errorcode, ...)
 }
 
 
-void cc_ansi_rerr(char *errorcode, ...)
+void cc_ansi_rerr(msg_t errorcode, ...)
 /* called to output an ANSI mode recoverable error mesage */
 /*  which is always suppressed in -pcc mode.              */
 {
@@ -841,21 +1195,57 @@ void cc_ansi_rerr(char *errorcode, ...)
     va_end(a);
 }
 
+void cc_rerr_cppwarn(msg_t errorcode, ...)
+{   /* recoverable error for C; warning for C++ */
+    va_list a;
+    va_start(a, errorcode);
+    if (!LanguageIsCPlusPlus)
+      cc_rerr_l(curlex.fl.l, errorcode, a);
+    else
+      cc_warn_l(curlex.fl.l, errorcode, a);
+    va_end(a);
+}
 
-void cc_err_l(int32 n, char *errorcode, va_list a)
+void cc_rerr_cwarn(msg_t errorcode, ...)
+{   /* recoverable error for C++; warning for C */
+    va_list a;
+    va_start(a, errorcode);
+    if (LanguageIsCPlusPlus)
+      cc_rerr_l(curlex.fl.l, errorcode, a);
+    else
+      /* what does PCC mode want here?  Warn like most PCC's         */
+      cc_warn_l(curlex.fl.l, errorcode, a); /* ANSI C says OK.     */
+    va_end(a);
+}
+
+void cc_err_l(int32 n, msg_t errorcode, va_list a)
 {
     if (++errorcount > 100) cc_fatalerr(misc_fatalerr_toomanyerrs);
     announce(misc_message_serious, n);
     superrprintf(errorcode, a);
     errprintf("\n");
+#ifdef FOR_ACORN
+    if (dde_throwback_flag != 0)
+        dde_throwback_send(THROWBACK_SERIOUS, n, &errsaves[throwback_idx]);
+#endif
 }
 
-void cc_err(char *errorcode, ...)
+void cc_err(msg_t errorcode, ...)
 {
     va_list a;
     va_start(a, errorcode);
     cc_err_l(curlex.fl.l, errorcode, a);
     va_end(a);
+}
+
+void flt_report_error(int failure) {
+    switch (failure) {
+    default:               syserr("flt_report_error");
+    case flt_very_small:   cc_warn(fp_rerr_very_small); break;
+    case flt_very_big:     cc_rerr(fp_err_very_big); break;
+    case flt_big_single:   cc_rerr(fp_err_big_single); break;
+    case flt_small_single: cc_warn(fp_rerr_small_single); break;
+    }
 }
 
 void errstate_init(void)

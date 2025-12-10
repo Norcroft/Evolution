@@ -4,9 +4,9 @@
  */
 
 /*
- * RCS $Revision: 1.7 $
- * Checkin $Date: 93/10/07 17:44:48 $
- * Revising $Author: irickard $
+ * RCS $Revision: 1.13 $
+ * Checkin $Date: 1995/08/14 16:41:30 $
+ * Revising $Author: enevill $
  */
 
 #ifndef _xrefs_LOADED
@@ -81,6 +81,10 @@ struct DataXref {
 #define X_TailCall    0x08000000L
 #endif
 
+#ifdef THUMB_CPLUSPLUS
+#  define X_PCreloc_32 0x17000000L
+#endif
+
 #ifdef TARGET_IS_ACW
 #  define X_codelink  0x0c000000L    /* WGD: for ACW  */
 #  define X_datalink  0x0d000000L    /* WGD: for ACW  */
@@ -89,54 +93,14 @@ struct DataXref {
 #ifdef TARGET_IS_SPARC
 #  define X_PCw30reloc        0x08000000L
 #endif
-#ifdef TARGET_IS_C4P
-#  define X_ZPOFFb            0x11000000L
-#  define X_ZPOFFh            0x12000000L
-#  define X_ZPOFFw            0x13000000L
-#endif
-#ifdef TARGET_IS_NEC
-#  ifndef TARGET_IS_C4P      /* @@@ see TARGET_IS_NEC hack in c4p/target.h */
-#  define X_HI16S             0x0b000000L
-#  define X_LO16b             0x0d000000L
-#  define X_LO16bu             0x2d000000L
-#  define X_LO16h             0x0e000000L
-#  define X_LO16hu             0x2e000000L
-#  define X_LO16w             0x0f000000L
 
-#  define X_ZPOFFb            0x11000000L
-#  define X_ZPOFFbu            0x31000000L
-#  define X_ZPOFFh            0x12000000L
-#  define X_ZPOFFhu            0x32000000L
-#  define X_ZPOFFw            0x13000000L
-
-#  define X_GPOFFb            0x15000000L
-#  define X_GPOFFbu            0x35000000L
-#  define X_GPOFFh            0x16000000L
-#  define X_GPOFFhu            0x36000000L
-#  define X_GPOFFw            0x17000000L
-
-#  define X_EPOFFb            0x19000000L
-#  define X_EPOFFbu            0x39000000L
-#  define X_EPOFFh            0x1a000000L
-#  define X_EPOFFhu            0x3a000000L
-#  define X_EPOFFw            0x1b000000L
-#  define X_EPOFF7b           0x1d000000L
-#  define X_EPOFF4bu           0x3d000000L
-#  define X_EPOFF7h           0x1e000000L
-#  define X_EPOFF4hu           0x3e000000L
-#  define X_EPOFF7w           0x1f000000L
-#  endif /* TARGET_IS_C4P * / @@@ see TARGET_IS_NEC hack in c4p/target.h */
-#endif
-
-struct DataDesc;
 struct ExtRef
 { ExtRef *extcdr;
   Symstr *extsym;
   int32 extindex;
   int extflags;            /* xr_xxx things below */
   int32 extoffset;
-/* Symstr *codesym;         / * for code defs when one area per fn */
-  struct DataDesc *extseg;
+  Symstr *codesym;         /* for code defs when one area per fn */
 };
 
 /*
@@ -163,24 +127,24 @@ struct ExtRef
                                 /* rationally, we would use xr_code+    */
                                 /* xr_data for this, but see below      */
 
-#define xr_zeropage    0x800    /* special easy access memory           */
-#define xr_refloc     0x1000    /* predicts future xr_defloc.           */
-#define xr_objflg     0x2000    /* private use by object code formatter */
-#define xr_objflg1    0x4000
-#define xr_objflg2    0x8000
-#ifdef TARGET_HAS_NEC_SECTS
-#define xr_zeropage2  xr_objflg1    /* TARGET_IS_NEC only */
-#endif
-#ifdef TARGET_HAS_C4P_SECTS
-#define xr_immpage2  xr_objflg1
+#define xr_objflg      0x800    /* private use by object code formatter */
+#define xr_objflg1    0x1000
+#define xr_objflg2    0x2000
+#define xr_objflg3    0x4000
+#define xr_objflg4    0x8000
+#define xr_objflg5   0x10000
+#define xr_objflg6   0x20000
+
+#ifdef THUMB_CPLUSPLUS
+#define xr_code_32      xr_objflg1
 #endif
 
 /* (Currently for Acorn AOF object format only), bits in the           */
-/* 0xffff0000 area are used for common block index numbers.            */
+/* 0xfffc0000 area are used for common block index numbers.            */
 /* The following macros sugar the conversion between the flag field    */
 /* and index values.                                                   */
-#define xr_flagtoidx_(n)       ((n) >> 16)
-#define xr_idxtoflag_(n)       ((n) << 16)
+#define xr_flagtoidx_(n)       ((n) >> 18)
+#define xr_idxtoflag_(n)       ((n) << 18)
 
 /* Due to an idleness (actually silly optimisation when ~TARGET_CALL...*/
 /*  ...USES_DESCRIPTOR) xr_data may get spuriously set, so always test */
@@ -220,34 +184,31 @@ struct ExtRef
                                 /* vestigial (obj_symref subsumes) or   */
                                 /* up-and-coming.  Currenltly only used */
                                 /* if TARGET_CALL_USES_DESCRIPTOR.      */
-#if (alignof_toplevel <= 2)
+
+/* the following used only if sizeof_ptr == 2 or in the presence of     */
+/* initialisation of s_unaligned objects                                */
 #define LIT_HX      0x0e        /* one halfword only (host sex)         */
 #define LIT_BBX     0x0f        /* two bytes only (host sex)            */
-#endif
-#if (alignof_toplevel <= 1)
-#define LIT_HBX     0x1b        /* halfword then 1 byte in host sex     */
-#define LIT_BX      0x1e        /* one bytes only (host sex)            */
-#define LIT_BBBX    0x1f        /* three bytes only (host sex)          */
-#endif
+/* the following used only in the presence of initialisation of         */
+/* s_unaligned objects                                                  */
+#define LIT_BXXX    0x14
+#define LIT_BBBX    0x15
+#define LIT_HBX     0x16
 
-#ifdef EXTENSION_FRAC
-#define LIT_LFRAC   0x42        /* 4 byte long frac constant literal    */
-#define LIT_RR      0x48        /* 2 (short) fracs                      */
-#define LIT_HR      0x58        /* short then frac                      */
-#define LIT_RH      0x59        /* frac then short                      */
-#define LIT_BBR     0x4a        /* 2 bytes then frac                    */
-#if (alignof_toplevel <= 2)
-#define LIT_RBB     0x4b        /* frac then 2 bytes                    */
-#define LIT_RX      0x4e        /* one short frac                       */
-#endif
+/* ECN: Support for single halfwords sized objects */
+#define LIT_H       0x17
+#define LIT_BB      0x18
+
+#ifdef THUMB_CPLUSPLUS
+/* ECN: Support for embedding 32 bit ARM instructions in a Thumb code sequence */
+#define LIT_OPCODE_32 0x19
 #endif
 
 extern CodeXref *codexrefs;
 extern ExtRef *obj_symlist;
 extern DataXref *dbgxrefs;
-extern int32 obj_symref4(Symstr *s, int flags, int32 loc, struct DataDesc *seg);
-#define obj_symref(s,f,l) obj_symref4(s,f,l,0)
-#define obj_symref2(s,f) obj_symref4(s,f,0,0)
+extern int32 obj_symref(Symstr *s, int flags, int32 loc);
+extern int32 obj_symdef(Symstr *s, int flags, int32 loc);
 
 #define LITF_INCODE  1L
 #define LITF_FIRST   2L

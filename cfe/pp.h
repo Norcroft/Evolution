@@ -7,7 +7,7 @@
 
 /*
  * RCS $Revision: 1.7 $
- * Checkin $Date: 93/10/07 17:47:48 $
+ * Checkin $Date: 1993/10/07 17:47:48 $
  * Revising $Author: irickard $
  */
 
@@ -127,13 +127,6 @@ extern void pp_inclclose(FileLine fl);
 
 #ifdef FORTRAN
 extern void pp_pop_include(void);
-#endif
-
-#ifdef TARGET_KEEP_COMMENT
-extern char *pp_textcomment(void);
-/* return text string (to be copied before next call to pp_nextchar())
- * which concatenates the comments seen since last call (or start of file).
- */
 #endif
 
 #endif

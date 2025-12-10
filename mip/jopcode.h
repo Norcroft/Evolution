@@ -4,9 +4,9 @@
  */
 
 /*
- * RCS $Revision: 1.20 $ Codemist 37
- * Checkin $Date: 93/10/07 17:38:18 $
- * Revising $Author: irickard $
+ * RCS $Revision: 1.33 $ Codemist 37
+ * Checkin $Date: 1995/11/29 11:30:19 $
+ * Revising $Author: hmeeking $
  */
 
 /*
@@ -66,36 +66,35 @@
 #define J_TABLE_BITS 0x3ff  /* Room for 1000 distinct jopcodes */
 #define _joptable(o) (joptable[(o) & J_TABLE_BITS].bits)
 
-#define J_VOLATILE 0x0800L      /* replacing J_USE/J_VSTORE, only LDRx/STRx */
-#define J_WBIT     0x0400L      /* short op (use also for short flt?)       */
-
+#define J_BASEALIGN4     0x0400L
+#define J_VOLATILE       0x0800L /* replacing J_USE/J_VSTORE, only LDRx/STRx */
 /* N.B. The compiler currently does not represent 'volatile' on J_MOVC      */
 /* because large structs are not subject to dataflow analysis.              */
 /* Maybe it should, and hence maybe there should be two J_VOLATILE bits.    */
-#define J_DEAD_R1  0x1000L      /* for dataflow analysis                    */
-#define J_DEAD_R2  0x2000L      /* for dataflow analysis                    */
-#define J_DEAD_R3  0x4000L      /* for dataflow analysis                    */
+#define J_DEAD_R1        0x1000L  /* for dataflow analysis                  */
+#define J_DEAD_R2        0x2000L  /* for dataflow analysis                  */
+#define J_DEAD_R3        0x4000L  /* for dataflow analysis                  */
 #define J_DEADBITS (J_DEAD_R1+J_DEAD_R2+J_DEAD_R3)
 
 #if defined TARGET_HAS_SCALED_ADDRESSING || defined TARGET_HAS_SCALED_OPS || \
     defined TARGET_HAS_SCALED_ADD
-#  define J_NEGINDEX      0x8000L /* currently or-able with load/store only */
-#  define J_SHIFTMASK   0xff0000L
-#  define J_SHIFTPOS          16
-#    define SHIFT_MASK      0x3fL
-#    define SHIFT_RIGHT     0x80L
-#    define SHIFT_ARITH     0x40L
+#  define J_NEGINDEX     0x8000L /* currently or-able with load/store only */
+#  define J_SHIFTMASK  0xff0000L
+#  define J_SHIFTPOS         16
+#    define SHIFT_MASK     0x3fL
+#    define SHIFT_RIGHT    0x80L
+#    define SHIFT_ARITH    0x40L
 #endif
-#define J_ALIGNMENT   0x03000000L       /* May 92 experiment.               */
-#define J_ALIGN1      0x00000000L       /* May 92 experiment.               */
-#define J_ALIGN2      0x01000000L       /* May 92 experiment.               */
-#define J_ALIGN4      0x02000000L       /* May 92 experiment.               */
-#define J_ALIGN8      0x03000000L       /* May 92 experiment.               */
+#define J_ALIGNMENT  0x03000000L       /* May 92 experiment.               */
+#define J_ALIGN1     0x00000000L       /* May 92 experiment.               */
+#define J_ALIGN2     0x01000000L       /* May 92 experiment.               */
+#define J_ALIGN4     0x02000000L       /* May 92 experiment.               */
+#define J_ALIGN8     0x03000000L       /* May 92 experiment.               */
 #define J_ALIGNPOS    24
 #define j_aligned(op,align) (((op) & J_ALIGNMENT) >= (align))
-#define J_SIGNED   0x04000000L  /* orable with LDRBx, LDRWx, also fix/float */
-#define J_UNSIGNED 0x08000000L  /* ditto */
-#define J_ALIGNWR  J_SIGNED     /* => J_STRxx may write to J_ALIGN padding  */ 
+#define J_SIGNED     0x04000000L /* orable with LDRBx, LDRWx, also fix/float */
+#define J_UNSIGNED   0x08000000L /* ditto */
+#define J_ALIGNWR    J_SIGNED    /* => J_STRxx may write to J_ALIGN padding  */
 
 /* type bits (reallocate?) ... n.b. Q_UBIT shares with J_UNSIGNED */
 
@@ -131,6 +130,8 @@
 #define K_PURE          0x02000000L /* replaces J_CALLP                 */
 #define K_SPECIAL_ARG   0x04000000L /* extra arg in an odd register     */
 #define K_INLINE        0x08000000L /* backend intends special expansion */
+/* ECN: Use to mark a J_CALLK which is actually an entry in a Thunk table */
+#define K_THUNK         0x10000000L /* C++ virtual function call        */
 
 #define k_argwords_(n) ((n)&K_ARGWORDMASK)
 #define k_resultregs_(n) (((n)>>12)&15)
@@ -156,14 +157,8 @@
 # else  /* TARGET_FP_ARGS in integer registers only                     */
 #define k_argisfp_(n,i) 0
 #define k_argregs_(n) (k_argwords_(n) < NARGREGS ? k_argwords_(n) : NARGREGS)
-#  ifdef TARGET_IS_XAP_OR_NEC
-#define k_argfpmask_(n) (((n)>>16)&255)         /* jopprint.c only!     */
-#define k_argdesc_(aw, fm, ni, nf, nres, f) \
-        ((aw) | (f) | (((unsigned32)(fm))<<16) | ((nres)<<12))
-#  else
 #define k_argdesc_(aw, fm, ni, nf, nres, f) \
         ((aw) | (f) | ((nres)<<12))
-#  endif
 # endif
 #endif
 
@@ -223,24 +218,16 @@
 /* Note that J_FNCON does not need considering as only this is only used    */
 /* in the interface to xxxgen.c from flowgraf.c (q.v.)                      */
 #ifdef RANGECHECK_SUPPORTED
-#  define pseudo_reads_r1(a) \
-  (((a) & J_TABLE_BITS)==J_CMPK || \
-   ((a) & J_TABLE_BITS)==J_CHKLK || \
-   ((a) & J_TABLE_BITS)==J_CHKUK || \
-   ((a) & J_TABLE_BITS)==J_CHKNEK)
-#  define j_is_check(a) \
-    ((J_CHKLK<=((a) & J_TABLE_BITS) && ((a) & J_TABLE_BITS)<=J_CHKUR) || \
-     (J_CHKNEFK<=((a) & J_TABLE_BITS) && ((a) & J_TABLE_BITS)<=J_CHKNER))
+#  define pseudo_reads_r1(a) (((a) & ~Q_MASK) == J_CMPK ||\
+                              (a)==J_CHKLK || (a)==J_CHKUK || (a)==J_CHKNEK)
+#  define j_is_check(op) \
+    ((J_CHKLK<=(op) && (op)<=J_CHKUR) || (J_CHKNEFK<=(op) && (op)<=J_CHKNER))
 #else
-#  define pseudo_reads_r1(a) (((a) & J_TABLE_BITS) == J_CMPK)
+#  define pseudo_reads_r1(a) (((a) & ~Q_MASK) == J_CMPK)
 #  define j_is_check(op) 0
 #endif
-#define pseudo_reads_r2(a) \
-  (((a) & J_TABLE_BITS)==J_MOVK || \
-   ((a) & J_TABLE_BITS)==J_ADCON || \
-   ((a) & J_TABLE_BITS)==J_ADCONV || \
-   ((a) & J_TABLE_BITS)==J_ADCONF || \
-   ((a) & J_TABLE_BITS)==J_ADCOND)
+#define pseudo_reads_r2(a) ((a)==J_MOVK || (a)==J_ADCON || (a)==J_ADCONV || \
+                            (a)==J_ADCONF || (a)==J_ADCOND)
 
 /* The following give machine types of store reference in LD/STxxx.     */
 #define    MEM_B 0L
@@ -291,7 +278,6 @@
  * with associated entries in the array.
  * NB: conditional compilation within this table might cause things to
  *     get out of step - so beware.
- ** let's use an 'enum' type soon.
  */
 #  if defined ENABLE_CG || defined ENABLE_REGS || defined ENABLE_CSE
 #     define with_bits(n, b) {n, b},
@@ -357,7 +343,7 @@
            with_bits("LDRWR", _jm(MEM_W)+_J_READ_R3+_J_READ_R2+_J_SET_R1)
 #define    J_LDRWVK     14L
            with_bits("LDRWVK", _jm(MEM_W)+_J_STACKREF+_J_IVD+_J_SET_R1)
-#define    J_LDRWV      15L             /* only if WRDREG               */
+#define    J_LDRWV      15L             /* unused Apr 92                */
            with_bits("LDRWV", _jm(MEM_W)+_J_SET_R1+_J_STACKREF+_J_GAP2)
 
 #define    J_LDRLK      16L
@@ -450,26 +436,25 @@
 #define    J_MOVR       55L
            with_bits("MOVR", _J_READ_R3+_J_SET_R1+_J_REGMOVE+_J_GAP2)
 
-#define    J_LDRBV1     56L     /* see LDRFV1 */
-           with_bits("LDRBV1", _jm(MEM_B)+_J_SET_R1+_J_STACKREF+_J_GAP2)
-#define    J_PUSHB      57L     /* don't use (Jan 95) */
-           with_bits("PUSHB", _J_READ_R1+_J_GAP2)
-#define    J_MOVBK      58L     /* don't use (Jan 95) */
-           with_bits("MOVBK", _J_SET_R1)
-#define    J_MOVBR      59L     /* don't use (Jan 95) */
-           with_bits("MOVBR", _J_READ_R3+_J_SET_R1+_J_REGMOVE+_J_GAP2)
-
-#define    J_LDRWV1     60L     /* see LDRFV1 */
-           with_bits("LDRWV1", _jm(MEM_W)+_J_SET_R1+_J_STACKREF+_J_GAP2)
-#define    J_PUSHW      61L     /* don't use (Jan 95) */
-           with_bits("PUSHW", _J_READ_R1+_J_GAP2)
-#define    J_MOVWK      62L     /* don't use (Jan 95) */
-           with_bits("MOVWK", _J_SET_R1)
-#define    J_MOVWR      63L     /* don't use (Jan 95) */
-           with_bits("MOVWR", _J_READ_R3+_J_SET_R1+_J_REGMOVE+_J_GAP2)
+#define    J_CMPK       56L       /* see pseudo_reads_r2() (loop opt) */
+           with_bits("CMPK", _J_READ_R2)
+#define    J_CMPR       57L
+           with_bits("CMPR", _J_READ_R3+_J_READ_R2+_J_GAP1)
+#define    J_CHKLK      58L
+           with_bits("CHKLK", _J_READ_R2)
+#define    J_CHKLR      59L
+           with_bits("CHKLR", _J_READ_R3+_J_READ_R2+_J_GAP1)
+#define    J_CHKUK      60L
+           with_bits("CHKUK", _J_READ_R2)
+#define    J_CHKUR      61L
+           with_bits("CHKUR", _J_READ_R3+_J_READ_R2+_J_GAP1)
+#define    J_STACK      62L
+           with_bits("STACK", _J_GAP1+_J_GAP2)
+#define    J_SETSPENV   63L
+           with_bits("SETSPENV", _J_GAP1+_J_GAP2)
 
 #define    J_LDRLV1     64L     /* must be J_LDRV1 + (J_LDRLK-K_LDRVK)   */
-           with_bits("LDRLV1", _jm(MEM_LL)+_J_SET_R1+_J_STACKREF+_J_GAP2)
+           with_bits("LDRLV1", _jm(MEM_I)+_J_SET_R1+_J_STACKREF+_J_GAP2)
 #define    J_PUSHL      65L
            with_bits("PUSHL", _J_READ_R1+_J_GAP2)
 #define    J_MOVLK      66L
@@ -613,11 +598,11 @@
 #define    J_NEGFR      131L
            with_bits("NEGFR", _J_FLOATING+_J_READ_R3+_J_SET_R1+_J_GAP2)
 #define    J_FLTFR      132L
-           with_bits("FLTFR", _J_FLOATING+_J_READ_R3+_J_SET_R1+_J_GAP2)
+           with_bits("FLTFR", _J_FLOATING+_J_READ_R3+_J_SET_R1)
 #define    J_FIXFR      133L
-           with_bits("FIXFR", _J_FLOATING+_J_READ_R3+_J_SET_R1+_J_GAP2)
+           with_bits("FIXFR", _J_FLOATING+_J_READ_R3+_J_SET_R1)
 #define    J_MOVDFR     134L
-           with_bits("MOVDFR", _J_FLOATING+_J_READ_R3+_J_SET_R1+_J_GAP2)
+           with_bits("MOVDFR", _J_FLOATING+_J_READ_R3+_J_SET_R1)
 #define    J_MOVIFR     135L
            with_bits("MOVIFR", _J_FLOATING+_J_READ_R3+_J_SET_R1)
 #define    J_ADCON      136L   /* see pseudo_reads_r2() (loop opt) */
@@ -709,12 +694,12 @@
 
 #define    J_ORG        173L
            with_bits("ORG", _J_GAP1+_J_GAP2)
-#define    J_INFOCOM    174L
-           with_bits("INFOCOM", 0)
+#define    J_SAVE       174L
+           with_bits("SAVE", _J_GAP1+_J_GAP2)
 #define    J_PUSHM      175L     /* for the back end, reg map   */
            with_bits("PUSHM", _J_GAP1+_J_GAP2)
-#define    J_POPMX      176L     /* ARM only: must move to arm/mcdpriv.h */
-           with_bits("POPMX", _J_GAP1+_J_GAP2)
+#define    J_spare176   176L
+           with_bits("x176x", _J_GAP1+_J_GAP2)
 #define    J_WORD       177L
            with_bits("WORD", _J_GAP1+_J_GAP2)
 #define    J_CONDEXEC   178L
@@ -739,55 +724,26 @@
 #define    J_BZ         187L     /* For 88000 back-end use only */
            with_bits("BZ", _J_READ_R2)
 
-#define    J_CMPK       188L       /* see pseudo_reads_r2() (loop opt) */
-           with_bits("CMPK", _J_READ_R2)
-#define    J_CMPR       189L
-           with_bits("CMPR", _J_READ_R3+_J_READ_R2+_J_GAP1)
-/* #ifdef EXTENSION_FRAC */
-#define    J_XMULK      190L
-           with_bits("XMULK", _J_READ_R2+_J_SET_R1)
-#define    J_XMULR      191L
-           with_bits("XMULR", _J_READ_R3+_J_READ_R2+_J_SET_R1)
-#define    J_XDIVK      192L
-           with_bits("XDIVK", _J_READ_R2+_J_SET_R1)
-#define    J_XDIVR      193L
-           with_bits("XDIVR", _J_READ_R3+_J_READ_R2+_J_SET_R1)
-/* #endif EXTENSION_FRAC */
-#define    J_CHKLK      194L
-           with_bits("CHKLK", _J_READ_R2)
-#define    J_CHKLR      195L
-           with_bits("CHKLR", _J_READ_R3+_J_READ_R2+_J_GAP1)
-#define    J_CHKUK      196L
-           with_bits("CHKUK", _J_READ_R2)
-#define    J_CHKUR      197L
-           with_bits("CHKUR", _J_READ_R3+_J_READ_R2+_J_GAP1)
-#define    J_STACK      198L
-           with_bits("STACK", _J_GAP1+_J_GAP2)
-#define    J_SETSPENV   199L
-           with_bits("SETSPENV", _J_GAP1+_J_GAP2)
-#define    J_MOVWIR     200L
-           with_bits("MOVWIR", _J_READ_R3+_J_SET_R1+_J_GAP2)
-#define    J_MOVI0WR    201L    /* in flux, move lo(int) to word        */
-           with_bits("MOVI0WR", _J_READ_R3+_J_SET_R1+_J_GAP2)
-#define    J_MOVI1WR    202L    /* in flux, move hi(int) to word        */
-           with_bits("MOVI1WR", _J_READ_R3+_J_SET_R1+_J_GAP2)
-#define    J_WSTRING    203L
-           with_bits("WSTRING", _J_SET_R1)
+/* ECN: Some jopcodes for creating Thumb vtables
+ *      J_WORD_ADCON    ->      DCD     extern
+ *      J_WORD_LABEL    ->      DCD     L<n>
+ *      J_THIS_ADJUST   ->      ADD     R1, R2, #K (but cannot be done using J_ADDK
+ *                                                  because we need to know it
+ *                                                  is a pointer adjustment so we
+ *                                                  can generate ARM or Thumb
+ *                                                  instructions as appropriate)
+ * ECN: It is too difficult to try and conditionalise this on THUMB_CPLUSPLUS
+ *      as peepgen includes this header to derive peeppat.c. May be generically
+ *      useful anyway (at least J_WORD_ADCON & J_WORD_LABEL).
+ */
+#define    J_WORD_ADCON         188L
+           with_bits("WORD.A", _J_GAP1+_J_GAP2)
+#define    J_WORD_LABEL         189L
+           with_bits("WORD.L", _J_GAP1+_J_GAP2)
+#define    J_THIS_ADJUST        190L
+           with_bits("ADJUST", _J_READ_R2+_J_SET_R1)
 
-#ifdef TARGET_IS_NEC
-/* just for the NEC peepholer */
-#define    J_ORIBK      204L
-           with_bits("ORIBK", _jm(MEM_B)+_J_READ_R2)
-#define    J_ANDIBK     205L
-           with_bits("ANDIBK", _jm(MEM_B)+_J_READ_R2)
-#define    J_XORIBK     206L
-           with_bits("XORIBK", _jm(MEM_B)+_J_READ_R2)
-#define    J_TSTIBK     207L
-           with_bits("TSTIBK", _jm(MEM_B)+_J_READ_R2)
-#define J_LAST_JOPCODE  207L
-#else
-#define J_LAST_JOPCODE  203L
-#endif
+#define J_LAST_JOPCODE          190L
 
 #ifdef DEFINE_JOPTABLE
    0 };
@@ -809,49 +765,37 @@
 typedef int32 J_OPCODE; /* really ENUMERATED_OPCODE but ensure 32 bits */
 
 /* n.b Q_UBIT is the same as J_UNSIGNED */
-#define Q_MASK           (~0x07ffffffL)
-#define Q_UBIT           0x08000000L   /* for test of signed/unsigned CMP   */
-#define Q_NEGATE(x) ((x)^0x10000000L)
-/* N.B. individual machine translators may rely on the cond values below -  */
-/* the routine/macro C_FROMQ() does this.                                   */
+#define Q_MASK     (~(int32)0x07ffffff)
+#define Q_UBIT     ((int32)0x08000000)   /* for test of signed/unsigned CMP   */
+#define Q_NEGATE(x) ((x)^Q_NOT)
+#define Q_issame(x,y) (((x)|Q_UBIT) == ((y)|Q_UBIT))
+/* The next macro may only be applied to Q_GE and Q_LT.                     */
+#define Q_tocmpz(x) ((x) ^ (Q_GE^Q_PL))  /* also (Q_LT^Q^MI)                */
 /* The following idea of conditions are machine independent - so any new    */
 /* code (e.g. Q_CC) should have a different number even if they have the    */
 /* same effect on your favorite machine - just as Q_HS and Q_GE differ even */
 /* though they have the same effect on the 370 (the comparison differs).    */
-#define Q_FLIP  (~0x1fffffffL)  /* Ensures Q_AL == 0 */
-#define Q_EQ    (0x00000000L^Q_FLIP)
-#define Q_NE    (0x10000000L^Q_FLIP)
-#define Q_HS    ((0x20000000L^Q_FLIP)|Q_UBIT)
-#define Q_LO    ((0x30000000L^Q_FLIP)|Q_UBIT)
-#define Q_PL    (0x40000000L^Q_FLIP)
-#define Q_MI    (0x50000000L^Q_FLIP)
-/* #define Q_VS    (0x60000000L^Q_FLIP) */
-/* #define Q_VC    (0x70000000L^Q_FLIP) */
-#ifdef NO_NOT_WORRY_ABOUT_64_BIT_HOSTS
-/* These versions are left in as documentation only */
-#define Q_HI    ((0x80000000L^Q_FLIP)|Q_UBIT)
-#define Q_LS    ((0x90000000L^Q_FLIP)|Q_UBIT)
-#define Q_GE    (0xa0000000L^Q_FLIP)
-#define Q_LT    (0xb0000000L^Q_FLIP)
-#define Q_GT    (0xc0000000L^Q_FLIP)
-#define Q_LE    (0xd0000000L^Q_FLIP)
-#define Q_AL    (0xe0000000L^Q_FLIP)
-#define Q_NOT   (0xf0000000L^Q_FLIP)
-#else
-#define Q_HI    (((~0x7fffffffL)^Q_FLIP)|Q_UBIT)
-#define Q_LS    (((~0x6fffffffL)^Q_FLIP)|Q_UBIT)
-#define Q_GE    ((~0x5fffffffL)^Q_FLIP)
-#define Q_LT    ((~0x4fffffffL)^Q_FLIP)
-#define Q_GT    ((~0x3fffffffL)^Q_FLIP)
-#define Q_LE    ((~0x2fffffffL)^Q_FLIP)
-#define Q_AL    ((~0x1fffffffL)^Q_FLIP)
-#define Q_NOT   ((~0x0fffffffL)^Q_FLIP)
-#endif
+#define Q_AL     ((int32)0x00000000)
+#define Q_NOT    ((int32)0x10000000)
+#define Q_GT     ((int32)0x20000000)
+#define Q_LE     ((int32)0x30000000)
+#define Q_GE     ((int32)0x40000000)
+#define Q_LT     ((int32)0x50000000)
+#define Q_HI     ((int32)0x60000000|Q_UBIT)
+#define Q_LS     ((int32)0x70000000|Q_UBIT)
+/* #define Q_VS     ((int32)0x80000000) */
+/* #define Q_VC     ((int32)0x90000000) */
+#define Q_PL     ((int32)0xa0000000)
+#define Q_MI     ((int32)0xb0000000)
+#define Q_HS     ((int32)0xc0000000|Q_UBIT)
+#define Q_LO     ((int32)0xd0000000|Q_UBIT)
+#define Q_EQ     ((int32)0xe0000000)
+#define Q_NE     ((int32)0xf0000000)
 /* The following are added by AM to check conversion to new style J_CMP */
 /* Q_UEQ and Q_UNE are unsigned equality tests.  May be useful one day? */
 #define Q_UEQ    (Q_EQ|Q_UBIT)
 #define Q_UNE    (Q_NE|Q_UBIT)
-#define Q_XXX    (0x60000000L^Q_FLIP)  /* flag CMP use for 3 way tests */
+#define Q_XXX    ((int32)0x80000000)  /* flag CMP use for 3 way tests */
 
 
 #ifndef JOPCODEDEF_ONLY
@@ -900,6 +844,7 @@ typedef int32 J_OPCODE; /* really ENUMERATED_OPCODE but ensure 32 bits */
 #define BLK2CALL          0x8000L   /* block contains 2 proc calls       */
 #define BLKSETJMP        0x10000L   /* block may call setjmp (groan).    */
 #define BLKSTACKI       0x100000L   /* blkstack is a number not a bindlist*/
+#define BLKREXPORTED2   0x200000L
 #define BLKCCEXPORTED   0x400000L
 #define BLKREXPORTED    0x800000L
 /* N.B. Q_MASK values above also used when BLK2EXIT is set (condition)   */
@@ -928,7 +873,8 @@ extern void print_jopcode_1(J_OPCODE op, VRegInt r1, VRegInt r2, VRegInt m);
 extern void jopprint_opname(J_OPCODE o);
 extern void print_xjopcode(J_OPCODE op, VRegInt r1, VRegInt r2, VRegInt m,
                     char *fmt, ...);
-void flowgraf_print(const char *mess);
+void flowgraf_printblock(BlockHead *p, bool deadbits);
+void flowgraf_print(const char *mess, bool deadbits);
 
 #endif
 

@@ -7,6 +7,12 @@
  */
 
 /*
+ * RCS $Revision: 1.14 $
+ * Checkin $Date: 1995/11/05 21:52:59 $
+ * Revising $Author: sdouglas $
+ */
+
+/*
  * This file is a program that is run in order to create a file called 
  * headers.c which is part of the source of the compiler.  It also creates
  * errors.h.  To do its work it needs prototype files miperrs.h, feerrs.h &
@@ -51,7 +57,6 @@
  * for a new machine, especially one with a different character set.
  */
 
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -61,12 +66,27 @@
 
 #define  SELF           "genhdrs"
 
+/*
+ * The following sets ArgvType for 64-bit pointers so that
+ * DEC Unix (OSF) cc can be used with the -xtaso-short compiler option
+ * to force pointers to be 32-bit.
+ */
+#if defined(__alpha) && defined(__osf__) 
+#pragma pointer_size (save) 
+#pragma pointer_size (long) 
+#endif
+typedef char *ArgvType; 
+#if defined(__alpha) && defined(__osf__) 
+#pragma pointer_size (restore) 
+#endif
+
 #define  MAXPATHS        40
 #define  MAXFILENAMESZ  256
 #define  MAXSTRINGS     1000       /* How many strings can be stored here */
 #define  MAXCHARS       100000     /* Total length of strings to be processed */
 
 static int number_msgs  = 0;
+static int emit_tagdirs = 0;    /* whether to emit -TAGS- and -NOT TAGS- messages*/
 static int squeeze_msgs = 0;
 static int safe_compress= 1;
 
@@ -99,8 +119,8 @@ static int charpoint = 0;
 #define STREND   0x8
 #define STRSTART 0x9
 
-static FILE *path_open(name, mode)
-char *name, *mode;
+
+static FILE *path_open(char *name, char *mode)
 {   FILE *f;
     int j;
 
@@ -113,8 +133,7 @@ char *name, *mode;
     return NULL;
 }
 
-static void outch(ch)
-int ch;
+static void outch(int ch)
 {   if (charpoint >= MAXCHARS)
     {   charpoint = 0;
         fprintf(stderr, "%s: Too many chars (%u permitted)\n", SELF, MAXCHARS);
@@ -124,8 +143,7 @@ int ch;
         chardata[charpoint++] = (ch);
 }
 
-static void copy_header(name)
-char *name;
+static void copy_header(char *name)
 {
     FILE *fh1;
     int ch, state = NORMAL;
@@ -141,6 +159,8 @@ char *name;
     {   strcpy(ansi_name, name+2);
         strcat(ansi_name, ".h");
     }
+    else if(name[0] == ':') /* Macintosh filenames can start with : */
+        strcpy(ansi_name, name+1);
     else
         strcpy(ansi_name, name);
 
@@ -238,8 +258,7 @@ char *name;
     fclose(fh1);
 }
 
-static void decompress_char(c)
-int c;
+static void decompress_char(int c)
 {
     int z = compression[c];
     if (c == z)
@@ -253,10 +272,7 @@ int c;
     }
 }
 
-static int compress_strings(emsg, digraph_counts, force_used)
-int emsg;
-int *digraph_counts;
-char *force_used;
+static int compress_strings(int emsg, int *digraph_counts, char *force_used)
 /*
  * value returned is greatest stack depth needed during decompression.
  * A nonzero arg => treat strings as error messages and try to preserve
@@ -399,11 +415,7 @@ char *force_used;
     return stackdepth_needed;
 }
 
-static int print_squashed_msg(s, l, fe, filecol)
-unsigned char *s;
-int l;
-FILE *fe;
-int filecol;
+static int print_squashed_msg(unsigned char *s, int l, FILE *fe, int filecol)
 {
     int c, i;
     putc('\"', fe);  filecol++;
@@ -423,7 +435,9 @@ int filecol;
             }
             if (
 #ifdef macintosh
-                isascii(c) &&
+                /* some Mac compilers admit that some high-bit set chars are printable */
+                /* and some others don't define isprint above 0x7f (which is non-ANSI) */
+                (c & ~0x7f) == 0 &&
 #endif
                 isprint(c)) putc(c, fe), filecol++;
 /*
@@ -444,8 +458,7 @@ int filecol;
 #define NUMBER      1
 #define LEAVE       2
 
-static void scan_msg_file(fq)
-FILE *fq;
+static void scan_msg_file(FILE *fq)
 {
 /*
  * This is only called if I am squeezing error strings.
@@ -539,8 +552,7 @@ FILE *fq;
     }
 }
 
-static void copy_msg_file(fe, fq, ft)
-FILE *fe, *fq, *ft;
+static void copy_msg_file(FILE *fe, FILE *fq, FILE *ft)
 {
     int prevch = -1, ch, state = NORMAL;
     int action = squeeze_msgs ? MAP : LEAVE;
@@ -554,10 +566,14 @@ FILE *fe, *fq, *ft;
         {   ch = getc(fq);
             switch (tolower(ch))
             {
-    case 'o':   action = squeeze_msgs ? MAP : LEAVE;
+    case 'o':   if (emit_tagdirs) fprintf(fe, "/*-TAGS-*/\n");
+                action = squeeze_msgs ? MAP : LEAVE;
                 break;
-    case 's':
-    case 'z':   action = LEAVE;
+    case 's':   if (emit_tagdirs) fprintf(fe, "/*-NOT TAGS-*/\n");
+                action = LEAVE;
+                break;
+    case 'z':   if (emit_tagdirs) fprintf(fe, "/*-TAGS-*/\n");
+                action = LEAVE;
                 break;
     default:    fprintf(stderr, "\n%%%c unrecognised\n", ch);
                 break;
@@ -650,11 +666,7 @@ FILE *fe, *fq, *ft;
     }
 }
 
-static int make_headers(headers, argc, argv, viafile)
-char *headers;
-int argc;
-char *argv[];
-char *viafile;
+static int make_headers(char *headers, int argc, ArgvType *argv, char *viafile)
 {   FILE *fh;
     int j, n_files = 0;
 
@@ -717,7 +729,7 @@ char *viafile;
             fprintf(fh, "#endif\n");
         }
         else
-        {   fprintf(fh, "static unsigned short int compression_info[256] = {");
+        {   fprintf(fh, "static const unsigned short int compression_info[256] = {");
             for (j=0; j<256; j++)
             {   if ((j & 0x7) == 0) fprintf(fh, "\n    ");
                 fprintf(fh, "0x%.4x", compression[j]);
@@ -725,7 +737,14 @@ char *viafile;
                 else fprintf(fh, ", ");
             }
 
-            fprintf(fh, "\nstatic header_files builtin_headers[] = {\n");
+
+            fprintf(fh, "typedef struct {\n");
+            fprintf(fh, "    const char *name;\n");
+            fprintf(fh, "    int content;\n");
+            fprintf(fh, "} header_files;\n");
+
+
+            fprintf(fh, "\nstatic const header_files builtin_headers[] = {\n");
 
             where = 0;
             for (j=0;  j < stringcount;  j++)
@@ -734,7 +753,7 @@ char *viafile;
             }
             fprintf(fh,"   {0, 0}};\n\n");
 
-            fprintf(fh, "static char string_data[] = {");
+            fprintf(fh, "static const unsigned char string_data[] = {");
             n = 0;
             for (j = 0;  j < stringcount;  j++)
             {   unsigned char *s = strings[j];
@@ -773,10 +792,7 @@ char *viafile;
     return nerrors != 0;
 }
 
-static int make_messages(messages, squeeze_msgs, text)
-char *messages;
-int squeeze_msgs;
-char *text;
+static int make_messages(char *messages, int squeeze_msgs, char *text)
 {   FILE *fe, *ft;
     int j, esk = 0;
 
@@ -905,27 +921,11 @@ char *text;
     return nerrors != 0;
 }
 
-int main(argc, argv)
-int argc;
-char *argv[];
+int main(int argc, ArgvType *argv)
 {
     int j, filecount = 0, rc;
     char *arg, *viafile, *headers = NULL, *messages = NULL, *text = NULL;
-#if defined __alpha && defined __sizeof_ptr && __sizeof_ptr == 4
-/*
- * The next few lines are a disgrace (!) but ACN has put them in as a
- * temporary expedient.  On the DEC Alpha the native version of crt0
- * passes down argv as an array of 8-byte pointers, but this compiler
- * (when sizeof(char *)==4) expects 4-byte pointers.  With the "-taso"
- * option the DEC system arranges that the top half of each pointer is
- * just zero, so I can afford to squeeze things together and then forget the
- * whole misery.  If compilation was with sizeof(char *)==8 no such
- * adjustment is needed.  Beware also sizeof(FILE) and the va_list
- * structure in standard headers.
- */
-  for (j=0; j<argc; j++) argv[j] = argv[2*j];
-  argv[j] = 0;
-#endif
+
     nerrors = npaths = filecount = 0;
     viafile = NULL;
 
@@ -940,6 +940,14 @@ char *argv[];
     case 'n':
     case 'N':   number_msgs = 1;
                 break;
+
+/*
+ * -d           Emit directives for the mktags program for syserr messages
+ */
+    case 'd':
+    case 'D':   emit_tagdirs = 1;
+                break;
+
 /*
  * -t           get text of messages mapped onto numeric codes
  */
@@ -1025,6 +1033,7 @@ char *argv[];
                     epaths[nepaths++] = arg;
                 }
                 break;
+
 /*
  * -v           Provide the list of files for scanning through an indirection.
  */

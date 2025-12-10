@@ -5,9 +5,9 @@
  */
 
 /*
- * RCS $Revision: 1.23 $ Codemist 73
- * Checkin $Date: 93/09/29 16:14:23 $
- * Revising $Author: lsmith $
+ * RCS $Revision: 1.47 $ Codemist 73
+ * Checkin $Date: 1995/09/13 19:33:23 $
+ * Revising $Author: amycroft $
  */
 
 /* AM, Sept 91: In this version of the code (67), I have arranged to    */
@@ -84,15 +84,11 @@
 #include "regsets.h"
 #include "store.h"
 #include "cg.h"
-#include "mcdep.h"    /* immed_cmp, usrdbgk(xxxx) */
+#include "mcdep.h"    /* immed_cmp, usrdbg(xxxx) */
 #include "flowgraf.h" /* top_block, bottom_block */
 #include "builtin.h"  /* sim */
 #include "aeops.h"    /* bitofstg_(), s_register - sigh */
 #include "sr.h"
-
-#ifdef REG_TO_BINDERS
-BindList *reg_to_binders[NMAGICREGS];
-#endif
 
 /* Only one (of size vregistername) of these is allocated, so array OK. */
 static unsigned char *reg_lsbusetab;
@@ -130,8 +126,10 @@ case J_STRBK: case J_STRBR: case J_STRBV: case J_STRBVK:
                                        return pos==1 ? 8 : ALLBITS;
 case J_STRWK: case J_STRWR: case J_STRWV: case J_STRWVK:
                                        return pos==1 ? 16 : ALLBITS;
+#ifdef TARGET_IS_MIPS    /* @@@ why has this been removed for ARM?      */
 /* STRV is used for storing CSE's.  Treat as J_MOVK.                    */
 case J_STRV:                           return pos==1 ? demand : ALLBITS;
+#endif
 case J_MOVR:                           return demand;
 case J_ADDK: case J_SUBK: case J_MULK: return demand;
 case J_ORRK: case J_EORK:              return demand;
@@ -193,11 +191,57 @@ static int32 n_real_spills, n_cse_spills,        /* these seem to be real.. */
              spill_cost, tot_cost, choose_count; /* the trace option.   */
 
 
-/* We could speed up the following routines by #if (NMAGICREGS<=32)?    */
 /* The following routines take pointers to RealRegSets as args even     */
 /* though conceptually RealRegSets should be passed by value.           */
 
-static bool member_RealRegSet(const RealRegSet *a, unsigned32 r)
+typedef union {
+    char **s;
+    VRegSetP vr;
+} RealRegSet_MapArg;
+
+typedef void RealRegSet_MapFn(RealRegister r, RealRegSet_MapArg arg);
+
+#if (NMAGICREGS <= 32)
+
+bool member_RealRegSet(RealRegSet const *a, unsigned32 r)
+{   return ((a->map)[0] & regbit(r)) != 0;
+}
+
+void augment_RealRegSet(RealRegSet *a, unsigned32 r)
+{   (a->map)[0] |= regbit(r);
+}
+
+unsigned32 delete_RealRegSet(RealRegSet *a, unsigned32 r)
+{   unsigned32 oldval = (a->map)[0] & regbit(r);
+    (a->map)[0] ^= oldval;
+    return oldval;
+}
+
+bool intersect_RealRegSet(RealRegSet *a, RealRegSet const *b, RealRegSet const *c)
+{   return ((a->map)[0] = (b->map)[0] & (c->map)[0]) != 0;
+}
+
+void union_RealRegSet(RealRegSet *a, RealRegSet const *b, RealRegSet const *c)
+{   (a->map)[0] = (b->map)[0] | (c->map)[0];
+}
+
+static void difference_RealRegSet(RealRegSet *a, const RealRegSet *b, const RealRegSet *c)
+{   (a->map)[0] = (b->map)[0] & ~(c->map)[0];
+}
+
+static void map_RealRegSet(RealRegSet const *a, RealRegSet_MapFn *f, RealRegSet_MapArg arg)
+{   unsigned32 m = ((a)->map)[0];
+    int j;
+    for (j = 0; m != 0; j++)
+        if (m & regbit(j))
+        {    f(j, arg);
+             m ^= regbit(j);
+        }
+}
+
+#else
+
+bool member_RealRegSet(RealRegSet const *a, unsigned32 r)
 {   return ((a->map)[r/32] & regbit(r % 32)) != 0;
 }
 
@@ -205,21 +249,21 @@ void augment_RealRegSet(RealRegSet *a, unsigned32 r)
 {   (a->map)[r/32] |= regbit(r % 32);
 }
 
-static int32 delete_RealRegSet(RealRegSet *a, unsigned32 r)
-{   int32 oldval = (a->map)[r/32] & regbit(r % 32);
+unsigned32 delete_RealRegSet(RealRegSet *a, unsigned32 r)
+{   unsigned32 oldval = (a->map)[r/32] & regbit(r % 32);
     (a->map)[r/32] ^= oldval;
     return oldval;
 }
 
-static bool intersect_RealRegSet(RealRegSet *a, const RealRegSet *b,
-                                                const RealRegSet *c)
-{   int32 i; bool res = 0;
+bool intersect_RealRegSet(RealRegSet *a, const RealRegSet *b,
+                                         const RealRegSet *c)
+{   int i; bool res = 0;
     for (i = 0; i < (NMAGICREGS+31)/32; i++)
         if (((a->map)[i] = (b->map)[i] & (c->map)[i]) != 0) res = 1;
     return res;
 }
 
-static void union_RealRegSet(RealRegSet *a, const RealRegSet *b, const RealRegSet *c)
+void union_RealRegSet(RealRegSet *a, const RealRegSet *b, const RealRegSet *c)
 {   int32 i;
     for (i = 0; i < (NMAGICREGS+31)/32; i++)
         (a->map)[i] = (b->map)[i] | (c->map)[i];
@@ -231,13 +275,30 @@ static void difference_RealRegSet(RealRegSet *a, const RealRegSet *b, const Real
         (a->map)[i] = (b->map)[i] & ~(c->map)[i];
 }
 
+static void map_RealRegSet(RealRegSet const *a, RealRegSet_MapFn *f, RealRegSet_MapArg arg)
+{   int32 i, j;
+    for (i = 0; i < (NMAGICREGS+31)/32; i++)
+    {   unsigned32 m = ((a)->map)[i];
+        int j;
+        for (j = 0; m != 0; j++)
+            if (m & regbit(j))
+            {    f(32*i + j, arg);
+                 m ^= regbit(j);
+            }
+    }
+}
+
+#endif
+
+static void print_RealRegSet_cb(RealRegister r, RealRegSet_MapArg arg) {
+    cc_msg("%s%ld", *(arg.s), (long)r);
+    *(arg.s) = " ";
+}
+
 static void print_RealRegSet(RealRegSet const *a) {
-    int32 i; char *s = "";
-    for (i = 0; i < NMAGICREGS; i++)
-        if (member_RealRegSet(a, i)) {
-            cc_msg("%s%ld", s, (long)i);
-            s = " ";
-        }
+    char *s = "";
+    RealRegSet_MapArg arg; arg.s = &s;
+    map_RealRegSet(a, print_RealRegSet_cb, arg);
 }
 
 #ifdef TARGET_SHARES_INTEGER_AND_FP_REGISTERS
@@ -279,12 +340,16 @@ static bool nonempty_RealRegSet(const RealRegSet *a, int32 rsort)
 }
 
 #else /* TARGET_SHARES_INTEGER_AND_FP_REGISTERS */
+#  if NMAGICREGS <= 32
+#    define nonempty_RealRegSet_x(a) (((a)->map)[0] != 0)
+#  else
 static bool nonempty_RealRegSet_x(const RealRegSet *a)
 {   int32 i; bool res = 0;
     for (i = 0; i < (NMAGICREGS+31)/32; i++)
         if ((a->map)[i] != 0) res = 1;
     return res;
 }
+#endif
 
 #define nonempty_RealRegSet(a,sort) nonempty_RealRegSet_x(a)
 
@@ -436,13 +501,18 @@ static void clash_reinit(int32 nregs)
 
 static void add_clash(VRegnum a, VRegnum b)
 {
-/* It is arguable that "if (a == b) return;" should be here instead of  */
-/* of at many of the callers!                                           */
+    if (a == b) return;
 #ifndef TARGET_SHARES_INTEGER_AND_FP_REGISTERS
     {   RegSort atype = vregtype_(vreg_(a));
         RegSort btype = vregtype_(vreg_(b));
-        /* don't bother to add clash for disjoint function int/flt regs */
-        if (isintregtype_(atype) != isintregtype_(btype)) return;
+#  ifdef ADDRESS_REG_STUFF
+        if (atype == ADDRREG) atype = INTREG;
+        if (btype == ADDRREG) btype = INTREG;
+#  endif
+        if (atype != btype)
+        {
+           if ((atype == INTREG) || (btype == INTREG)) return;
+        }
     }
 #endif
     if (a < b) { VRegnum t = a; a = b; b = t; }
@@ -502,26 +572,19 @@ static void removeclashes(VRegister *vreg)
     vreg->u.nclashes = 0;
 }
 
-int vregtypechar(VRegnum vr)
-{   int c = 'g';
+static void printvreg(VRegnum vr)
+{
+    int c = 'g';
     if (vr != GAP)
-    {   /* The next line is a cheating sort of test for 'phase1'.       */
-        RegSort type = reg_lsbusetab==DUFF_ADDR ? vregsort(vr) :
-                                                  vregtype_(vreg_(vr));
+    {   RegSort type = vregtype_(vreg_(vr));
         c = type == FLTREG ? 'f' :
             type == DBLREG ? 'd' :
-            type == INTREG ? 'r' :
-            type == WRDREG ? 'w' :      /* may be hidden (= INTREG)     */
 #ifdef ADDRESS_REG_STUFF
-            type == ADDRREG ? 'a' :     /* may be hidden (= INTREG)     */
+            type == ADDRREG ? 'a' :
 #endif
-            '?';
+            'r';
     }
-    return c;
-}
-
-static void printvreg(VRegnum vr)
-{   cc_msg(" %c%ld", vregtypechar(vr), (long)vr);
+    cc_msg(" %c%ld", c, (long)vr);
 }
 
 static void print_clashes(VRegister *vreg)
@@ -540,10 +603,16 @@ static void add_copy(VRegnum a, VRegnum b)
 #ifndef TARGET_SHARES_INTEGER_AND_FP_REGISTERS
     {   RegSort atype = vregtype_(vreg_(a));
         RegSort btype = vregtype_(vreg_(b));
-        /* AM believes that atype and btype will always be the same  */
-        /* with the possible exception of MOVDFR.  Hence the RETURN  */
-        /* below can never be executed.                              */
-        if (isintregtype_(atype) != isintregtype_(btype)) return;
+#ifdef ADDRESS_REG_STUFF
+        if (atype == ADDRREG) atype = INTREG;
+        if (btype == ADDRREG) btype = INTREG;
+#endif
+        if (atype != btype)
+        {  /* AM believes that atype and btype will always be the same  */
+           /* with the possible exception of MOVDFR.  Hence the RETURN  */
+           /* below can never be executed.                              */
+           if ((atype == INTREG) || (btype == INTREG)) return;
+        }
     }
 #endif
 
@@ -686,7 +755,7 @@ static VRegSetAllocRec listallocrec;
 
 /* Sept 91: define procs to hide vregset_xxx/reg_lsbusetab reps.        */
 static int reg_demand(VRegnum r)
-{   if ((unsigned32)r >= vregistername) syserr("reg %lx", (long)r);
+{   if ((unsigned32)r >= vregistername) syserr(syserr_regno, (long)r);
     return reg_lsbusetab[r];
 }
 static void live_print(char *s)
@@ -697,7 +766,7 @@ static void live_print(char *s)
     cc_msg("\n");
 }
 static void live_union_anon(VRegnum r)
-{   if ((unsigned32)r >= vregistername) syserr("reg %lx", (long)r);
+{   if ((unsigned32)r >= vregistername) syserr(syserr_regno, (long)r);
     reg_lsbusetab[r] = ALLBITS;
 }
 static VRegSetP live_union(VRegSetP s1, VRegSetP s2, VRegSetAllocRec *allocrec)
@@ -708,7 +777,7 @@ static bool live_member(VRegnum r, VRegSetP set)
 {   return vregset_member((int32)r, set);
 }
 static VRegSetP live_delete(VRegnum r, VRegSetP set, bool *oldp)
-{   if ((unsigned32)r >= vregistername) syserr("reg %lx", (long)r);
+{   if ((unsigned32)r >= vregistername) syserr(syserr_regno, (long)r);
     reg_lsbusetab[r] = 0;
     return vregset_delete((int32)r, set, oldp);
 }
@@ -723,10 +792,10 @@ static VRegSetP reference_register(VRegnum r, int demand, VRegSetP s)
 /* BEWARE: the result is compared with s to determine if s became live.  */
 /* Sep 91: Is this still true?                                           */
 {
-    if ((unsigned32)r >= (unsigned32)vregistername) /* includes 'GAP' */
-        syserr("reg %lx", (long)r);
+    if ((unsigned32)r >= vregistername) /* includes 'GAP' */
+        syserr(syserr_regno, (long)r);
     s = vregset_insert(r, s, NULL, &listallocrec);
-    if ((int)reg_lsbusetab[r] < demand) reg_lsbusetab[r] = demand;
+    if (reg_lsbusetab[r] < demand) reg_lsbusetab[r] = demand;
     return s;
 }
 
@@ -738,18 +807,30 @@ static void makebindersclash(VRegnum r, BindList *bl, VRegnum rx)
 {   BindList *ab = argument_bindlist;
     for ( ; ab!=NULL ; ab = ab->bindlistcdr ) {
         VRegnum r1 = bindxx_(ab->bindlistcar);
-        if (r1!=GAP && r1!=r && r1!=rx) add_clash(r1, r);
+        if (r1!=GAP && r1!=rx) add_clash(r1, r);
     }
 
     for ( ; bl!=NULL ; bl = bl->bindlistcdr ) {
         VRegnum r1 = bindxx_(bl->bindlistcar);
-        if (r1!=GAP && r1!=r && r1!=rx) add_clash(r1, r);
+        if (r1!=GAP && r1!=rx) add_clash(r1, r);
     }
 }
 
 static void setregister_cb(int32 r, VoidStar r1)
+{   /* the type of 'r1' is a lie for map-function vregset_map.          */
+    add_clash((VRegnum)r, (VRegnum)(IPtr)r1);
+}
+
+static VRegSetP set_register1(VRegnum r, VRegSetP s)
 {
-    add_clash((VRegnum)r, (VRegnum)r1);
+    vregset_map(s, setregister_cb, (VoidStar)(IPtr)r);
+#ifdef TARGET_SHARES_INTEGER_AND_FP_REGISTERS
+    if (is_physical_double_reg_(r))
+        vregset_map(s, setregister_cb, (VoidStar)(IPtr)other_halfreg(r));
+#endif
+    if (usrdbg(DBG_VAR))
+        makebindersclash(r, thisBlocksBindList, GAP);
+    return s;
 }
 
 static void corrupt_register(VRegnum r, VRegSetP s)
@@ -761,13 +842,7 @@ static void corrupt_register(VRegnum r, VRegSetP s)
 /* and set_register */
     if (vregset_member(r, s))
         syserr(syserr_corrupt_register, (long)r, s);  /* insert to check */
-    vregset_map(s, setregister_cb, (VoidStar)r);
-#ifdef TARGET_SHARES_INTEGER_AND_FP_REGISTERS
-    if (is_physical_double_reg_(r))
-        vregset_map(s, setregister_cb, (VoidStar)other_halfreg(r));
-#endif
-    if (usrdbgk(DBG_VAR))
-        makebindersclash(r, thisBlocksBindList, GAP);
+    set_register1(r, s);
 }
 
 static void corrupt_physical_register(VRegnum r, VRegSetP s)
@@ -796,14 +871,7 @@ static VRegSetP set_register(VRegnum r, VRegSetP s)
     if (is_physical_double_reg_(r))
         s = live_delete(other_halfreg(r), s, NULL);
 #endif
-    vregset_map(s, setregister_cb, (VoidStar)r);
-#ifdef TARGET_SHARES_INTEGER_AND_FP_REGISTERS
-    if (is_physical_double_reg_(r))
-        vregset_map(s, setregister_cb, (VoidStar)other_halfreg(r));
-#endif
-    if (usrdbgk(DBG_VAR))
-        makebindersclash(r, thisBlocksBindList, GAP);
-    return s;
+    return set_register1(r, s);
 }
 
 #ifndef TARGET_IS_NULL
@@ -829,7 +897,7 @@ static VRegSetP set_register_copy(VRegnum r, VRegSetP s, VRegnum rsource)
     sc.r = r; sc.rsource = rsource;
 /* r conflicts with all live registers EXCEPT rsource.                   */
     vregset_map(s, setregistercopy_cb, (VoidStar) &sc);
-    if (usrdbgk(DBG_VAR))
+    if (usrdbg(DBG_VAR))
         makebindersclash(r, thisBlocksBindList, rsource);
     if (debugging(DEBUG_REGS))
         cc_msg("Record copy %ld %ld\n", (long)r, (long)rsource);
@@ -838,9 +906,9 @@ static VRegSetP set_register_copy(VRegnum r, VRegSetP s, VRegnum rsource)
 }
 
 static void setregisterslave_cb(int32 r, VoidStar r1)
-{
-    if (!reg_overlord((VRegnum)r1, (VRegnum)r))
-        add_clash((VRegnum)r, (VRegnum)r1);
+{   /* the type of 'r1' is a lie for map-function vregset_map.          */
+    if (!reg_overlord((VRegnum)(IPtr)r1, (VRegnum)r))
+        add_clash((VRegnum)r, (VRegnum)(IPtr)r1);
 }
 
 static VRegSetP set_register_slave(VRegnum r, VRegSetP s, VRegnum rmaster)
@@ -851,14 +919,13 @@ static VRegSetP set_register_slave(VRegnum r, VRegSetP s, VRegnum rmaster)
 {
     s = live_delete(r, s, NULL);
 /* r conflicts with all live registers EXCEPT its masters.               */
-    vregset_map(s, setregisterslave_cb, (VoidStar) r);
+    vregset_map(s, setregisterslave_cb, (VoidStar)(IPtr)r);
 
-    if (usrdbgk(DBG_VAR)) {
+    if (usrdbg(DBG_VAR)) {
         BindList *bl = thisBlocksBindList;
         for ( ; bl!=NULL ; bl = bl->bindlistcdr ) {
             VRegnum r1 = bindxx_(bl->bindlistcar);
-            if (r1 != GAP && r1 != r && !reg_overlord(r, r1))
-                add_clash(r1, r);
+            if (r1 != GAP && !reg_overlord(r, r1)) add_clash(r1, r);
         }
     }
 
@@ -874,13 +941,17 @@ static VRegSetP set_register_slave(VRegnum r, VRegSetP s, VRegnum rmaster)
 /* reference to VRegSets, or vregset_xxx ops.                           */
 static VRegSetP reference_argreg(VRegnum r, int32 *exact, VRegSetP s1)
 {   s1 = reference_register(r, ALLBITS, s1);
-    if (exact && usrdbgk(DBG_VAR))
-       makebindersclash(r, thisBlocksBindList, GAP);
+    if (exact) {
+        if (usrdbg(DBG_VAR))
+            makebindersclash(r, thisBlocksBindList, GAP);
+        augment_RealRegSet(&regmaskvec, r);
+    }
     return s1;
 }
 
 static VRegSetP instruction_ref_info(VRegSetP s1,
-    int32 op, VRegInt r1, VRegInt r2, VRegInt m, int32 *exact, int demand)
+    int32 op, VRegInt r1, VRegInt r2, VRegInt m, int32 *exact, int demand,
+    int32 wholeop)
 /* 'exact' is non-0 for the final pass when exact dataflow info is required */
 /* It is convenient to arrange it to be a pointer to where J_DEAD_Rx is put */
 /* Note that 'op' here has been masked with J_TABLE_BITS.                   */
@@ -1006,7 +1077,7 @@ case J_CALLR:
  * the registers otherwise used as scratch workspace).
  */
         if (r2.i & K_SPECIAL_ARG)
-            s1 = reference_argreg( TARGET_SPECIAL_ARG_REG, exact, s1);
+            s1 = reference_argreg(TARGET_SPECIAL_ARG_REG, exact, s1);
 #endif
         break;
     case J_COUNT:       /* for the profile option */
@@ -1017,13 +1088,6 @@ case J_CALLR:
 #endif
             corrupt_physical_register(R_IP, s1);
         }
-        break;
-    case J_ADCON:
-#ifdef TARGET_IS_RISC_OS
-        if (exact && arthur_module) {
-            corrupt_physical_register(R_IP, s1);
-        }
-#endif
         break;
     case J_ENTER:
 #ifndef TARGET_FP_ARGS_IN_FP_REGS
@@ -1051,8 +1115,21 @@ case J_CALLR:
             s1 = reference_register(r2.r, reg_bitsrefd(op,m.i,demand,2), s1);
             }
     if (reads_r3(op) && op != J_CALLR)     /* see above */
-            {   if (exact && !live_member(m.r, s1)) *exact |= J_DEAD_R3;
-            s1 = reference_register(m.r, reg_bitsrefd(op,m.i,demand,3), s1);
+            {   int bitsrefd = reg_bitsrefd(op, m.i, demand, 3);
+#ifdef J_SHIFTPOS
+                if (wholeop & J_SHIFTMASK) {
+                    int32 shift = (wholeop >> J_SHIFTPOS) & SHIFT_MASK;
+                    if (wholeop & (SHIFT_RIGHT << J_SHIFTPOS)) {
+                        bitsrefd += shift;
+                        if (bitsrefd > ALLBITS) bitsrefd = ALLBITS;
+                    } else if (wholeop & J_SHIFTMASK) {
+                        bitsrefd -= shift;
+                        if (bitsrefd < 0) bitsrefd = 0;
+                    }
+                }
+#endif
+                if (exact && !live_member(m.r, s1)) *exact |= J_DEAD_R3;
+            s1 = reference_register(m.r, bitsrefd, s1);
             }
     if (reads_r1(op) ||
         (pseudo_reads_r1(op) && r1.r!=GAP))    /* CMPK loopopt */
@@ -1083,7 +1160,7 @@ static VRegSetP extra_regs(VRegSetP s, LabelNumber *q)
 /* blocks.                                                               */
 {   /* local to successor_regs() */
     if (q == RetIntLab)
-        return exitregset(V_Presultreg(INTREG), s);     /* WRDREG? */
+        return exitregset(V_Presultreg(INTREG), s);
     else if (q == RetDbleLab)
         return exitregset(V_Presultreg(DBLREG), s);
     else if (q == RetFloatLab)
@@ -1100,7 +1177,7 @@ static VRegSetP successor_regs(BlockHead *p)
 /* This is done by merging the blkuse_() information from all succesor   */
 /* blocks.                                                               */
     VRegSetP s1 = NULL;
-    memclr((void *)reg_lsbusetab, (size_t)vregistername);
+    memclr(reg_lsbusetab, (size_t)vregistername);
     if (blkflags_(p) & BLKSWITCH)
     {   LabelNumber **v = blktable_(p);
         int32 i, n = blktabsize_(p);
@@ -1119,15 +1196,16 @@ static VRegSetP live_deleteresults(VRegInt r2, VRegSetP s1, bool *oldp) {
     bool old = NO;
     for (; --n >= 0;) {
         bool old2;
-        s1 = live_delete(R_A1+n, s1, &old2);
-        old |= old2;
+        s1 = live_delete(R_A1result+n, s1, &old2);
+        old = old | old2;
     }
     *oldp = old;
     return s1;
 }
 
 static VRegSetP add_instruction_info(
-        VRegSetP s1, int32 op, VRegInt r1, VRegInt r2, VRegInt m, bool removed)
+        VRegSetP s1, int32 op, VRegInt r1, VRegInt r2, VRegInt m, bool removed,
+        int32 wholeop)
 /* Note that 'op' here has been masked with J_TABLE_BITS.               */
 {
     bool old, old2;
@@ -1151,7 +1229,7 @@ static VRegSetP add_instruction_info(
 #else
             if (s1 = live_delete(r1.r, s1, &old), old) /*nothing*/;
 #endif
-            else if (usrdbgk(DBG_VAR+DBG_LINE)) /*nothing*/;
+            else if (usrdbg(DBG_VAR+DBG_LINE)) /*nothing*/;
                  /* leave unused code alone if debugging */
             else if (op == J_CALLK)
                /* I suppose this should really be just calls with K_PURE */
@@ -1185,8 +1263,8 @@ static VRegSetP add_instruction_info(
                 /* this else case is really J_STRV/STRDV/STRFV */
                 else if (vregset_member(m1, globalregvarset) ||
                          (s1 = live_delete(m1, s1, &old), old)) /*NULL*/;
-                else if ((bindstg_(m.b) & b_addrof)==0 &&
-                         !usrdbgk(DBG_VAR+DBG_LINE))
+                else if ((bindstg_(m.b) & (b_addrof|b_spilt)) == 0 &&
+                         !usrdbg(DBG_VAR+DBG_LINE))
                 {
                     if (debugging(DEBUG_REGS))
                         print_xjopcode(op, r1, r2, m,
@@ -1195,7 +1273,7 @@ static VRegSetP add_instruction_info(
                 }
             }
         }
-        return instruction_ref_info(s1, op, r1, r2, m, 0, ALLBITS);
+        return instruction_ref_info(s1, op, r1, r2, m, 0, ALLBITS, wholeop);
 }
 
 static bool update_block_use_info(BlockHead *p)
@@ -1207,9 +1285,9 @@ static bool update_block_use_info(BlockHead *p)
     int32 w;
 /* Now scan this block backwards to see what is needed at its head.      */
     for (w=blklength_(p)-1; w>=0; w--)
-    {   int32 op = q[w].op & J_TABLE_BITS;
+    {   int32 op = q[w].op;
         VRegInt r1=q[w].r1, r2=q[w].r2, m=q[w].m;
-        s1 = add_instruction_info(s1, op, r1, r2, m, 0);
+        s1 = add_instruction_info(s1, op & J_TABLE_BITS, r1, r2, m, 0, op);
     }
     {   VRegSetP s2 = blkuse_(p);
         bool same = vregset_equal(s1, s2);
@@ -1229,7 +1307,8 @@ static bool update_block_use_info(BlockHead *p)
             for (i = 0, s2 = NULL; i < vregistername; i++)
                 if (reg_lsbusetab[i])
                     s2 = vregset_insert(i, s2, NULL, &listallocrec);
-            if (!vregset_equal(s1, s2)) syserr("liveness odd");
+            if (!vregset_equal(s1, s2))
+                syserr(syserr_liveness);
             vregset_discard(s2);
         }
         return !same;
@@ -1238,17 +1317,9 @@ static bool update_block_use_info(BlockHead *p)
 
 static void increment_refcount(VRegnum n, BlockHead *p)
 {
-    if (n != GAP) vreg_(n)->refcount += (8L << blknest_(p));
+    if (n != GAP) vreg_(n)->refcount += (8L << 
+        (config & CONFIG_OPTIMISE_SPACE ? 0 : blknest_(p)));
 }
-
-#if defined(TARGET_IS_ARM) && defined(TARGET_HAS_BLOCKMOVE)
-
-/* work registers used in expanding J_MOVC (short & long cases) */
-#define R_ENDFLAG (NMAGICREGS+1)        /* just a terminator    */
-static int32 const movc_regs1[] = { R_IP, R_A1+3, R_ENDFLAG };
-static int32 const movc_regs2[] = { R_IP, R_A1+3, R_A1+2, R_A1+1, R_ENDFLAG };
-
-#endif
 
 static bool liveresult(VRegnum r2, VRegSetP s1) {
     int32 n = k_resultregs_(r2);
@@ -1259,8 +1330,12 @@ static bool liveresult(VRegnum r2, VRegSetP s1) {
 
 static VRegSetP set_result_registers(VRegnum r2, VRegSetP s1) {
     int32 n = k_resultregs_(r2);
-    for (; --n >= 0;) s1 = set_register(R_A1+n, s1);
+    for (; --n >= 0;) s1 = set_register(R_A1result+n, s1);
     return s1;
+}
+
+static void crc_f1(RealRegister r, RealRegSet_MapArg a)
+{   corrupt_physical_register(r, a.vr);
 }
 
 static void collect_register_clashes(BlockHead *p)
@@ -1272,9 +1347,13 @@ static void collect_register_clashes(BlockHead *p)
     VRegSetP s1 = successor_regs(p);
     Icode *q = blkcode_(p);
     int32 w;
+#ifdef TARGET_IS_ARM_OR_THUMB
+    RealRegSet workregs_clashing_with_inputs,
+               workregs_clashing_with_outputs;
+#endif
     thisBlocksBindList = blkstack_(p);
 
-    if (usrdbgk(DBG_VAR)) {
+    if (usrdbg(DBG_VAR)) {
 /* if we are generating debug data, cause all binders with extent that   */
 /* includes this block to clash with all others.                         */
         BindList *bl = blkstack_(p);
@@ -1288,10 +1367,19 @@ static void collect_register_clashes(BlockHead *p)
     for (w=blklength_(p)-1; w>=0; w--)
     {   int32 op = q[w].op & J_TABLE_BITS;
         VRegnum r1=q[w].r1.r, r2=q[w].r2.r;
-        int32 m=q[w].m.i;
+        IPtr m=q[w].m.i;
         int demand = ALLBITS;
+    if (debugging(DEBUG_REGS)) { print_jopcode(op, q[w].r1, q[w].r2, q[w].m);live_print("scan regs"); }
 /* Obviously, if TARGET_SHARES_INTEGER_AND_FP_REGISTERS then J_MOVDIR   */
 /* could make some optimisations...                                     */
+#ifdef TARGET_IS_ARM_OR_THUMB
+        FixedRegisterUse(&q[w], &workregs_clashing_with_inputs,
+                                &workregs_clashing_with_outputs);
+        if (nonempty_RealRegSet(&workregs_clashing_with_outputs, INTREG)) {
+            RealRegSet_MapArg a; a.vr = s1;
+            map_RealRegSet(&workregs_clashing_with_outputs, crc_f1, a);
+        }
+#endif
         if (loads_r2(op))       /* assumes loads_r1 too!                */
         {   /* assumes 'loads_r2' ops demand ALLREGS...                 */
             if (!live_member(r2, s1) && !live_member(r1, s1)) goto killcode;
@@ -1305,16 +1393,12 @@ static void collect_register_clashes(BlockHead *p)
 /* amazing things happen here because MOV r1, r2 does not want to cause  */
 /* r1 and r2 to clash - indeed the very opposite is true.                */
                 if (op==J_MOVR || op==J_MOVFR || op==J_MOVDR
-#ifdef TARGET_IS_XAP
-                   /* >>> implicit || op==J_MOVR+J_WBIT */
-#endif
 #ifdef TARGET_IS_ARM
                    || op==J_MOVFDR
 #endif
                    )
                     s1 = set_register_copy(r1, s1, (VRegnum)m);
-                else if ((op==J_LDRV || op==J_LDRFV || op==J_LDRDV ||
-                          op==J_LDRLV || op==J_LDRWV || op==J_LDRBV) &&
+                else if ((op==J_LDRV || op==J_LDRFV || op==J_LDRDV) &&
                          bindxx_((Binder *)m) != GAP)
                     s1 = set_register_copy(r1, s1, bindxx_((Binder *)m));
                 else if ((op==J_ADCON || op==J_ADCONV || op == J_MOVK)
@@ -1323,9 +1407,9 @@ static void collect_register_clashes(BlockHead *p)
 #ifdef REGALLOC_CHAR_OPTIMISER
                 else if (r1 < vregistername &&
                          ( (op == J_EXTEND &&
-                              extend_bitsused(m) >= (int)reg_lsbusetab[r1]) ||
+                              extend_bitsused(m) >= reg_lsbusetab[r1]) ||
                            (op == J_ANDK &&
-                              spaceofmask(m) >= (int)reg_lsbusetab[r1] &&
+                              spaceofmask(m) >= reg_lsbusetab[r1] &&
                               (m & 0xffffffff) == (1L<<spaceofmask(m))-1)))
                 {   q[w].op = op = J_MOVR;
                     m = (int32)(q[w].m.r = r2);
@@ -1344,6 +1428,23 @@ if (debugging(DEBUG_REGS)) live_print("EXTEND/ANDK => MOVR");
                           !(bindstg_((Binder *)m) & b_pseudonym))
                         cc_warn(regalloc_warn_use_before_set, (Binder *)m);
 #ifdef REGALLOC_CHAR_OPTIMISER
+#ifdef TARGET_IS_MIPS
+                    if ((mips_opt & 1) && r1 < vregistername && op == J_ANDK)
+                    {   int32 junklsb = (reg_lsbusetab[r1] >= 32 ? 0 :
+                                           (int32)1<<reg_lsbusetab[r1]);
+                        int32 junkmask = (-junklsb) & 0xffffffff;
+                        int32 mnew = m & ~junkmask;   /* make mask smaller */
+                        if (mnew != 0)
+                        {   /* keep the SHL,SHR implementation of ANDK:    */
+                            int32 k = power_of_two(-(m | junkmask));
+                            if (0 <= k && k <= 8) mnew = m | junkmask;
+                        }
+                        if (mnew != m)
+                        { q[w].m.i = m = mnew;
+if (debugging(DEBUG_REGS)) live_print("Improve ANDK mask");
+                        }
+                    }
+#endif
                     if (r1 < vregistername && reg_lsbusetab[r1] <= 8)
                         switch (op)
                         {   case J_LDRBK: case J_LDRBR:
@@ -1359,20 +1460,13 @@ if (debugging(DEBUG_REGS)) live_print("plain LDRBx");
 if (debugging(DEBUG_REGS)) live_print("plain LDRWx");
                         }
 #endif
-#ifdef TARGET_IS_NEC
-                    if (op == J_MULK &&
-                             r1 < vregistername && reg_lsbusetab[r1] <= 16)
-                    {   q[w].op |= (J_SIGNED|J_UNSIGNED);
-if (debugging(DEBUG_REGS)) live_print("MULK+JUNK16");
-                    }
-#endif
                     if (iscalln_(op, r2))
                         s1 = set_result_registers(r2, s1);
                     else
                         s1 = set_register(r1, s1);
                 }
 
-            } else if (usrdbgk(DBG_VAR))
+            } else if (usrdbg(DBG_VAR))
                 s1 = set_register(r1, s1);
 
             else if (iscalln_(op, r2) && liveresult(r2, s1))
@@ -1391,7 +1485,7 @@ if (debugging(DEBUG_REGS)) live_print("MULK+JUNK16");
                         {   if (debugging(DEBUG_REGS)) cc_msg("void a divide\n");
                             r2 = q[w].r2.i = k_argdesc_(1, 0, 1,0,0,0);
                                              /* Reduce to one arg  */
-                            m = q[w].m.i = (int32)arg1_(sim.divtestfn);
+                            m = q[w].m.i = (IPtr)arg1_(sim.divtestfn);
                         }
                         else
                         {   if (debugging(DEBUG_REGS))
@@ -1423,15 +1517,15 @@ if (debugging(DEBUG_REGS)) live_print("MULK+JUNK16");
 /* usage information is accumulated for the virtual register that I will */
 /* use if I manage to map this stack location onto a register.           */
             if (m1 != GAP)
-            {   if (loads_r1(op))
+            {   if (loads_r1(op)) {
                     s1 = reference_register(m1, demand, s1);
-                else
+                } else
                 {   /* this else case is really J_STRV/STRDV/STRFV */
-                    if (live_member(m1, s1) || usrdbgk(DBG_VAR+DBG_LINE))
+                    if (live_member(m1, s1) || usrdbg(DBG_VAR+DBG_LINE))
                     {   demand = reg_demand(m1);
                         s1 = set_register_copy(m1, s1, r1);
                     }
-                    else if (bindstg_((Binder *)m) & b_addrof)
+                    else if (bindstg_((Binder *)m) & (b_addrof|b_spilt))
                         syserr(syserr_dataflow);
                     else
                     {   /* spurious store -- var not live.  Kill to NOOP. */
@@ -1461,6 +1555,9 @@ if (debugging(DEBUG_REGS)) live_print("MULK+JUNK16");
 
         if (uses_r1(op)) increment_refcount(r1, p);
         if (uses_r2(op)) increment_refcount(r2, p);
+#ifdef TARGET_IS_MIPS
+        if (pseudo_reads_r2(op)) increment_refcount(r2, p);
+#endif
         if (uses_stack(op))
         {   VRegnum n = bindxx_((Binder *)m);
             increment_refcount(n, p);
@@ -1480,33 +1577,20 @@ if (debugging(DEBUG_REGS)) live_print("MULK+JUNK16");
         }
 
 /* let's rationalise the below someday.                                  */
-#ifdef TARGET_IS_ARM
-#  ifdef TARGET_IS_RISC_OS
-        if ((op == J_ADCON) && arthur_module)
-            add_clash(r1, R_IP);
-#  endif
-        if (op == J_MULR)
-            add_clash(r1, (VRegnum)m);
+#ifdef TARGET_IS_ARM_OR_THUMB
+        if (op == J_MULR) add_clash(r1, (VRegnum)m);
 #  ifdef TARGET_HAS_BLOCKMOVE
         if (op == J_MOVC || op == J_CLRC) {
-            if (m != 8) {
+#    ifndef TARGET_IS_THUMB
+            if (m > 8) {
+#    endif
                 corrupt_register(r1, s1);
                 if (op == J_MOVC) corrupt_register(r2, s1);
+#    ifndef TARGET_IS_THUMB
             }
+#    endif
         }
 #  endif
-#endif
-
-#ifdef TARGET_IS_XAP
-        /* avoid using R_AL for anything which is indexed directly      */
-        /* somewhat experimental.                                       */
-        switch (op & J_TABLE_BITS)
-        {
-case J_LDRBK: case J_LDRWK: case J_STRBK: case J_STRWK:
-case J_LDRK:  case J_LDRLK: case J_STRK:  case J_STRLK:
-case J_LDRFK: case J_LDRDK: case J_STRFK: case J_STRDK:
-            add_clash(r2, R_A1);
-        }
 #endif
 
 #ifdef TARGET_IS_370
@@ -1521,8 +1605,7 @@ case J_LDRFK: case J_LDRDK: case J_STRFK: case J_STRDK:
         if (uses_r3(op) && op!=J_MOVR) add_clash(m, R_SB);
         if (op==J_STRV)
         {   VRegnum r3 = bindxx_((Binder *)m);
-            if (r3 != GAP && r3 != R_SB)
-                add_clash(r3, R_SB);
+            if (r3 != GAP) add_clash(r3, R_SB);
         }
         if (op==J_MOVC && m>16)
         {   int32 i;
@@ -1556,13 +1639,13 @@ case J_LDRFK: case J_LDRDK: case J_STRFK: case J_STRDK:
    virtual registers not real ones - thus (and especially given that SUBR
    seems to be used but rarely) I might prefer a test just on
    jop_asymdiadr(op). */
-        if (jop_asymdiadr_(op) && r1 != r2) add_clash(r1, (VRegnum)m);
+        if (jop_asymdiadr_(op) && two_address_code(op) && r1 != r2) add_clash(r1, (VRegnum)m);
 #  endif
 #endif
 
         {   VRegInt vr1, vr2, vm;
             vr1.r = r1; vr2.r = r2; vm.i = m;
-            s1 = instruction_ref_info(s1, op, vr1, vr2, vm, &q[w].op, demand);
+            s1 = instruction_ref_info(s1, op, vr1, vr2, vm, &q[w].op, demand, q[w].op);
         }
 
 /* The following things that allow for workspace registers MUST be done  */
@@ -1592,6 +1675,38 @@ case J_MOVC: case J_CLRC:
         }
 #endif
 
+#ifdef TARGET_IS_MIPS
+        /* This code (for the 8-register model of MIPS16) ensures       */
+        /* that R_IP2+1 (mips regs $v1) can be corrupted by             */
+        /* instructions like AND/OR/MUL which need a temp for their     */
+        /* immediate operand.                                           */
+        if (mips_opt & 2) switch (op)                    /* old -zh6    */
+        {
+case J_SCCK: if (-0x8000 <= m && m <= 0x7fff) break;
+             goto corruption2;
+case J_ADDK: if (-0x8000 <= m && m <= 0x7fff) break;
+             goto corruption2;
+case J_SUBK: if (-0x8000 <= (-m) && (-m) <= 0x7fff) break;
+             goto corruption2;
+/* The next line corresponds to the various bit of code for CMP,        */
+/* i.e. CMP (eq, 0..ffff), ADD (eq, -8000..-1), SLTI/SLTIU (0000..7ffe) */
+case J_CMPK: if (0 <= m && m <= 0x7ffe) break;
+             goto corruption2;
+case J_STRBV: case J_STRBVK:
+case J_STRWV: case J_STRWVK:
+case J_MULK: case J_DIVK: case J_REMK:
+case J_ANDK: case J_ORRK: case J_EORK:
+case J_SHLR: case J_SHRR:
+corruption2:
+              corrupt_physical_register(R_IP2+1, s1);
+              break;
+case J_STRV: case J_STRVK:
+              /* needn't do STRV and STRVK if stack is small...         */
+              if (greatest_stackdepth+max_argsize > 0x7000) goto corruption2;
+              break;
+        }
+#endif
+
 #ifdef TARGET_IS_ALPHA
         switch (op)
         {
@@ -1604,13 +1719,15 @@ case J_MOVC: case J_CLRC:
         }
 #endif
 
-#ifdef TARGET_IS_ARM
+#ifdef TARGET_IS_ARM_OR_THUMB
+        if (nonempty_RealRegSet(&workregs_clashing_with_inputs, INTREG)) {
+            RealRegSet_MapArg a; a.vr = s1;
+            map_RealRegSet(&workregs_clashing_with_inputs, crc_f1, a);
+        }
+#if 0
         if ((pseudo_reads_r1(op) && !immed_cmp(m))    /* J_CMPK+friends */
             || op == J_MULK
             || (op == J_CASEBRANCH && !immed_cmp(m-2))
-#  ifdef TARGET_IS_RISC_OS
-            || (op == J_ADCON && arthur_module)
-#  endif
            )
             corrupt_physical_register(R_IP, s1);
 #  ifdef TARGET_HAS_BLOCKMOVE
@@ -1618,11 +1735,12 @@ case J_MOVC: case J_CLRC:
         /* The disgusting magic number here had better agree with arm/gen.c */
             int32 const *regs = m <= 24 ? &movc_regs1[0] : &movc_regs2[0];
             int32 r;
-            while ((r = *regs++) != R_ENDFLAG) {
+            while ((r = *regs++) != R_ENDFLAG)
                 corrupt_physical_register(r, s1);
-                add_clash(r1, r);
-                if (op != J_CLRC) add_clash(r2, r);
-            }
+                /* There were redundant calls to add_clash(r1,r) and (r2,r)
+                   here (redundant since r1 and r2 must be in s1, and
+                   corrupt_register(r) makes r clash with everything in s1).
+                */
         }
 #  endif
         if (uses_mem(op) && j_memsize(op) == MEM_W &&
@@ -1631,19 +1749,62 @@ case J_MOVC: case J_CLRC:
             add_clash(r1, R_IP);
         }
 #endif
+#endif
 #ifdef TARGET_LDRK_MAX
 /* If I have a large stack frame I reserve register ip for helping       */
 /* gain addressability to frame locations.                               */
 /* The 256 slop is to allow for routine linkage/savearea space.          */
         if (uses_stack(op) && op!=J_ADCONV)
         {   int32 n = vkformat(op) ? (int32)r2 : 0;
-            if (n < TARGET_LDRK_MIN
-                || greatest_stackdepth+max_argsize+n > TARGET_LDRK_MAX-256
-#  ifdef TARGET_LDRFK_MAX
-                || n < TARGET_LDRFK_MIN
-                || greatest_stackdepth+max_argsize+n > TARGET_LDRFK_MAX-256
-#  endif
-               )
+/* ECN changes - Improve for different size objects
+ *               Also use xxx_SP_LDRK_xxx & co if defined
+ */
+            int32 m = j_memsize(op);
+            int32 min, max;
+
+#ifdef TARGET_SP_LDRK_MAX
+            switch (m) {
+            default:    syserr("collect_register_clashes(switch)");
+            case MEM_B: min = TARGET_SP_LDRBK_MIN, max = TARGET_SP_LDRBK_MAX;
+                        break;
+            case MEM_W: min = TARGET_SP_LDRWK_MIN, max = TARGET_SP_LDRWK_MAX;
+                        break;
+            case MEM_I: min = TARGET_SP_LDRK_MIN, max = TARGET_SP_LDRK_MAX;
+                        break;
+            case MEM_F: min = TARGET_SP_LDRFK_MIN, max = TARGET_SP_LDRFK_MAX;
+                        break;
+            case MEM_D: min = TARGET_SP_LDRDK_MIN, max = TARGET_SP_LDRDK_MAX;
+                        break;
+            case MEM_LL: min = TARGET_SP_LDRLK_MIN, max = TARGET_SP_LDRLK_MAX;
+                        break;
+            }
+            if ((op & J_ALIGNMENT) == J_ALIGN1) {
+                if (TARGET_SP_LDRBK_MIN > min) min = TARGET_SP_LDRBK_MIN;
+                if (TARGET_SP_LDRBK_MAX < max) max = TARGET_SP_LDRBK_MAX;
+            }
+#else
+            switch (m) {
+            default:    syserr("collect_register_clashes(switch)");
+            case MEM_B: min = TARGET_LDRBK_MIN, max = TARGET_LDRBK_MAX;
+                        break;
+            case MEM_W: min = TARGET_LDRWK_MIN, max = TARGET_LDRWK_MAX;
+                        break;
+            case MEM_I: min = TARGET_LDRK_MIN, max = TARGET_LDRK_MAX;
+                        break;
+            case MEM_F: min = TARGET_LDRFK_MIN, max = TARGET_LDRFK_MAX;
+                        break;
+            case MEM_D: min = TARGET_LDRDK_MIN, max = TARGET_LDRDK_MAX;
+                        break;
+            case MEM_LL: min = TARGET_LDRLK_MIN, max = TARGET_LDRLK_MAX;
+                        break;
+            }
+            if ((op & J_ALIGNMENT) == J_ALIGN1) {
+                if (TARGET_LDRBK_MIN > min) min = TARGET_LDRBK_MIN;
+                if (TARGET_LDRBK_MAX < max) max = TARGET_LDRBK_MAX;
+            }
+#endif
+            max -= TARGET_MAX_FRAMESIZE;
+            if (n < min || greatest_stackdepth+max_argsize+n > max)
                     corrupt_physical_register(R_IP, s1);
         }
 #endif
@@ -1690,7 +1851,7 @@ static void update_deadflags(BlockHead *p)
     for (w=blklength_(p)-1; w>=0; w--)
     {   int32 fullop = q[w].op, op = fullop & J_TABLE_BITS;
         VRegnum r1=q[w].r1.r, r2=q[w].r2.r;
-        int32 m=q[w].m.i;
+        IPtr m=q[w].m.i;
 /* The following three lines take care of the fact that we really want   */
 /*               ^^^^^ i.e. to the vregset_delete() call?                */
 /* to execute this code half-way through add_instruction_info().         */
@@ -1727,7 +1888,7 @@ static void update_deadflags(BlockHead *p)
             if (debugging(DEBUG_LOOP))
                 cc_msg("%s", udf.icode->op & J_DEAD_R2 ? "undead\n": "\n");
         }
-        if ((fullop & J_DEAD_R3) && reads_r3(op)/* &&
+        if ((fullop & J_DEAD_R3) && reads_r3(op) /* &&
              op != J_CALLR*/)     /* see above */
         {   RealRegister rr = register_number((VRegnum)m);
             if (debugging(DEBUG_LOOP))
@@ -1757,7 +1918,7 @@ static void update_deadflags(BlockHead *p)
         }
         {   VRegInt vr1, vr2, vm;
             vr1.r = r1; vr2.r = r2; vm.i = m;
-            s = add_instruction_info(s, op, vr1, vr2, vm, removed);
+            s = add_instruction_info(s, op, vr1, vr2, vm, removed, fullop);
         }
     }
     vregset_discard(s);
@@ -1772,6 +1933,15 @@ static void MaybePrefer(VRegnum vr, void *vprefer)
     RealRegSet *prefer = (RealRegSet *)vprefer;
     RealRegister r1 = register_number(vr);
     if (isany_realreg_(r1)) augment_RealRegSet(prefer,r1);
+}
+
+static void MaybePrefer2(VRegnum vr, void *vprefer)
+{
+    RealRegister r1 = register_number(vr);
+    if (!isany_realreg_(r1)) {
+        VRegister *r = vreg_(vr);
+        relation_map(vregname_(r), copymatrix, MaybePrefer, vprefer);
+    }
 }
 
 static void GetPhysicalCopies(VRegnum vr, RealRegSet *copies) {
@@ -1840,7 +2010,7 @@ static bool choose_real_register(VRegister *r)
                           (!spillpanic ? &m_addrregs : &m_intregs) :
 #endif
 #ifndef TARGET_SHARES_INTEGER_AND_FP_REGISTERS
-                      !(rsort == INTREG || rsort == WRDREG) ? &m_fltregs :
+                      rsort != INTREG ? &m_fltregs :
 #endif
                       &m_intregs);
     clashkillbits(&m1, r);
@@ -1906,7 +2076,12 @@ static bool choose_real_register(VRegister *r)
                 cc_msg("No preferred allocation for %ld\n", vregname_(r));
             m2 = m1;
             vregset_map(r->clashes, avoid_cb, (VoidStar)&m2);
-            if (nonempty_RealRegSet(&m2, rsort))
+            memclr((VoidStar)&prefer, sizeof(RealRegSet));
+            relation_map(vregname_(r), copymatrix, MaybePrefer2,
+                                       (void *)&prefer);
+            if (intersect_RealRegSet(&prefer, &m2, &prefer))
+                m1 = prefer;
+            else if (nonempty_RealRegSet(&m2, rsort))
                 m1 = m2;
         }
     }
@@ -1915,10 +2090,15 @@ static bool choose_real_register(VRegister *r)
 /* AM (Dec 87) wonders how necessary this is in that ALLOCATION_ORDER    */
 /* can do this equally as well!                                          */
 
+/* Don't do this for MIPS (because of need to allocate $16,$17 on MIPS16 */
+/* before rest of the m_notpreserved regs).  The v2p() register mapper   */
+/* means that this is OK for vanilla MIPS too.                           */
+#ifndef TARGET_IS_MIPS
 /* /* The next line needs to ensure that the overlap is an even/odd      */
 /* pair if TARGET_SHARES_INTEGER_AND_FP_REGISTERS.                       */
     if (intersect_RealRegSet(&m2, &m1, &m_notpreserved))
         m1 = m2;
+#endif
 
 /* Convert representation from bit-position to register number.          */
     {   int32 i = 0;
@@ -1927,6 +2107,10 @@ static bool choose_real_register(VRegister *r)
 #ifdef ALLOCATION_ORDER
 /* a prespecified allocation ordering:                                   */
             static unsigned char o[] = ALLOCATION_ORDER;
+#ifdef TARGET_IS_MIPS
+            static unsigned char o2[] = ALLOCATION_ORDER2;
+            #define o (mips_opt & 1 ? o2 : o)
+#endif
             r1 = o[i];
 #else
 /* else choose in a not particularly inspired order.                     */
@@ -2059,9 +2243,10 @@ static int32 spill_binder(VRegister *rr, BindList *spill_order, VRegSetP *vr)
 
 /* exported... */
 
-static void addclashes_rcb(VRegnum n, void * arg)
-{   VRegister *v = vreg_(n);
-    VRegnum m = (VRegnum) arg;
+static void addclashes_rcb(VRegnum n, void *arg)
+{   /* the type of 'r1' is a lie for map-function vregset_map.          */
+    VRegister *v = vreg_(n);
+    VRegnum m = (VRegnum)(IPtr)arg;
     v->clash2 = vregset_insert(m, v->clash2, NULL, &listallocrec);
 }
 
@@ -2126,7 +2311,7 @@ void allocate_registers(BindList *spill_order)
             if (debugging(DEBUG_REGS))
                 cc_msg("Start a scan of register flow iteration\n");
             for (p=bottom_block; p!=NULL; p = blkup_(p))
-                changed |= update_block_use_info(p);
+                changed = changed | update_block_use_info(p);
         } while (changed);
     }
     if (debugging(DEBUG_REGS))
@@ -2224,8 +2409,7 @@ void allocate_registers(BindList *spill_order)
 
     nn = 0;
     if ((n_real_spills + n_cse_spills)> 1 &&        /* retrying may help */
-        (var_cc_private_flags & 6L) == 0)
-             /* neither compatible with original nor cleaning suppressed */
+        (var_cc_private_flags & 4L) == 0)     /* cleaning not suppressed */
     {
 /* Here, we do some cleaning up of the register colouring to trying to   */
 /* the things that have already been spilt. Sometimes we'll succeed.     */
@@ -2244,7 +2428,7 @@ void allocate_registers(BindList *spill_order)
             else
                 x = vregset_intersection(
                         vregset_copy(spillset, &listallocrec), rr->clash2);
-            vregset_map(x, addclashes_rcb, (VoidStar)(vregname_(rr)));
+            vregset_map(x, addclashes_rcb, (VoidStar)(IPtr)vregname_(rr));
         }
 
 /* It isn't clear which way this loop should go - or even whether it's   */
@@ -2268,6 +2452,8 @@ void allocate_registers(BindList *spill_order)
                    cc_msg("    unspill: $b, v%lu = r%lu, saving = %lu\n",
                        bb, vregname_(rr), rr->realreg, rr->refcount);
             }
+            else if (debugging(DEBUG_SPILL))
+                cc_msg("\n");
         }
         if (debugging(DEBUG_SPILL))
             cc_msg("%lu vregs unspilt by cleaning pass in %ucs\n",
@@ -2302,37 +2488,6 @@ void allocate_registers(BindList *spill_order)
             if (p->spillcount == 0)
                 bindxx_(p->binder) = 0;
     }
-#ifdef REG_TO_BINDERS
-/* Compute the mapping regs->binders allocated to them.                 */
-/* Re-use store in spill_order.                                         */
-    {   BindList *p, *q;
-        for (p = spill_order;  p != 0; p = q)
-        {   Binder *b = p->bindlistcar;
-            VRegnum vr = bindxx_(b);
-            q = p->bindlistcdr;
-            if (vr != GAP)
-            {   RealRegister rr = register_number(vr);
-                if (debugging(DEBUG_REGS)) cc_msg("$b r%d\n", b, rr);
-                if ((unsigned32)rr < (unsigned32)NMAGICREGS)
-                {   p->bindlistcdr = reg_to_binders[rr];
-                    reg_to_binders[rr] = p;
-                }
-            }
-        }
-        if (debugging(DEBUG_REGS))
-        {   int32 i;
-            cc_msg("reg table:\n");
-            for (i=0; i<NMAGICREGS; i++)
-            {   BindList *p;
-                int ch = '{';
-                cc_msg("r%ld: ", i);
-                for (p = reg_to_binders[i]; p!=NULL; p = p->bindlistcdr)
-                    cc_msg("%c$b", ch, p->bindlistcar), ch = ',';
-                cc_msg("%s", (ch=='{') ? "{}\n" : "}\n");
-            }
-        }
-    }
-#endif
 }
 
 #ifndef TARGET_IS_NULL
@@ -2376,7 +2531,7 @@ VRegnum vregister(RegSort rsort)
 /* ... and its inverse (for cg/cse only, due regalloc_changephase()).   */
 RegSort vregsort(VRegnum r)
 {   if ((unsigned32)r >= (unsigned32)vregistername)
-        syserr("vregsort(%lx)", (long)r);
+        syserr(syserr_vregsort, (long)r);
     return vregtypetab_(r) & REGSORTMASK;
 }
 
@@ -2407,11 +2562,7 @@ void regalloc_reinit(void)
 {   RealRegister i;   /* parallel to vregistername here */
     vregistername = 0;
     for (i = 0; i < NMAGICREGS; i++)
-#ifdef TARGET_IS_XAP
-        (void)vregister(i == R_A1+1 ? WRDREG : INTREG);
-#else
         (void)vregister(i < NINTREGS ? INTREG : DBLREG);
-#endif
     (void)vregister(SENTINELREG);
     memclr((VoidStar)&curstats, sizeof(curstats));
     memclr((VoidStar)&regmaskvec, sizeof(RealRegSet));
@@ -2427,10 +2578,6 @@ void regalloc_reinit(void)
     n_real_spills = n_cse_spills = spill_cost = 0;
 #endif
     reg_lsbusetab = (unsigned char *)DUFF_ADDR;
-#ifdef REG_TO_BINDERS
-    for (i = 0; i < NMAGICREGS; i++)
-        reg_to_binders[i] = 0;
-#endif
 }
 
 void regalloc_init(void)
@@ -2486,8 +2633,8 @@ void regalloc_init(void)
 #ifndef TARGET_SHARES_INTEGER_AND_FP_REGISTERS
     memclr((VoidStar)&m_fltregs, sizeof(RealRegSet));
     for (i = 0; i<NMAGICREGS; i++)
-        if (R_FA1 <= i && i < R_FA1+NFLTARGREGS || i == R_FA1result ||
-                R_FP1 <= i && i < R_FP1+NFLTARGREGS || i == R_FP1result ||
+        if (R_FA1 <= i && i < R_FA1+NFLTARGREGS ||
+                R_FP1 <= i && i < R_FP1+NFLTARGREGS ||
                 R_FT1 <= i && i < R_FT1+NFLTTEMPREGS ||
                 R_FV1 <= i && i < R_FV1+NFLTVARREGS)
             augment_RealRegSet(&m_fltregs,i);
@@ -2527,19 +2674,6 @@ void regalloc_tidy(void)
 /* C.  Note that it gets called before regalloc_init() (e.g. builtin.c) */
 /* and so the obvious initialisation fails.                             */
 
-extern void reg_setregsused(RealRegSet *s, int32 rdesc)
-{
-#ifdef TARGET_IS_NEC    /* of more general use...                       */
-    if (rdesc == 0x0002)        
-    {   int i;
-        memset((void *)s, 0, sizeof(*s));
-        augment_RealRegSet(s,R_A1+0);
-        augment_RealRegSet(s,R_A1+1);
-        augment_RealRegSet(s,R_A1result);
-    }
-    else
-#endif
-        memset((void *)s, 0xff, sizeof(*s));
-}
+extern void reg_setallused(RealRegSet *s) { memset(s, 0xff, sizeof(*s)); }
 
 /* end of regalloc.c */

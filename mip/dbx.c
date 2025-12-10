@@ -1,3 +1,4 @@
+
 /*
  * C compiler file dbx.c, version 5
  * Copyright (C) Acorn Computers Ltd., 1988.
@@ -5,14 +6,14 @@
  */
 
 /*
- * RCS $Revision: 1.2 $
- * Checkin $Date: 91/09/09 16:33:38 $
+ * RCS $Revision: 1.6 $
+ * Checkin $Date: 1994/10/17 11:34:48 $
  * Revising $Author: hmeekings $
  */
 
 #ifndef NO_VERSION_STRINGS
 extern char dbx_version[];
-char dbx_version[] = "\ndbx.c $Revision: 1.2 $ 5\n";
+char dbx_version[] = "\ndbx.c $Revision: 1.6 $ 5\n";
 #endif
 
 /* This file contains routines to buffer information required for         */
@@ -29,7 +30,6 @@ char dbx_version[] = "\ndbx.c $Revision: 1.2 $ 5\n";
  *      inside the procedure.  But it is a bit of a tacky thing to do.
  */
 
-#if 0
 #ifdef unix
 #  include <a.out.h>
 #  ifdef arm                 /* a.out.h defines size_t via sys/types.h */
@@ -37,7 +37,6 @@ char dbx_version[] = "\ndbx.c $Revision: 1.2 $ 5\n";
 #  endif
 #else
 #  include "aout.h"
-#endif
 #endif
 
 #ifdef __STDC__
@@ -61,6 +60,10 @@ char dbx_version[] = "\ndbx.c $Revision: 1.2 $ 5\n";
 #include "errors.h"
 #ifdef FORTRAN
 #include "feext.h"     /* syn_equivcheck */
+#endif
+
+#ifndef __STDC__
+#  define sprintf ansi_sprintf
 #endif
 
 #ifdef TARGET_HAS_DEBUGGER
@@ -264,7 +267,6 @@ static TypeInfo dbg_stdtypes[] = {
 static void dbg_stab(char *name, int32 type, int32 desc,
                      unsigned long value)
 {
-#ifndef NO_OBJECT_OUTPUT            /* e.g. TARGET_IS_XAP */
     struct nlist nlist;
     nlist.n_un.n_name = name;
     nlist.n_type      = (char)type;
@@ -272,15 +274,15 @@ static void dbg_stab(char *name, int32 type, int32 desc,
     nlist.n_desc      = (short)desc;
     nlist.n_value     = value;
     obj_stabentry(&nlist);
-#endif
 }
 
 static void dbg_stdheader(void)
 {   TypeInfo *p;
     char buf[64];
-    int idx;
+    int idx, pos;
     for (p = dbg_stdtypes, idx = 1; p->name != NULL; ++p) {
-       sprintf(buf, "%s:t%d=%s", p->name, idx++, p->defn);
+       pos = sprintf(buf, "%s:t%d=%s", p->name, idx++, p->defn);
+       buf[pos] = 0;
        dbg_stab(copy(buf), N_LSYM, 0, 0);
     }
 }
@@ -373,7 +375,7 @@ typedef int VarClass;
 
 static char charofclass[] = "@GSrVpvVSG";
 
-static unsigned char ntypeof[] = {
+static char ntypeof[] = {
     N_LSYM, N_GSYM, N_STSYM, N_RSYM, N_STSYM, N_PSYM, N_PSYM, N_GSYM,
     N_LCSYM,N_LCSYM,
     0
@@ -537,7 +539,6 @@ void dbg_addcodep(VoidStar debaddr, int32 codeaddr)
 
 static int32 sprinttype(char *name,char *, TypeExpr *);
 
-#ifndef TARGET_IS_XAP
 static int32 sprintstruct(char *pp, TypeExpr *type)
 {
     char   *start = pp;
@@ -548,12 +549,12 @@ static int32 sprintstruct(char *pp, TypeExpr *type)
     /* do two passes to cope with cycles */
     sym = bindsym_(b);
     if (b->tagbinddbg > 0) {
-        sprintf(pp, "%ld", b->tagbinddbg), pp += strlen(pp);
+        pp += sprintf(pp, "%ld", b->tagbinddbg); *pp = 0;
         return(pp - start);    /* seen before */
     }
     if (!(attributes_(b) & TB_DEFD)) { /* no definition yet */
         b->tagbinddbg = -dbg_newtype(type, symname_(sym), NULL);
-        sprintf(pp, "%ld", -b->tagbinddbg), pp += strlen(pp);
+        pp += sprintf(pp, "%ld", -b->tagbinddbg); *pp = 0;
         return(pp - start);
     }
     if (b->tagbinddbg < 0) { /* it has become defined */
@@ -566,13 +567,13 @@ static int32 sprintstruct(char *pp, TypeExpr *type)
      */
     if (!isgensym(sym)) { /* not anonymous */
         DbgList *p = (DbgList*)DbgAlloc(DbgListVarSize(DEB_STRUCT));
-        sprintf(pp, "T%ld=", b->tagbinddbg), pp += strlen(pp);
+        pp += sprintf(pp, "T%ld=", b->tagbinddbg);
         p->debsort = D_STRUCT;
         p->car.DEB_STRUCT.typeidx = b->tagbinddbg;
         p->cdr = dbglist;
         dbglist = p;
     } else {
-        sprintf(pp, "%ld=", b->tagbinddbg), pp += strlen(pp);
+        pp += sprintf(pp, "%ld=", b->tagbinddbg);
     }
     {   char dbxclass = 0;
         switch (sort = (attributes_(b) & ENUMORCLASSBITS)) {
@@ -583,35 +584,29 @@ static int32 sprintstruct(char *pp, TypeExpr *type)
             default:                   syserr(syserr_tagbindsort, sort);
         }
         *pp++ = dbxclass;
-        if (dbxclass != 'e')
-            sprintf(pp, "%ld", sizeoftype(type)), pp += strlen(pp);
+        if (dbxclass != 'e') pp += sprintf(pp, "%ld", sizeoftype(type));
     }
     {   StructPos p;
         ClassMember *l;
-#ifdef NEW_STRUCTPOS_INIT
         structpos_init(&p, b);
-#else
-        p.n = p.bitoff = 0;
-#endif
         for (l = tagbindmems_(b); l != 0; l = memcdr_(l)) {
-            if (sort != bitoftype_(s_enum)) structfield(l, sort, &p);
+            if (sort != s_enum) structfield(l, sort, &p);
             if (memsv_(l)) {
                 /* note that memsv is 0 for padding bit fields */
-                sprintf(pp, "%s:", symname_(memsv_(l))), pp += strlen(pp);
+                pp += sprintf(pp, "%s:", symname_(memsv_(l)));
                 if (sort == bitoftype_(s_enum)) {
                 /* symdata_ here is ok, since dbg_typerep gets called for local
                    things when a declaration is first seen (by dbg_locvar)
                    at which time bindings are still in place.
                  */
-                    sprintf(pp, "%ld", bindenumval_(l)), pp += strlen(pp);
+                    pp += sprintf(pp, "%ld", bindenumval_(l));
                     *pp++ = ',';
                 } else {
                     pp += sprinttype("", pp, memtype_(l)); *pp++ = ',';
-                    sprintf(pp, "%ld,%ld;",
+                    pp += sprintf(pp, "%ld,%ld;",
                                       p.woffset*8 + p.boffset,
                                       p.bsize != 0 ? p.bsize :
                                                      p.typesize * 8);
-                    pp += strlen(pp);
                 }
             }
         }
@@ -619,11 +614,10 @@ static int32 sprintstruct(char *pp, TypeExpr *type)
     *pp++ = ';'; *pp = 0;
     if (!isgensym(sym)) { /* not anonymous */
         typeinfo_(b->tagbinddbg)->defn = globalcopy(start);
-        pp = start; sprintf(pp, "%ld", b->tagbinddbg); pp += strlen(pp);
+        pp = start; pp += sprintf(pp, "%ld", b->tagbinddbg); *pp = 0;
     }
     return(pp - start);
 }
-#endif /* !TARGET_IS_XAP */
 
 static int32 sprinttype(char *name, char *buf, TypeExpr *x)
 {   char *p = buf;
@@ -632,11 +626,11 @@ static int32 sprinttype(char *name, char *buf, TypeExpr *x)
     if (typeidx != 0) {
         TypeInfo *t = typeinfo_(typeidx);
         if (t->name[0] == '<' && t->defn != NULL) { /* anonymous structure */
-            sprintf(p, "%s", t->defn), p += strlen(p);
+            p += sprintf(p, "%s", t->defn);
         } else {
-            sprintf(p, "%ld", typeidx), p += strlen(p);
+            p += sprintf(p, "%ld", typeidx);
         }
-        return(p - buf);
+        *p = 0; return(p - buf);
     }
     switch (h0_(x)) {
     case t_content:
@@ -649,7 +643,7 @@ static int32 sprinttype(char *name, char *buf, TypeExpr *x)
     case t_subscript:
         *p++ = 'a';
         n = typesubsize_(x) ? evaluate(typesubsize_(x)) : 1;
-        sprintf(p, "r%d;0;%ld", T_INT, n-1), p += strlen(p); *p++ = ';';
+        p += sprintf(p, "r%d;0;%ld", T_INT, n-1); *p++ = ';';
         p += sprinttype("", p, typearg_(x));
         break;
     case t_fnap:
@@ -662,11 +656,7 @@ static int32 sprinttype(char *name, char *buf, TypeExpr *x)
             case bitoftype_(s_struct):
             case bitoftype_(s_class):
             case bitoftype_(s_union):
-#ifdef TARGET_IS_XAP
-                *p++ = 'q';
-#else
                 p += sprintstruct(p, x);
-#endif
                 break;
             case bitoftype_(s_typedefname):
                 p += sprinttype("", p, bindtype_(typespecbind_(x)));
@@ -827,10 +817,6 @@ static Dbg_LocList *dbg_lookupline(Binder *b)
 /* #  define local_fpaddress(x) 0 */
 #endif
 
-#ifdef TARGET_IS_XAP
-void dbg_locvar1(Binder *b) {}
-/* we don't really keep this info... */
-#else
 void dbg_locvar1(Binder *b)
 {   Symstr *name = b->bindsym;
     Dbg_LocList *loc = dbg_lookupline(b);
@@ -898,7 +884,6 @@ case bitofstg_(s_auto):
         cc_msg(" %c %lx", charofclass[dbxclass], (long)addr);
     dbg_addvar_t(name, loc->typerep, loc->pos, dbxclass, addr);
 }
-#endif /* !TARGET_IS_XAP */
 
 /*
  * The code here is written is this manner, so that for *significant*
@@ -925,11 +910,7 @@ bool dbg_scope(BindListList *newbll, BindListList *oldbll)
      */
     for (nvars = 0; newbll != oldbll; newbll = newbll->bllcdr)
     {   SynBindList *bl;
-#ifdef TARGET_IS_XAP
-        if (newbll == 0) break;
-#else
         if (newbll == 0) syserr(syserr_dbx_scope);
-#endif
         for (bl = newbll->bllcar; bl; bl = bl->bindlistcdr)
         {   Binder *b = bl->bindlistcar;
             if (bindstg_(b) & b_dbgbit) continue;
@@ -965,7 +946,6 @@ void dbg_proc(Symstr *name, TypeExpr *t, bool ext, FileLine fl)
     {   DbgList *p = (DbgList*)DbgAlloc(DbgListVarSize(DEB_PROC));
         if (debugging(DEBUG_Q)) cc_msg("startproc $r\n", name);
         p->debsort = D_PROC;
-        t = princtype(t);        /* fix bug (otherwise safe) */
         if (h0_(t) != t_fnap) syserr(syserr_dbx_proc);
         p->car.DEB_PROC.type = dbg_typerep(typearg_(t));
         p->car.DEB_PROC.isextern = ext;
@@ -1155,11 +1135,11 @@ if ((c)>=0 && !sameline((x),curline)) \
                 int  ntype;
                 Symstr *sym = p->car.DEB_VAR.sym;
                 setpos(p->car.DEB_VAR.sourcepos, curcode);
-                sprintf(pp, "%s:", symname_(sym)), pp += strlen(pp);
+                pp += sprintf(pp, "%s:", symname_(sym));
                 if (p->car.DEB_VAR.dbxclass != CLASS_AUTO) {
                     *pp++ = charofclass[p->car.DEB_VAR.dbxclass];
                 }
-                sprintf(pp, "%s", p->car.DEB_VAR.type), pp += strlen(pp);
+                pp += sprintf(pp, "%s", p->car.DEB_VAR.type);
                 ntype = (int)ntypeof[p->car.DEB_VAR.dbxclass];
                 *pp = 0;
                 {   ExtRef *x = symext_(sym);

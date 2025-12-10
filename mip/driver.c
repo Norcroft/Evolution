@@ -6,9 +6,9 @@
  */
 
 /*
- * RCS $Revision: 1.43 $  Codemist 186a
- * Checkin $Date: 93/10/08 14:50:59 $
- * Revising $Author: lsmith $
+ * RCS $Revision: 1.63 $  Codemist 186
+ * Checkin $Date: 1995/12/13 12:46:02 $
+ * Revising $Author: hmeeking $
  */
 
 /* AM memo: we should look at a getenv() variable to find alternative    */
@@ -54,20 +54,19 @@ extern int  system();
 #endif
 #include <ctype.h>
 #include <stdio.h>
-#ifndef COMPILING_ON_MSDOS
 #include <signal.h>
-#endif
-#ifndef SEEK_SET
-#define SEEK_SET 0      /* some sun stdio.h's    */
-#endif
 
 #include "globals.h"
+#include "errors.h"
 #include "compiler.h"
 #include "fname.h"
 #include "version.h"
 #include "drivhelp.h"
 #include "mcdep.h"
 #include "prgname.h"
+#ifdef FOR_ACORN
+#include "dde.h"
+#endif
 
     /*************************************************************/
     /*                                                           */
@@ -119,17 +118,19 @@ extern int  system();
 #define KEY_ERRORSTREAM    0x00400000L
 #define KEY_VIAFILE        0x00800000L
 #define KEY_VERIFY         0x01000000L
-#define KEY_QUIET          0x02000000L
-#define KEY_WIZARD         0x04000000L
-#define KEY_SINGLEFLOAT    0x08000000L
-#ifdef TARGET_IS_XAP
-#define KEY_NOLITVALS      0x80000000L
+#  define KEY_CFRONT       0x02000000L
+#ifdef PASCAL
+#  define KEY_ISO          0x02000000L
 #endif
-#ifdef PASCAL /*ECN*/
-#define KEY_ISO            0x80000000L
+#define KEY_CPP            0x04000000L
+
+#ifndef FORTRAN
+/* IDJ 25-Mar-94: re-use FORTRAN flags for DDE purposes */
+#define KEY_THROWBACK      0x10000000L
+#define KEY_DESKTOP        0x20000000L
+#define KEY_DEPEND         0x40000000L
+#define KEY_CFRONTPREPROCESS 0x80000000L
 #else
-#endif
-#ifdef FORTRAN
 #define KEY_F66            0x10000000L
 #define KEY_ONETRIP        0x20000000L
 #define KEY_UPPER          0x40000000L
@@ -166,8 +167,7 @@ extern int  system();
 #define F66_ONETRIP       1L
 #define F66_IOSUBLIST     2L
 #define F66_INTRINSGO     4L
-
-#endif
+#endif /* FORTRAN */
 
 /*************************************************************/
 /*                                                           */
@@ -224,6 +224,18 @@ static struct EnvTable
 #else
 # ifdef COMPILING_ON_ARM
 #  ifdef COMPILING_ON_RISC_OS
+#     ifdef FOR_ACORN
+    {
+/*/* IDJ hack: 06-Jun-94 to make it work for DDE.  Needs sorting out! */
+      0, (KEY_LINK), 0,
+/* /* Perhaps $.clib, $.plib etc should be called $.lib */
+      "$.clib", "$.clib", "$.plib", "", "$.clib.", "$.plib", "l",
+      "ObjAsm -quit -stamp",
+      "CHAIN:link", NULL, "",
+      "", "", "",
+      "o.stubs", "o.hostlib", "o.ansilib", "o.fortlib", "o.fortlib", "o.plib"
+    }
+#     else
     {
       0, (KEY_LINK), 0,
 /* /* Perhaps $.clib, $.plib etc should be called $.lib */
@@ -233,6 +245,7 @@ static struct EnvTable
       "", "", "",
       "o.ansilib", "o.hostlib", "o.ansilib", "o.fortlib", "o.fortlib", "o.plib"
     }
+#     endif
 #  endif
 #  ifdef COMPILING_ON_UNIX
 #   ifdef TARGET_IS_HELIOS         /* software rust awaiting paint. */
@@ -292,7 +305,12 @@ static struct EnvTable
 #  ifdef COMPILING_ON_MACINTOSH
 /* arm_targetted cross_compilation : fortran & pascal not supported */
 /* no default places (no root without knowing volume name) */
-     { 0, (KEY_LINK), 0,
+     {
+#ifndef HOST_CANNOT_INVOKE_LINKER
+       0, (KEY_LINK), 0,
+#else
+       0, 0, 0,
+#endif
        "", "", "", ":", "", "", "lst",
        "armasm -quit -stamp",
        "armlink", NULL, "",
@@ -322,15 +340,22 @@ static char  *(*cc_argv)[], *(*cc_filv)[];
 static const char *(*ld_argv)[], *(*ld_filv)[];
 static int   cc_argc, cc_filc, ld_argc, ld_filc;
 static int   cmd_error_count, main_error_count;
-static bool  banner_given;
 static int32 driver_flags;
 #ifdef FORTRAN
 static int32 pragmax_flags;
 #endif
+#ifdef FOR_ACORN
+static char *dependfile;
+        /* IDJ: 06-Jun-94: used to point to filename after -depend */
+#endif
+
 
 #ifdef TARGET_IS_KCM            /* shouldn't be here */
 #  define OBJ_EXTN "kcm"
 #  define ASM_EXTN "mas"
+#endif
+#ifdef TARGET_IS_XAP            /* ditto */
+#  define ASM_EXTN "xap"
 #endif
 
 #ifdef HOST_OBJECT_INCLUDES_SOURCE_EXTN
@@ -454,7 +479,6 @@ static void get_external_environment(void)
   char *root = pathfromenv(C_INC_VAR, "");
   if (root[0] != 0)
       setupenv.include_ansi_path = setupenv.include_pcc_path = root;
-#ifndef HOST_CANNOT_INVOKE_LINKER
   root = pathfromenv(C_LIB_VAR, setupenv.lib_root);
   if (root[0] != 0)
   {
@@ -482,7 +506,6 @@ static void get_external_environment(void)
   {   lib_fixupname(setupenv.pas_lib);
   }
 #endif
-#endif /* HOST_CANNOT_INVOKE_LINKER */
 }
 
 static void set_default_options(void)
@@ -513,12 +536,10 @@ bool cistreq(const char *s1, const char *s2) {
 static int32 keyword(const char *string)
 {
   int count;
-  static const struct { char *word; int32 key; } keytab[] = {
+  static struct { char *word; int32 key; } const keytab[] = {
       "-help",          KEY_HELP,
       "-h",             KEY_HELP,
       "-verify",        KEY_VERIFY,
-      "-quiet",         KEY_QUIET,
-      "-xyzzy",         KEY_WIZARD,
       "-link",          KEY_LINK,
       "-list",          KEY_LISTING,
       "-errors",        KEY_ERRORSTREAM,
@@ -529,14 +550,6 @@ static int32 keyword(const char *string)
       "-bigend",        KEY_BIGEND,
       "-bi",            KEY_BIGEND,
 #endif
-      "-singlefloat",   KEY_SINGLEFLOAT,
-      "-double=32",     KEY_SINGLEFLOAT,
-      "-double=4",      KEY_SINGLEFLOAT,
-      "-double=64",     0,
-      "-double=8",      0,
-#ifdef TARGET_IS_XAP
-      "-nolitvals",     KEY_NOLITVALS,
-#endif
 #ifdef PASCAL /*ECN*/
       "-iso",           KEY_ISO,
       "-arthur",        KEY_HOST_LIB,
@@ -545,6 +558,7 @@ static int32 keyword(const char *string)
 #else
 #ifndef FORTRAN /* i.e. C, C++, etc */
       "-ansi",          KEY_ANSI,
+      "-ansic",         KEY_ANSI,
       "-arthur",        KEY_HOST_LIB,
       "-pcc",           KEY_PCC,
       "-super",         KEY_HOST_LIB,
@@ -552,6 +566,14 @@ static int32 keyword(const char *string)
       "-strict",        KEY_STRICT,
       "-pedantic",      KEY_STRICT,
       "-counts",        KEY_COUNTS,
+      "-cfront",        KEY_CFRONT,
+      "-cpp",           KEY_CPP,
+#ifdef FOR_ACORN
+      "-throwback",     KEY_THROWBACK,
+      "-desktop",       KEY_DESKTOP,
+      "-depend",        KEY_DEPEND,
+      "-c++",           KEY_CFRONTPREPROCESS,
+#endif
 #  ifdef RISCiX113
       "-riscix1.2",     KEY_RIX120,
 #  endif
@@ -575,6 +597,12 @@ static int32 keyword(const char *string)
   return 0L;
 }
 
+static void incompatible_option(msg_t opt)
+{
+  cc_msg_lookup(driver_incompat_options,msg_lookup(opt));
+  exit(EXIT_error);
+}
+
 /*************************************************************/
 /*                                                           */
 /*      Validate the command line keywords                   */
@@ -588,14 +616,30 @@ static void validate_flags(void)
 #ifdef WANT_WHINGY_MSGS_EVEN_WHEN_WRONG
   if (ld_argc != 0 && !(flags & KEY_LINK))
       /* Beware: the next line catches most curios, but not -lxxx   */
-      cc_msg("Warning: linker flag(s) ignored with -c -E -M or -S\n");
+      cc_msg_lookup(driver_ignored_linkerflags);
 #endif
 
   if (flags & KEY_ANSI) flags &= ~KEY_PCC;
 
+  if (flags & KEY_ANSI)
+    if (flags & KEY_CFRONT || flags & KEY_CPP)
+      incompatible_option(driver_incompat_cfrontcpp_ansi);
+
+  if (flags & KEY_PCC)
+    if (flags & KEY_CFRONT || flags & KEY_CPP)
+      incompatible_option(driver_incompat_cfrontcpp_pcc);
+
+  if (flags & KEY_CFRONT)
+    if (flags & KEY_PCC || flags & KEY_ANSI)
+      incompatible_option(driver_incompat_pccansi_cfront);
+
+  if (flags & KEY_CPP)
+    if (flags & KEY_PCC || flags & KEY_ANSI)
+      incompatible_option(driver_incompat_pccansi_cpp);
+
   if (flags & KEY_HOST_LIB)
   {   if (flags & KEY_UNIX)
-      {   cc_msg("Warning: -arthur/-super ignored under unix\n");
+      {   cc_msg_lookup(driver_ignored_arthur_unix);
           flags &= ~KEY_HOST_LIB;
       }
   }
@@ -605,7 +649,7 @@ static void validate_flags(void)
   if ((flags & (KEY_MAKEFILE+KEY_PREPROCESS+KEY_MD)) ==
                (KEY_MAKEFILE+KEY_PREPROCESS))
   {
-      cc_msg("Warning: options -E and -M conflict: -E assumed\n");
+      cc_msg_lookup(driver_conflict_EM);
       flags &= ~KEY_MAKEFILE;
   }
 
@@ -616,20 +660,20 @@ static void validate_flags(void)
 #ifdef FORTRAN
   if (flags & KEY_STRICT)
   {   if (flags & KEY_ONETRIP)
-      {   cc_msg("Warning: -onetrip and -strict conflict: -strict assumed\n");
+      {   cc_msg_lookup(driver_conflict_strict_onetrip);
           flags &= ~KEY_ONETRIP;
       }
       if (flags & KEY_F66)
-      {   cc_msg("Warning: -f66 and -strict conflict: -strict assumed\n");
+      {   cc_msg_lookup(driver_conflict_strict_f66);
           flags &= ~KEY_F66;
       }
       if (flags & KEY_LONGLINES)
-      {   cc_msg("Warning: -extend and -strict conflict: -strict assumed\n");
+      {   cc_msg_lookup(driver_conflict_strict_extend);
           flags &= ~KEY_LONGLINES;
       }
   }
   if ((flags & KEY_F66) && (flags & KEY_ONETRIP))
-  {   cc_msg("Warning: -f66 implies -onetrip\n");
+  {   cc_msg_lookup(driver_implies_f66_onetrip);
       flags &= ~KEY_ONETRIP;
   }
 #endif
@@ -637,35 +681,23 @@ static void validate_flags(void)
   driver_flags = flags;
 }
 
-static void driver_banner(bool helper)
-{
-#ifdef HOST_WANTS_NO_BANNER     /* rather dying: use KEY_QUIET */
-    if (!helper) return;        /* simulate old HOST_WANTS_NO_BANNER beh. */
-#endif
-    if (!banner_given)
-    {   fprintf(stderr, "%s\n", CC_BANNER);
-#ifdef COPYRIGHT_NOTICE
-        fprintf(stderr, "%s\n", COPYRIGHT_NOTICE);
-#endif
-    }
-    banner_given = 1;
-}
-
-
 static void give_help(const char *command_name)
 {
-    driver_banner(1);
+#ifdef HOST_WANTS_NO_BANNER
+    msg_printf(driver_banner);
+#endif
 #ifdef TIME_LIMIT
     {   time_t expire = TIME_LIMIT;
-        fprintf(stdout,
-                "This time-limited software remains the property of "
-                VENDOR_NAME     /* specified in options.h */
-                ".\nIt will expire at (GMT) %s\n", ctime(&expire));
+        msg_fprintf(driver_expire,VENDOR_NAME,ctime(&expire));
     }
 #endif
-    {   char **p = driver_help_text;
-        fprintf(stdout, *p, command_name);
-        while (*++p != NULL) fprintf(stdout, "%s\n", *p);
+    {   msg_t *p = driver_help_text;
+        msg_printf(*p, command_name);
+#ifdef REL193_HACK
+        while (*++p != NULL) msg_printf("%s\n", *p);
+#else
+        while (*++p != NULL) msg_printf(*p,command_name);
+#endif
     }
 }
 
@@ -696,17 +728,25 @@ static void set_flag_options(void)
   new_cc_arg(pragmax);
 #endif
 
-  if (flags & KEY_SINGLEFLOAT)  new_cc_arg("-ZD");
   if (flags & KEY_STRICT)       new_cc_arg("-ZF");
   if (flags & KEY_MAKEFILE)
       new_cc_arg(flags & KEY_NOSYSINCLUDES ? "-M<" : "-M");
   if (flags & KEY_PCC)          new_cc_arg("-ZU");
-#ifdef TARGET_IS_XAP
-  if (flags & KEY_NOLITVALS)    new_cc_arg("-ZH4");
-#endif
-#ifdef PASCAL /*ECN*/
+#ifdef PASCAL
   if (flags & KEY_ISO)          new_cc_arg("-ZZ");
 #endif
+
+#ifdef FOR_ACORN
+  if (flags & KEY_THROWBACK)
+      dde_throwback_flag = 1;
+  if (flags & KEY_CFRONTPREPROCESS)
+      cplusplus_flag = 1;
+#endif
+#ifdef CPLUSPLUS
+  if (flags & KEY_CFRONT)       new_cc_arg("-ZZ");
+  if (flags & KEY_CPP)          new_cc_arg("-ZX");
+#endif
+  if (flags & KEY_ANSI)         new_cc_arg("-ZY");
   if (flags & KEY_PREPROCESS &&
       flags & KEY_COMMENT)      new_cc_arg("-C");
 #ifdef TARGET_ENDIANNESS_CONFIGURABLE
@@ -918,8 +958,8 @@ default:            startup = setupenv.link_startup;       break;
 #endif
       (cc_filc == 1) && (ld_filc == 1) && (count==0))
       remove((*ld_filv)[0]);
-#else
-  IGNORE(flags);
+#else /* TARGET_IS_NULL */
+  flags = flags;  /* keep ncc happy */
 #endif
 }
 #endif
@@ -949,7 +989,7 @@ static void process_file_names(int filc, char *filv[])
       int extn_ch;
 
       if (strlen(current) > MAX_TEXT-5)
-      {   cc_msg("Overlong filename ignored: %s\n", current);
+      {   cc_msg_lookup(driver_ignored_filename_overlong, current);
           continue;
       }
 
@@ -959,6 +999,9 @@ static void process_file_names(int filc, char *filv[])
       if (unparse.extn == NULL)
 #ifndef COMPILING_ON_UNIX
       /* On non-Unix hosts use a sensible default if no extension was given */
+#ifdef FOR_ACORN
+      if (!cplusplus_flag)
+#endif
       {   unparse.extn = LANG_EXTN_STRING;
           unparse.elen = sizeof(LANG_EXTN_STRING)-1;
       }
@@ -982,15 +1025,14 @@ case 'o':     if ((flags & (KEY_PREPROCESS+KEY_MAKEFILE)) == 0)
                   (*ld_filv)[ld_filc++] = copy_unparse("", &unparse, NULL);
                   break;
               }
-              else cc_msg("Warning: %s -E/M %s - inconsistent options\n",
-                           (*cc_argv)[0], current);
+              else cc_msg_lookup(driver_inconsistent_EM,
+                          (*cc_argv)[0], current);
               /* and fall through ... */
 #endif
 
 default:      if ((flags & (KEY_PREPROCESS+KEY_MAKEFILE)) == 0)
-              {
-                  cc_msg("Error: type of '%s' unknown (file ignored)\n",
-                          current);
+              {   if ((flags & KEY_CFRONTPREPROCESS) != 0) goto case_lang_extn;
+                  cc_msg_lookup(driver_unknown_filetype, current);
                   ++cmd_error_count;
                   continue;
               }
@@ -1015,13 +1057,12 @@ case 's':     if ((flags & (KEY_PREPROCESS+KEY_MAKEFILE)) == 0)
 #endif
 
 #ifdef COMPILING_ON_UNIX
-#ifdef CPLUSPLUS
 case LANG_UC_EXTN:      /* unix foo.C for C++ (rework other hosts?)     */
-#endif
 case 'i':               /* for X/Open compliance (what about '.I'?)     */
 #else
 case LANG_UC_EXTN:
 #endif
+case_lang_extn:
 case LANG_EXTN:
           {   char *out_file = setupenv.output_file;
               char *out_name = NULL;
@@ -1061,7 +1102,12 @@ case LANG_EXTN:
 
               if (flags & KEY_MD)
                   new_cc_arg(copy_unparse("-M", &unparse, "d"));
-
+#ifdef FOR_ACORN
+              /* IDJ 06-Jun-94: -depend <filename> gets turned into     */
+              /* -M+<filename> here                                     */
+              if (flags & KEY_DEPEND)
+                  new_cc_arg(join_strs("-M+", dependfile));
+#endif
               new_cc_arg(copy_unparse("", &unparse, NULL));
 
               if (out_file == NULL                  ||
@@ -1138,14 +1184,14 @@ case LANG_EXTN:
 
 static void bad_option(const char *opt)
 {
-  cc_msg("Error: bad option '%s': ignored\n", opt);
+  cc_msg_lookup(driver_option_bad, opt);
   ++cmd_error_count;
 }
 
 #ifdef FORTRAN
 static void nimp_option(const char *opt)
 {
-  cc_msg("Error: unimplemented option '%s': ignored\n", opt);
+  cc_msg_lookup(driver_option_nimp, opt);
   ++cmd_error_count;
 }
 #endif
@@ -1177,12 +1223,11 @@ static char *new_include(const char *file, char *list)
 }
 
 static int mapvia(FILE *v, char *viafile, char **newargv)
-{   int ch = ' ', newargc, p, got_via;
+{   int ch, newargc, p, got_via;
     char word[128];
 
     if (v == NULL)
-    {   driver_banner(0);
-        cc_msg("Can't open -via file %s\n", viafile);
+    {   cc_msg_lookup(driver_via_not_opened, viafile);
         exit(1);
     }
     fseek(v, 0L, SEEK_SET);
@@ -1192,10 +1237,18 @@ static int mapvia(FILE *v, char *viafile, char **newargv)
     {   while (ch != EOF && isspace(ch)) ch = getc(v);
         if (ch == EOF) break;
         p = 0;
-        do
-        {   if (p < (sizeof(word)-1)) word[p++] = ch;
-            ch = getc(v);
-        } while (ch != EOF && !isspace(ch));
+        if (ch == '"' || ch == '\'') {
+            int quote = ch;
+            for (;;) {
+                ch = getc(v);
+                if (ch == EOF || ch == quote) break;
+                if (p < (sizeof(word)-1)) word[p++] = ch;
+            }
+        } else
+            do
+            {   if (p < (sizeof(word)-1)) word[p++] = ch;
+                ch = getc(v);
+            } while (ch != EOF && !isspace(ch));
         word[p] = 0;
         if (got_via)
         {   FILE *f = fopen(word, "r");
@@ -1222,26 +1275,20 @@ static int read_keyword_options(int argc, char ***argvPtr)
   for (count=1; count < argc;  ++count)
   {
       int32 key = keyword(argv[count]);
-#ifdef TARGET_IS_XAP
-      if (!(driver_flags & KEY_WIZARD ||
-            key & (KEY_WIZARD|KEY_HELP|KEY_STRICT|KEY_NOLITVALS|
-                   KEY_LISTING|KEY_QUIET|KEY_ANSI|KEY_PCC)))
-          key = 0;      /* (reject all keys but above unless wizard)    */
-#endif
       if (key == 0L)
       {   int n = count;
           KW_Status status = mcdep_keyword(argv[count], &n, argv);
           if (status != KW_OK && status != KW_NONE) {
               int c = '\'';
-              driver_banner(0);
-              cc_msg("Error: bad option ");
+              cc_msg_lookup(driver_option_bad1);
               while (count <= n) {
                   cc_msg("%c%s", c, argv[count]);
                   argv[count++] = NULL;
                   c = ' ';
               }
               count--;
-              cc_msg("': ignored\n");
+              cc_msg("'");      /* makes NLS string more sensible */
+              cc_msg_lookup(driver_option_bad2);
               ++cmd_error_count;
           } else
               count = n;
@@ -1253,16 +1300,46 @@ static int read_keyword_options(int argc, char ***argvPtr)
               pragmax_flags = RISCIX_FORTRAN_PRAGMAX;
           else
 #endif
+#ifdef FOR_ACORN
+          if (key & KEY_DEPEND)
+          {   /* IDJ 06-Jun-94: this is messy here (but safe, I believe)
+               * We remember the arg after -depend here, so that we can
+               * change it into -M+<filename> later (yuk).
+               */
+              if (++count >= argc)
+              {   cc_msg("Missing file argument for %s\n", keyword);
+                  exit(1);
+              }
+              else
+              {   dependfile    = argv[count];
+                  argv[count]   = NULL;
+                  driver_flags |= key;
+              }
+          }
+          else if (key & KEY_DESKTOP)
+          {   /* IDJ 06-Jun-94: this is messy here (but safe, I believe)
+               * We remember the desktop prefix for running under the wimp.
+               */
+              if (++count >= argc)
+              {   cc_msg("Missing file argument for %s\n", keyword);
+                  exit(1);
+              }
+              else
+              {   dde_desktop_prefix = argv[count];
+                  argv[count]   = NULL;
+                  driver_flags |= key;
+              }
+          }
+          else
+#endif
           if (key == KEY_ERRORSTREAM || key == KEY_VIAFILE) {
               if (++count >= argc) {
-                  driver_banner(0);
-                  cc_msg("Missing file argument for %s\n", keyword);
+                  cc_msg_lookup(driver_option_missing_filearg, keyword);
                   exit(1);
               } else if (key == KEY_ERRORSTREAM) {
                   FILE *e = fopen(argv[count], "w");
                   if (e == NULL) {
-                      driver_banner(0);
-                      cc_msg("Can't open %s for output\n", argv[count]);
+                      cc_msg_lookup(driver_cant_open_output, argv[count]);
                       exit(1);
                   }
                   fclose(e);
@@ -1286,7 +1363,7 @@ static int read_keyword_options(int argc, char ***argvPtr)
                       {   if (argv[j] == NULL) continue;
                           newargv[n++] = argv[j];
                       }
-                      count = newargc;
+                      count = newargc-1;
                       argc = n;
                       *argvPtr = argv = newargv;
                   }
@@ -1350,23 +1427,6 @@ static void read_compile_options(int argc, char *argv[])
                 bad_option(current);
           }
 
-#ifdef TARGET_IS_XAP
-          switch (uc_opt)
-          {
-case 'Z':      switch (safe_toupper(current[2]))
-             {   case 'C': case 'P': break;
-                 default: goto wizard_check;
-             }
-case 'D': case 'E': case 'I': case 'J': case 'U': case 'W':
-case 'S': case '\0':
-             break;
-case 'O':      if (current[1]=='o') break;
-wizard_check:
-default:     if (!(driver_flags & KEY_WIZARD)) goto link_command;
-                                               /* for error msg */
-          }
-#endif
-
           switch(uc_opt)
           {
 #ifdef FORTRAN
@@ -1415,7 +1475,7 @@ default:     if (!(driver_flags & KEY_WIZARD)) goto link_command;
 
   case 'V':   if (current[1] == 'v') {
                  new_cc_arg("-FB");
-                 cc_msg("%s\n",CC_BANNER);
+                 cc_msg_lookup(driver_banner);
               }
               else goto link_command;
               break;
@@ -1600,11 +1660,16 @@ default:     if (!(driver_flags & KEY_WIZARD)) goto link_command;
               if (current[2] == 0 || uc_opt == 'S' ||
                   current[3] == 0 && uc_opt == 'Z')
               {
-                  if (++count < argc)
+                  if (++count < argc) {
                       next = argv[count];
-                  else
+                      if (!next) {
+                          cc_msg_lookup(driver_option_missing_arg, current);
+                          ++cmd_error_count;
+                          break;
+                      }
+                  } else
                   {
-                      driver_abort("No argument to last compiler option");
+                      driver_abort(msg_lookup(driver_option_missing_lastarg));
                       return;
                   }
               }
@@ -1733,18 +1798,28 @@ default:     if (!(driver_flags & KEY_WIZARD)) goto link_command;
  * Main.
  */
 
+#ifdef ANTHONY_BERENT_VERSION
+/*
+ * On Alpha/OSF, realargv is declared as 64-bit pointer array
+ * although other pointers can be 32-bit if -xtaso-short is used.
+ * Thus argv needs to be converted to normal (poss 32-bit) ptr array.
+ */
+int main(int argc, char *realargv[])
+#else
 int main(int argc, char *argv[])
+#endif
 {
-  int count;
   bool is_cpp = NO;
   char *progname;
 #if (defined(COMPILING_ON_UNIX) && defined(FORTRAN))
   progname = "f77"; /* rather than the "f77comp" we would get from argv[0] */
 #else
   char p[32];
-  progname = program_name(argv[0], p, 32);
+  char *default_output = setupenv.output_file;
 #endif
-#ifdef __alpha
+
+/* Pointer manipulation is only required for Alpha/OSF (NOT Windows NT) */
+#if defined(__alpha) && defined(__osf__)
 /*
  * The next few lines are a disgrace (!) but ACN has put them in as a
  * temporary expedient.  On the DEC Alpha the native version of crt0
@@ -1756,14 +1831,33 @@ int main(int argc, char *argv[])
  * adjustment is needed.  Beware also sizeof(FILE) and the va_list
  * structure in standard headers.
  */
+/* IJR: I don't understand the above - as the DEC -xtaso_short option
+ * sets sizeof(char *)==4 but the argv is declared as a special case
+ * with 8-byte pointers.  Thus, the argv[i]=argv[2*i] copy below just
+ * skips every second argument.  It would be interesting to try the
+ * ((char **)argv)[i] = ((char **)argv[2*i]), but there may be
+ * type errors where the long argv is passed to read_keyword_options etc.
+ */
+#ifndef ANTHONY_BERENT_VERSION
   if (sizeof(char *) == 4)
   {  int i;
      for (i=0; i<argc; i++) argv[i] = argv[2*i];
      argv[i] = 0;
   }
+#else
+  char **argv = malloc(sizeof(char *)*argc);
+
+  /* The following is needed to on alpha to create an argv array with a
+   * 32 bit pointer size
+   */
+  {
+    int i;
+    for(i=0; i<argc; i++)
+      argv[i] = realargv[i];
+  }
 #endif
-  main_error_count = cmd_error_count = 0;
-  banner_given = 0;
+#endif
+  progname = program_name(argv[0], p, 32);
 #ifdef TIME_LIMIT
   if (time(0) > TIME_LIMIT) {
     fprintf(stderr, "This time-limited software has expired.\nPlease contact "
@@ -1772,20 +1866,28 @@ int main(int argc, char *argv[])
     exit(99);
   }
 #endif
+  main_error_count = cmd_error_count = 0;
 
 #ifdef CHECK_AUTHORIZED
   check_authorized();
 #endif
 
+#ifdef NLS
+  msg_init(argv[0], MSG_TOOL_NAME);
+#endif
+
   errstate_init();   /* needed before cc_msg */
 
+#ifndef HOST_WANTS_NO_BANNER
+    cc_msg_lookup(driver_banner);
+#endif
 #ifndef COMPILING_ON_UNIX
 #ifndef COMPILING_ON_MSDOS
   (void) signal(SIGINT, compile_abort);
 #endif
 #else
 #  ifdef DRIVER_PRE_RELEASE_MSG
-     cc_msg("%s\n",DRIVER_PRE_RELEASE_MSG);
+     cc_msg_lookup(driver_prerelease);
 #  endif
   /* The signal ignore state can be inherited from the parent... */
 #ifndef COMPILING_ON_MSDOS
@@ -1817,17 +1919,19 @@ int main(int argc, char *argv[])
       exit(1);
   }
 
-#ifndef CPLUSPLUS
-  count = strlen(argv[0]);
-  if (count >= 3 && strcmp(&argv[0][count-3], "cpp") == 0)
-  {    /* The compiler was called as '...cpp' - treat as 'cc -E'.  */
-       driver_flags = (driver_flags | KEY_PREPROCESS) & ~KEY_LINK;
-       is_cpp = YES;
+  {   UnparsedName un;
+      fname_parse(argv[0], ".exe .EXE" , &un);
+      if (un.rlen == 3 &&
+          (strncmp(un.root, "cpp", 3) == 0 ||
+           strncmp(un.root, "CPP", 3) == 0))
+      {
+          /* The compiler was called as '...cpp' - treat as 'cc -E'.  */
+          driver_flags = (driver_flags | KEY_PREPROCESS) & ~KEY_LINK;
+          is_cpp = YES;
+      }
   }
-#endif
 
   argc = read_keyword_options(argc, &argv);
-  if (!(driver_flags & KEY_QUIET)) driver_banner(0);
 
   cc_argv = (char *(*)[]) malloc(sizeof(char *) *
                           (argc + sizeof(driver_options)/sizeof(char *) + 3));
@@ -1842,6 +1946,12 @@ int main(int argc, char *argv[])
   set_default_options();
   read_compile_options(argc, argv);
 
+#ifdef FOR_ACORN
+  if (!(driver_flags & KEY_CFRONTPREPROCESS))
+      /* IDJ: 06-Jun-94: banner if not -c++ */
+      cc_msg_lookup(driver_banner);
+#endif
+
   validate_flags();
   if (driver_flags & KEY_HELP)
   {   give_help(progname);
@@ -1853,9 +1963,9 @@ int main(int argc, char *argv[])
   if (is_cpp)
   {   if (cc_filc >= 2)
       {   if (cc_filc > 2)
-              cc_msg("More than 2 file arguments to cpp ignored\n");
+              cc_msg_lookup(driver_cpp_toomanyfileargs);
           if (freopen((*cc_filv)[1], "w", stdout) == NULL)
-          {   cc_msg("Can't open output file %s\n", (*cc_filv)[1]);
+          {   cc_msg_lookup(driver_cpp_cantopenoutput, (*cc_filv)[1]);
               exit(EXIT_error);
           }
           cc_filc = 1;
@@ -1865,21 +1975,15 @@ int main(int argc, char *argv[])
   if (cc_filc > 0)
   {
       if (driver_flags & KEY_STDIN)
-          cc_msg("stdin ('-') combined with other files -- ignored\n");
+          cc_msg_lookup(driver_stdin_otherfiles);
       process_file_names(cc_filc, *cc_filv);
   }
-  else if (is_cpp ||
-           ((driver_flags & KEY_STDIN)
-#ifdef DEFAULT_STDIN_OBJECT
-            && ((driver_flags & (KEY_PREPROCESS|KEY_MAKEFILE|KEY_ASM_OUT))
-                || setupenv.output_file != NULL)
-#endif
-          ))
-  {   char *output_file = "-";
+  else if (is_cpp || (driver_flags & KEY_STDIN))
+  {   char *output_file = setupenv.output_file == default_output ? NULL :
+                                                   setupenv.output_file;
 /* was: output_file = setupenv.output_file; but writes asm to a.out     */
 /* we need to separate the differing uses of "output_file".             */
 #ifdef DEFAULT_STDIN_OBJECT
-      output_file = setupenv.output_file;
       if (!(driver_flags & (KEY_PREPROCESS|KEY_MAKEFILE|KEY_ASM_OUT)) &&
           setupenv.output_file == NULL)
           output_file = DEFAULT_STDIN_OBJECT;
@@ -1898,11 +2002,24 @@ int main(int argc, char *argv[])
           cc_msg("]\n");
       }
       (*cc_argv)[cc_argc] = NULL;
-      if (ccom(cc_argc, *cc_argv)) ++main_error_count;
+      if (ccom(cc_argc, *cc_argv))
+      {  ++main_error_count;
+         if (output_file != NULL)
+#ifdef COMPILING_ON_RISC_OS
+/* The next line is dirty and should be done by checking return code,   */
+/* not peeking at other's variables.                                    */
+            if (errorcount)  /* only delete o/p file if serious errors */
+#endif
+            remove(output_file);
+      }
   }
-  else cc_msg("Warning: %s command with no effect\n", progname);
+  else cc_msg_lookup(driver_noeffect, progname);
 
 #ifndef HOST_CANNOT_INVOKE_LINKER
+#  ifdef LINKER_IS_SUBPROGRAM
+/* IJR: hack to ensure that path gets passed to linker in argv[0] for NLS */
+  setupenv.link_cmd = argv[0];
+#  endif
   if ((main_error_count == 0) && (driver_flags & KEY_LINK) && (ld_filc > 0))
       linker(driver_flags);
 #endif

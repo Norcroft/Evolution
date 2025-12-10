@@ -5,9 +5,9 @@
  */
 
 /*
- * RCS $Revision: 1.20 $
- * Checkin $Date: 93/10/07 17:27:02 $
- * Revising $Author: irickard $
+ * RCS $Revision: 1.28 $
+ * Checkin $Date: 1996/01/05 16:24:19 $
+ * Revising $Author: hmeeking $
  */
 
 #ifndef _cseguts_h
@@ -64,6 +64,7 @@ struct Exprn {
     int32  op;                  /* a jopcode */
     int32  nodeid;      /* nodeno<<5 | alias | type, see mknodeid_().   */
     ExprnUse *uses;
+    VRegSetP leaves;    /* set of Locations on which this Exprn depends */
     union {
         struct {
             bool waslive;
@@ -76,8 +77,14 @@ struct Exprn {
             Exprn *e1;
         } unary;
         struct {
-            int32  m;           /* immediate const (or binder for ADCON) */
+            IPtr  m;            /* immediate const (or binder for ADCON) */
         } unaryk;
+        struct {
+            Binder *b;          /* see unaryk */
+        } unarykb;
+        struct {
+            FloatCon *f;        /* ADCONF/D, MOVF/DK */
+        } unarykf;
         struct {                /* load or store some location */
             Location *loc;
         } loc;
@@ -110,7 +117,8 @@ struct Exprn {
 #define exalias_(e) ((e)->nodeid & EX_ALIAS)
 #define e1_(e) ((e)->u.binary.e1)
 #define e1k_(e) ((e)->u.unaryk.m)
-#define e1b_(e) ((Binder *)(e)->u.unaryk.m)
+#define e1b_(e) ((e)->u.unarykb.b)
+#define e1f_(e) ((e)->u.unarykf.f)
 #define e2_(e) ((e)->u.binary.e2)
 #define e2k_(e) ((e)->u.binaryk.m)
 #define exloc_(e) ((e)->u.loc.loc)
@@ -128,7 +136,7 @@ struct Exprn {
 #define exnewid_(e) ((e)->v.newid)
 #define exuses_(e) ((e)->uses)
 #define exop_(e) ((e)->op)
-
+#define exleaves_(e) ((e)->leaves)
 
 #define is_call2(ex) ((exop_(ex) == J_CALLK || exop_(ex) == J_OPSYSK) && \
                       exnres_(ex) == 2)
@@ -152,22 +160,25 @@ struct Location {
     VRegSetP users;   /* the set of Exprns killed if this location is   */
                       /* stored into (those with this as a leaf).       */
     VRegSetP aliasusers; /* union over possible aliases of alias->users */
+                         /* (includes this->users)                      */
     Exprn *load;      /* the Exprn which is a load from this location.
                        * (A plain load if the location is narrow)
                        */
+    Location *synonym;
     union {
         struct {
             Binder *binder;
-            char   Location_pad;
+            LocType type;
         } var;
         struct {
-            int32  offset;
+            VRegnum regno;
+        } reg;
+        struct {
+            int32 offset;
             Exprn  *base;
         } mem;
     } u;
 };
-
-#define SizeOfLocVar offsetof(Location, u.var.Location_pad)
 
 #define mkidandtype_(id, type) ((id) << 6 | (type))
 #define locvalue_(p) ((p)->curvalue)
@@ -176,8 +187,10 @@ struct Location {
 #define locid_(p)   ((p)->idandtype >> 6)
 #define locreg_(p)  ((p)->u.reg.regno)
 #define locbind_(p) ((p)->u.var.binder)
+#define locvartype_(p) ((p)->u.var.type)
 #define locbase_(p) ((p)->u.mem.base)
 #define locoff_(p)  ((p)->u.mem.offset)
+#define locsynonym_(p) ((p)->synonym)
 #define ispublic(p) (loctype_(p) != LOC_VAR)            /* odd name? */
 
 typedef struct CSEDef CSEDef;
@@ -224,6 +237,7 @@ extern Exprn **exprnindex[EXPRNINDEXSIZE];
 
 #define CSEAlloc SynAlloc
 #define CSEAllocType AT_Syn
+#define CSEList4 syn_list4
 #define CSEList3 syn_list3
 #define CSEList2 syn_list2
 
@@ -259,7 +273,10 @@ extern void cse_print_node(Exprn *p);
 
 extern void cse_printexits(int32 flags, LabelNumber *exit, LabelNumber *exit1);
 
+#if 0
+/* In retirement pending removal: see definition */
 extern Icode *trytokillargs(Icode *p, Icode *blockstart, bool nextinblock);
+#endif
 
 extern bool addlocalcse(Exprn *node, int valno, BlockHead *b);
 /* A use of node has occurred, with a previous evaluation in the same

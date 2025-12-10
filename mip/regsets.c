@@ -4,9 +4,9 @@
  */
 
 /*
- * RCS $Revision: 1.5 $
- * Checkin $Date: 93/05/27 18:11:52 $
- * Revising $Author: hmeekings $
+ * RCS $Revision: 1.9 $
+ * Checkin $Date: 1995/09/13 19:45:36 $
+ * Revising $Author: amycroft $
  */
 
 /* Memo: @@@ someone misunderstands either the use of unsigned32 or     */
@@ -26,33 +26,29 @@
 #include "store.h"
 
 
-/* RegList operations */
+/* Some generic list operations which should be elsewhere (e.g. with   */
+/* nconc.                                                              */
 
-RegList *rldiscard(RegList *x)
-{   return (RegList *)discard2((List *)x);
-}
-
-bool member(VRegnum a, RegList *l)
+bool generic_member(IPtr a, List *l)
 {
-    for (; l != NULL; l = l->rlcdr)
-        if (a == l->rlcar) return YES;
+    for (; l != NULL; l = l->cdr)
+        if (a == l->car) return YES;
     return NO;
 }
 
-RegList *ndelete(VRegnum a, RegList *l)
+List *generic_ndelete(IPtr a, List *l)
 {
-/* delete a from the list l (destructive operation) */
-    RegList *r = l, *s;
+    List *r = l, *s;
     if (l == NULL)
         return l;
-    else if (l->rlcar == a)
-        return rldiscard(l);
+    else if (l->car == a)
+        return (List *)discard2(l);
     do
     {   s = l;
-        l = l->rlcdr;
+        l = l->cdr;
         if (l == NULL) return r;
-    } while (l->rlcar != a);
-    s->rlcdr = rldiscard(l);
+    } while (l->car != a);
+    s->cdr = (List *)discard2(l);
     return r;
 }
 
@@ -85,19 +81,20 @@ typedef unsigned char BitmapChunk;
 
 typedef struct VRegSet {
     struct VRegSet *next;
-    unsigned32 rangeid;
+    UPtr rangeid;       /* for 'newchunk' allocator, else unsigned32.   */
     union {
-       unsigned32 bitword;
+       UPtr bitword;
        BitmapChunk bits[RANGESIZE/BITSPERCHUNK];
     } bits;
 } VRegSet;
 
-static VRegSet *newchunk(VRegSetAllocRec *allocrec, VRegSet *next, int32 id, int32 n)
+static VRegSet *newchunk(VRegSetAllocRec *allocrec, VRegSet *next, int32 id,
+                         unsigned32 n)
 {
     AllocType type = allocrec->alloctype;
     (*allocrec->statsloc)++;
     return (VRegSet*) (
-           (type == AT_Syn) ?  syn_list3((int32) next, id, n) :
+           (type == AT_Syn) ?  syn_list3(next, id, n) :
            (type == AT_Bind) ? binder_list3(next, id, n) :
                                global_list3(SU_Other, next, id, n));
 }
@@ -119,19 +116,20 @@ extern VRegSet *vregset_insert(int32 regno, VRegSet *set, bool *oldp,
             prev->next = q;
         p = q;
     }
-    if (oldp) *oldp = bitmapchunk(p->bits.bits, regno) & bitmapbit(regno);
+    if (oldp)
+        *oldp = (bitmapchunk(p->bits.bits, regno) & bitmapbit(regno)) != 0;
     bitmapchunk(p->bits.bits, regno) |= bitmapbit(regno);
     return set;
 }
 
-extern int vregset_member(int32 regno, VRegSet *set)
+extern bool vregset_member(int32 regno, VRegSet *set)
 {   VRegSet  *p;
     unsigned32 range = ((unsigned32)regno) / RANGESIZE;
     regno &= (RANGESIZE-1);
     for (p = set; p != NULL; p = p->next) {
         if (p->rangeid <= range) { /* may have it */
             if (p->rangeid < range) return NO;
-            return(bitmapchunk(p->bits.bits, regno) & bitmapbit(regno));
+            return (bitmapchunk(p->bits.bits, regno) & bitmapbit(regno)) != 0;
         }
     }
     return NO;
@@ -145,7 +143,8 @@ extern VRegSet *vregset_delete(int32 regno, VRegSet *set, bool *oldp)
     for (p = set; p != NULL; prev = p, p = p->next)
         if (p->rangeid <= range) { /* may have it */
             if (p->rangeid < range) return set;
-            if (oldp) *oldp = bitmapchunk(p->bits.bits, regno) & bitmapbit(regno);
+            if (oldp) *oldp = (bitmapchunk(p->bits.bits, regno) &
+                               bitmapbit(regno)) != 0;
             bitmapchunk(p->bits.bits, regno) &= ~bitmapbit(regno);
             if (p->bits.bitword == 0) {
                 VRegSet *next = (VRegSet *) discard3((VoidStar) p);
@@ -208,7 +207,7 @@ extern void vregset_discard(VRegSet *set)
 
 extern int vregset_compare(VRegSetP s1, VRegSetP s2)
 {
-    bool res = VR_EQUAL;
+    int res = VR_EQUAL;
     while (s1 != NULL && s2 != NULL) {
         int32 r1 = s1->rangeid,
               r2 = s2->rangeid;
@@ -448,7 +447,7 @@ extern bool relation_add(int32 a, int32 b, Relation matrix,
         p->next     = master->list;
         p->blockid  = ((int32)blockno(a)) | (((int32)other) << 16);
         p->weaknext = matrix[other].weaklist;
-        memclr((void *)p->bitmap, sizeof(p->bitmap));
+        memclr(p->bitmap, sizeof(p->bitmap));
         master->list = p;
         matrix[other].weaklist = p;
     }

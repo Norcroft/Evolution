@@ -6,9 +6,9 @@
  */
 
 /*
- * RCS $Revision: 1.23 $ Codemist 167
- * Checkin $Date: 93/09/29 14:51:23 $
- * Revising $Author: lsmith $
+ * RCS $Revision: 1.61 $ Codemist 167
+ * Checkin $Date: 1995/11/05 22:02:12 $
+ * Revising $Author: sdouglas $
  */
 
 /* AM, july 90: fix pp recursion problem in macro args.                 */
@@ -79,18 +79,13 @@ extern void free();
 #endif
 #include "globals.h"
 #include "pp.h"
+#include "lex.h"
 #include "syn.h"
 #include "store.h"
 #include "errors.h"
-#include "mcdep.h"              /* for asm_listeof(), asm_codesegname */
+#include "mcdep.h"
 
 #ifndef NO_INSTORE_FILES
-
-typedef struct {            /* /* this typedef should be in headers.c now  */
-    char *name;
-    int content;
-} header_files;
-
 #include "headers.c"        /* Tables for in-store headers */
 #endif
 
@@ -175,11 +170,13 @@ static char pp_ctype[UCHAR_MAX+1];
 #define PP_ARGLINES_WARN_VAL  10        /* warn after 10 lines of arguments */
 
 #ifdef COMPILING_ON_MAC
-#  define isdigit(c) (isascii(c) && (isdigit)(c))
-#  define isalpha(c) (isascii(c) && (isalpha)(c))
-#  define isalnum(c) (isascii(c) && (isalnum)(c))
-#  define isspace(c) (isascii(c) && (isspace)(c))
-#  define isprint(c) (isascii(c) && (isprint)(c))
+/* some Mac compilers admit that some high-bit set chars are printable */
+/* and some others don't define isprint, etc. above 0x7f (which is non-ANSI) */
+#  define isdigit(c) ((c & ~0x7f) == 0 && (isdigit)(c))
+#  define isalpha(c) ((c & ~0x7f) == 0 && (isalpha)(c))
+#  define isalnum(c) ((c & ~0x7f) == 0 && (isalnum)(c))
+#  define isspace(c) ((c & ~0x7f) == 0 && (isspace)(c))
+#  define isprint(c) ((c & ~0x7f) == 0 && (isprint)(c))
 #endif
 
 /*
@@ -227,6 +224,7 @@ typedef struct hashentry {
 #define PP_NOARGHASHENTRY  offsetof(PP_HASHENTRY,arglist)
   struct arglist *arglist;     /* only if noargs==0   */
 } PP_HASHENTRY;
+typedef PP_HASHENTRY *(PP_HASHTABLE[PP_HASHSIZE]);
 
 #define pp_hashname_(p) ((p)->name)
 #define pp_hasharglist_(p) ((p)->arglist)
@@ -262,43 +260,38 @@ typedef struct ifstack {
 #define pp_ifoldskip_(p)  ((p)->oldskip)
 #define pp_ifskipelse_(p) ((p)->skipelse)
 
-typedef struct file_name_list
-{
-    struct file_name_list *cdr;
-    unsigned count;
-    bool nomore;
-    char fname[1];  /* typically rather longer than 1 byte */
-} file_name_list;
-
-static file_name_list *this_file_name, *seen_before;
-
 typedef struct filestack {
   struct filestack *chain;
   FILE *stream;
   FileLine fl;
-  file_name_list *fnl;
 #ifndef NO_LISTING_OUTPUT
   int32 propoint;
   int32 filenumber;
 #endif
+  PP_IFSTACK *ifstart;
+  char *ifdefname;        /* name of macro guarding this #include (if any) */
+  PP_IFSTACK *guard_ifndef;
 } PP_FILESTACK;
 
 #define pp_filchain_(p)   ((p)->chain)
 #define pp_filstream_(p)  ((p)->stream)
 #define pp_fileline_(p)   ((p)->fl)
-#define pp_filefnl_(p)    ((p)->fnl)
 #define pp_propoint_(p)   ((p)->propoint)
 #define pp_filenumber_(p) ((p)->filenumber)
 
-int pp_inhashif;                /* 3-valued: see cfe/pp.h               */
+int pp_inhashif;              /*/*should this really belong to syn_hashif? */
 
-static PP_HASHENTRY *((*pp_hashtable)[PP_HASHSIZE]), *pp_noexpand,
+static PP_HASHTABLE *pp_hashtable;
+static PP_HASHENTRY *pp_noexpand,
              *pp_hashfirst, *pp_hashlast, *pp_hashone, *pp_hashzero;
 static PP_IFSTACK *pp_ifstack, *pp_freeifstack;
 static PP_FILESTACK *pp_filestack, *pp_freefilestack;
 
 static int32 pp_nsubsts;
 static bool pp_skipping, pp_instring;
+typedef enum { NO_COMMENT, BALANCED_COMMENT, EOL_COMMENT } PP_CommentKind;
+static PP_CommentKind pp_incomment = NO_COMMENT;
+static bool seen_pp_token;
 
 static FILE *pp_cis;
 static FileLine *pp_fl;
@@ -339,7 +332,7 @@ static int32 pp_filenumber;    /* profile_files index ( < profile_nfiles)  */
 
 static int Exec_Rec_Compare(ConstVoidStar a, ConstVoidStar b)
 {
-    XCount *aa = (XCount *)a, *bb = (XCount *)b;
+    const XCount *aa = (const XCount *)a, *bb = (const XCount *)b;
     int32 k = (int32)aa->filename - (int32)bb->filename;
     if (k == 0) k = (int32)aa->line - (int32)bb->line;
 /* The following line ensures that I return an int value that makes sense  */
@@ -394,7 +387,7 @@ bool map_init(FILE *mapstream)
 static void listing_nextline(int32 ll)
 {   int32 line = ll + 1;
     int pos = 0;
-    while ((int32)profile_data[profile_ptr].line < line &&
+    while (profile_data[profile_ptr].line < line &&
            profile_data[profile_ptr].filename == pp_filenumber &&
            profile_ptr < profile_count)
         profile_ptr++;
@@ -430,32 +423,12 @@ static void profile_find(char *fname)
 #define PP_DBUFSIZ         1024L    /* default chunk for definitions */
 #define PP_ABUFINITSIZ      512L
 #define PP_EBUFINITSIZ      256L
-#define PP_CBUFINITSIZ     1024L
 
-#ifdef TARGET_KEEP_COMMENT
-static char *pp_cbufbase, *pp_cbufptr, *pp_cbufend;
-
-static void pp_stuffcom(int ch)
-{   if (pp_filestack) return;           /* skip #included comments      */
-    while (pp_cbufptr >= pp_cbufend)
-    {   int32 k = pp_cbufend - pp_cbufbase;
-        char *d = (char *)pp_alloc(2*k);
-        if (debugging(DEBUG_PP))
-            cc_msg("up pp_cbuf to %ld\n", (long)(2*k));
-        memcpy(d, pp_cbufbase, (size_t)k);
-        pp_cbufend = d + 2*k;
-        pp_cbufptr = d + (pp_cbufptr - pp_cbufbase);
-        pp_cbufbase = d;
-    }
-    *pp_cbufptr++ = ch;
-}
-#else
-#define pp_stuffcom(ch) ((void)0)
-#endif
+#define pp_new_(type)      (pp_alloc(type))
 
 static char *pp_dbufend, *pp_dbufseg, *pp_dbufptr;
 #define pp_stuffid_(ch) \
-    (void)(pp_dbufptr==pp_dbufend ? pp_newdbuf(ch) : (*pp_dbufptr++ = (ch)))
+    (pp_dbufptr==pp_dbufend ? pp_newdbuf(ch) : (*pp_dbufptr++ = (ch)))
 
 static int pp_newdbuf(int x)
 { char *dbufbase;
@@ -466,8 +439,10 @@ static int pp_newdbuf(int x)
   if (size > allocsize)
      syserr(syserr_newdbuf, (long)size, (long)allocsize);
   dbufbase = (char *)pp_alloc(allocsize);
+#ifdef ENABLE_PP                /* spurious: deadcode elimination fixes */
   if (debugging(DEBUG_PP))
       cc_msg("new pp_dbuf(%ld)\n", (long)allocsize);
+#endif
   if (size != 0) memcpy(dbufbase, pp_dbufseg, (size_t)size);
   pp_dbufseg = dbufbase;
   pp_dbufptr = dbufbase+size;
@@ -491,8 +466,10 @@ static void pp_abuf_ensure(int32 n)
 {   while (pp_abufptr + n >= pp_abufend)
     {   int32 k = pp_abufend - pp_abufbase;
         char *d = (char *)pp_alloc(2*k);
+#ifdef ENABLE_PP                /* spurious: deadcode elimination fixes */
         if (debugging(DEBUG_PP))
             cc_msg("up pp_abuf to %ld\n", (long)(2*k));
+#endif
         memcpy(d, pp_abufbase, (size_t)k);
         pp_abufend = d + 2*k;
         pp_abufptr = d + (pp_abufptr - pp_abufbase);
@@ -515,8 +492,10 @@ static void pp_ebuf_ensure(int32 n)
 {   while (pp_ebuftop + n >= pp_ebufend)
     {   int32 k = pp_ebufend - pp_ebufbase;
         char *d = (char *)pp_alloc(2*k);
+#ifdef ENABLE_PP                /* spurious: deadcode elimination fixes */
         if (debugging(DEBUG_PP))
             cc_msg("up pp_ebuf to %ld\n", (long)(2*k));
+#endif
         memcpy(d, pp_ebufbase, (size_t)k);
         pp_ebufend = d + 2*k;
         pp_ebuftop = d + (pp_ebuftop - pp_ebufbase);
@@ -536,7 +515,7 @@ static void pp_savbuf(void *buf, int32 len)
 }
 
 #ifdef ENABLE_PP
-static void pp_showsleep()
+static void pp_showsleep(void)
 {   PP_HASHENTRY *p;
     for (p = pp_noexpand; p != 0; p = pp_unchain_(p))
         fprintf(stderr, "<sleeping %s %ld>", pp_hashname_(p), pp_sleepleft_(p));
@@ -560,7 +539,7 @@ static void pp_subsleep(int32 n)
     }
 }
 
-static void pp_awaken_all()
+static void pp_awaken_all(void)
 {   /* Maybe this should be a syserr() one day if pp_noexpand != 0.     */
     while (pp_noexpand)
     {   PP_HASHENTRY *p = pp_noexpand;
@@ -592,20 +571,19 @@ static bool string_file_active = NO;
 
 static struct pp_uncompression_record
 {
-    char *pointer;              /* /* some of these should be unsigned */
+    const unsigned char *pointer;
     char compressed;
     unsigned char height;
-    char stack[HDRSTACKDEPTH];
+    unsigned char stack[HDRSTACKDEPTH];
 } hdrfile;
 
-static int pp_fetch_string_char()
+static int pp_fetch_string_char(void)
 {
     int c, k;
     if (hdrfile.height == 0) c = *hdrfile.pointer++;
     else c = hdrfile.stack[--hdrfile.height];
     for (;;)
-    {   c &= 0xff;
-        k = compression_info[c];
+    {   k = compression_info[c];
         if (k == c || hdrfile.compressed == 0) return c;
 /*
  * When genhdrs is establishes the greatest possible depth needed in
@@ -666,43 +644,13 @@ static int   pp_rdch1nls,                  /* count of \<NL>s outstanding */
              pp_rdch3nls;            /* count of <NL>s in current comment */
 static bool  pp_in_directive;        /* pend pp_rdch3nls after '#'.       */
 
-#ifdef TARGET_IS_XAP
-/* encodes an 'occurrence number' AFTER the filename string.              */
-static char *xap_filename(char *p, unsigned n)
-{   char a[20];
-    size_t ps = strlen(p)+1;
-    char *q;
-    sprintf(a, "%u", n);
-    q = (char *)pp_alloc((size_t)(ps + strlen(a) + 1));
-    strcpy(q, p);
-    strcpy(q+ps, a);
-    return q;
-}
-#else
-#define xap_filename(x,n) (x)
-#endif
-
-static void init_pp_fl(char *fname)
-{   file_name_list *p1 = seen_before;
-    while (p1 != NULL)
-    {   if (strcmp(p1->fname, fname) == 0) break;
-        else p1 = p1->cdr;
-    }
-    if (p1 == NULL)
-    {   p1 = (file_name_list *)pp_alloc(
-          (int32)offsetof(file_name_list,fname) + strlen(fname) + 1);
-        p1->cdr = seen_before;
-        p1->nomore = 0;
-        p1->count = 0;
-        strcpy(p1->fname, fname);
-        seen_before = p1;
-    }
-    p1->count++;
-    this_file_name = p1;
-    pp_fl->f = xap_filename(fname, this_file_name->count);
+static void init_pp_fl(char *filename)
+{   pp_fl->f = filename;
     pp_fl->l = 1;
     pp_fl->column = 1;
     pp_fl->filepos = 0;
+    /* ### morally right here ? */
+    pp_fl->p = 0;
     pp_rdcnt = 0;
     pp_rdptr = NULL;
 }
@@ -711,6 +659,10 @@ static void init_pp_fl(char *fname)
 /* part thereof, pp_rdcnt is the number of chars left in the buffer and   */
 /* the first character of the buffer (or EOF) is returned (we do this     */
 /* because EOF cannot be stored as a character).                          */
+
+#ifdef TARGET_IS_INTERPRETER
+extern char *expr_string;
+#endif
 
 static int pp_fillbuf(void)
 {   int32 n;
@@ -740,6 +692,13 @@ static int pp_fillbuf(void)
     }
     else
 #endif
+#ifdef TARGET_IS_INTERPRETER
+    if (expr_string) {
+        strncpy(s, expr_string, sizeof(pp_linebuf));
+        n = strlen(s);
+        expr_string += n;
+    } else
+#endif
 /* Reading from a real file. Here, pp_rdcnt == 0 OR pp_rdcnt == 1 and   */
 /* the last character in the buffer should be saved before reading more */
 /* (it's either '\' or '?'). Any other value of pp_rdcnt is ignored.    */
@@ -759,6 +718,7 @@ static int pp_fillbuf(void)
 #endif
                 n >= sizeof(pp_linebuf)) break;
         }
+        if (ferror(cis)) cc_fatalerr("Host file system read error\n");
         if (n == 0)                                      /* end of file */
         {   if (pp_rdptr != NULL && pp_rdptr[-1] != '\n')
             {
@@ -861,7 +821,8 @@ case '-':   ch = '~';   break;
         pp_rdcnt = n - 2;
         pp_rdptr = s + 2;
         pp_fl->column += 2;
-        cc_warn(pp_warn_triglyph,(int)'?', (int)'?', (int)s[1], (int)ch);
+        if (pp_incomment == NO_COMMENT)
+          cc_warn(pp_warn_triglyph,(int)'?', (int)'?', (int)s[1], (int)ch);
         if (ch != '\\') return ch;
         /* else ch == '\\' so drop through in case next char is '\n' */
     }
@@ -874,6 +835,8 @@ case '-':   ch = '~';   break;
             if (n == 0) return '\\';
         }
         if (pp_rdptr[0] != '\n') return '\\';
+        if (pp_incomment == EOL_COMMENT)
+          cc_warn(pp_warn_continued_comment);
         ++pp_rdptr;
         pp_rdcnt = n - 1;
         ++pp_rdch1nls;
@@ -884,8 +847,12 @@ case '-':   ch = '~';   break;
     /* Otherwise, this function never gets called in -pcc mode (see pp_init */
     /* and how it sets pp_translate[] for an explanation).                  */
     if (!(feature & FEATURE_PCC))
-    {   cc_rerr(pp_rerr_nonprint_char, ch);
-        return PP_EOF;
+    {
+        if (pp_incomment != NO_COMMENT) cc_warn(pp_rerr_nonprint_char, ch);
+        else
+        {   cc_rerr(pp_rerr_nonprint_char, ch);
+            return PP_EOF;
+        }
     }
     return ch;
 }
@@ -923,14 +890,10 @@ static int pp_comment(int ch)
         if (ch != '{') putc(COMMENT_START, stdout);
         putc(ch, stdout);
     }
-    if (ch != '{') pp_stuffcom(COMMENT_START);
-    pp_stuffcom(ch);
+    pp_incomment = BALANCED_COMMENT;
     ch = pp_rdch1();
     for (;;)
-    {   if (ch != PP_EOF)
-        {   if (feature & FEATURE_PPCOMMENT) putc(ch, stdout);
-            pp_stuffcom(ch);
-        }
+    {   if (ch != PP_EOF && feature & FEATURE_PPCOMMENT) putc(ch, stdout);
         switch (ch)
         {   case PP_EOF: cc_err(pp_err_eof_comment); return PP_EOF;
             case '\n':
@@ -948,7 +911,6 @@ static int pp_comment(int ch)
                     --comment_nest;
                     if (comment_nest == 0) {
                         if (feature & FEATURE_PPCOMMENT) putc(ch, stdout);
-                        pp_stuffcom(ch);
                         return ' ';
                     }
                 }
@@ -968,8 +930,6 @@ static int pp_comment(int ch)
                 if (comment_nest == 0)
                 {
                     if (feature & FEATURE_PPCOMMENT) putc(ch, stdout);
-                    pp_stuffcom(ch);
-                    pp_stuffcom('\n');
                     if (feature & (FEATURE_PCC | FEATURE_PPCOMMENT))
                         return PP_TOKSEP;      /* comments vanish but have */
                     else                       /* separating value...      */
@@ -979,6 +939,7 @@ static int pp_comment(int ch)
         }
         ch = pp_rdch1();
     }
+    pp_incomment = NO_COMMENT;
 }
 
 /*
@@ -1056,18 +1017,29 @@ static int pp_rdch(void)
     if (ch != '{')
 #endif
     {   ch = pp_rdch1();
-#ifndef CPLUSPLUS
-        if (!(feature & FEATURE_FUSSY))
-#endif
-        if (ch == '/')
-        {   for (;;) if ((ch = pp_rdch1()) == '\n' || ch == PP_EOF) return ch;
-        }
-        if (ch != '*')             /* unget ch... */
-        {   ++pp_rdcnt;            /* which is    */
-            --pp_rdptr;            /* always safe */
-            --pp_fl->column;
-            return COMMENT_START;
-        }
+        if (LanguageIsCPlusPlus || !(feature & FEATURE_FUSSY))
+            if (ch == '/')
+            {   pp_incomment = EOL_COMMENT;
+                if (feature & FEATURE_PPCOMMENT)
+                { putc('/', stdout); putc(ch, stdout); }
+                for (;;)
+                    {   if ((ch = pp_rdch1()) == '\n' || ch == PP_EOF)
+                        {   pp_incomment = NO_COMMENT;
+                            if ((feature & FEATURE_PPCOMMENT) && ch == '\n')
+                                putc(ch, stdout);
+                            return ch;
+                        }
+                        else if (feature & FEATURE_PPCOMMENT) putc(ch, stdout);
+                    }
+            }
+            if (ch != '*')             /* unget ch... */
+            {   ++pp_rdcnt;            /* which is    */
+                --pp_rdptr;            /* always safe */
+                --pp_fl->column;
+                if (ch == '\n')
+                    --pp_fl->l; /* pp_fl->column is zero but not for long */
+                return COMMENT_START;
+            }
     }
     return pp_comment(ch);
 }
@@ -1388,15 +1360,16 @@ static void pp_expand(PP_HASHENTRY *p, int32 nlsinargs)
   while ((dch = *dp) != 0) switch (dch)
   {
     case '#':
-        if (feature & FEATURE_PCC)
-        { /* no '#' operators in pcc-mode macro-expansion... */
-            pp_savch(*dp++);
-        } else
-        {   /* consider cases like f(a,b) == a ## # b.       */
-            ++dp;
-            if (*dp == '#') {hashflag |= 2; ++dp;} else hashflag |= 1;
-            while (*dp == ' ') dp++;    /* whitespace ANSI normalised.  */
-        }
+        if ((feature & FEATURE_PCC) ||
+            (pp_hashnoargs_(p) && dp[1] != '#'))
+            goto defaultcase;
+        /* no '#' operators in pcc-mode macro-expansion... */
+        /* or inside non-function macros */
+
+        /* consider cases like f(a,b) == a ## # b.       */
+        ++dp;
+        if (*dp == '#') {hashflag |= 2; ++dp;} else hashflag |= 1;
+        while (*dp == ' ') dp++;    /* whitespace ANSI normalised.  */
         break;
     case '\'':
     case '"':
@@ -1410,6 +1383,7 @@ static void pp_expand(PP_HASHENTRY *p, int32 nlsinargs)
         else if (in_string == 0)
             in_string = dch;
         /* if in pcc mode then fall through to default case */
+    defaultcase:
     default:
         if (pp_macstart(dch))
         { int32 i = 0;
@@ -1429,7 +1403,7 @@ static void pp_expand(PP_HASHENTRY *p, int32 nlsinargs)
           { /* an arg 'a' to include/expand */
             int32 ap = pp_argactual_(a);
             if (in_string)
-            {   cc_warn("argument %s of macro %s expanded in %c...%c",
+            {   cc_warn(pp_warn_macro_arg_exp_in_string,
                     pp_argname_(a), pp_hashname_(p), in_string, in_string);
             }
             if (hashflag == 0 && !(feature & FEATURE_PCC))
@@ -1518,11 +1492,22 @@ static PP_HASHENTRY *pp_lookup(char *name, int32 hash)
     return p;
 }
 
+static PP_HASHENTRY *pp_lookup_name(char *name)
+{   int32 i = 0, hash = 0;
+    for (;;)
+    {   int ch = name[i];
+        if (!pp_cidchar(ch)) break;
+        if (i < PP_DEFLEN) hash = HASH(hash, ch);
+        ++i;
+    }
+    return pp_lookup(name, hash);
+}
+
 /* The following routines are just used by pp_checkid:                  */
-static void pp_arg_align()
+static void pp_arg_align(void)
 {
-  while ((int32)pp_abufptr & (sizeof(int32)-1)) pp_wrch(0);
-  pp_abufptr += sizeof(int32);
+  while ((IPtr)pp_abufptr & (sizeof(IPtr)-1)) pp_wrch(0);
+  pp_abufptr += sizeof(int32);      /* IPtr? */
 }
 
 static void pp_arg_link(PP_ARGENTRY *a, int32 arg)
@@ -1554,10 +1539,12 @@ static void pp_rd_args(PP_HASHENTRY *p, int32 uselinect)
   int32 parcnt = 0, arglinect = 0;
   int32 abufarg;   /* now offset into pp_abufbase */
   int ch;
+  int lastch = 0;
   pp_arg_align();
   abufarg = pp_abufptr - pp_abufbase;
   for (ch = pp_rdch();;)           /* read args */
-  { switch (ch)
+  { int thisch = ch;
+    switch (ch)
     { case PP_EOM: /* e.g. i(f) where i(x)=x and f=i(.                  */
                 /* maybe the following line should pp_unrdch()?         */
                 if (pp_scanidx > 0) pp_scanidx--;
@@ -1565,15 +1552,24 @@ static void pp_rd_args(PP_HASHENTRY *p, int32 uselinect)
                 while (parcnt-- > 0) pp_wrch(')');
                 goto endofargs;
       case '\n': ++arglinect;
+                 if (pp_in_directive && !(feature & FEATURE_PCC))
+/* This helps to force a diagnostic in #if f(1,<nl>2) as required by    */
+/* the ANSI C standard. Constraint: #if ... occupies only one line.     */
+                 {  pp_wrch(ch);
+                    break;
+                 }
                  if (arglinect == PP_ARGLINES_WARN_VAL)
-                    cc_warn(pp_warn_many_arglines, arglinect);
-                                /* drop through - treat nl in arg as space  */
-      case '\t': ch = ' ';      /* drop through - treat tab in arg as space */
+                     cc_warn(pp_warn_many_arglines, arglinect);
+                            /* drop through - treat nl in arg as space  */
+      case '\t': ch = ' ';  /* drop through - treat tab in arg as space */
       case ' ': /* Ignore leading or multiple spaces within an arg.     */
                 /* (Only visible via ansi stringify (#) so PCC mode ok) */
 ansitoksep:     if (pp_abufptr != pp_abufbase+abufarg)
                     pp_spacearg(ch);
                 break;
+      case '#': if (PP_EOLP(lastch))
+                    cc_warn(pp_warn_directive_in_args);
+                /* drop through to default case */
       default:  /* NB: we do not need to use pp_number here.            */
                 if (ch == PP_TOKSEP)
                 {   if (!(feature & FEATURE_PCC)) goto ansitoksep;
@@ -1621,6 +1617,7 @@ ansitoksep:     if (pp_abufptr != pp_abufbase+abufarg)
                 }
                 return;
     }
+    if (thisch == '\n' || ch != ' ') lastch = thisch;
     ch = pp_rdch();
   }
 }
@@ -1718,7 +1715,8 @@ static bool pp_checkid(int pp_ch)
 /* the next pp-token if it is present the draft seems unambiguous.      */
 /* Consider examples like "f(getchar <nl>#whatever <nl> )".             */
 /* Note the related "f(getchar( <nl>#whatever <nl> ))" is undefined.    */
-  while (pp_ch == '\n') whitech = '\n', pp_ch = pp_skipb0();
+  if (!pp_in_directive)
+      while (pp_ch == '\n') whitech = '\n', pp_ch = pp_skipb0();
   if (pp_ch != '(')                /* ANSI says ignore if no '(' present */
   { if (debugging(DEBUG_PP))
         cc_msg("pp_checkid(%s%c/%.2x not '(')\n", pp_abufptr, pp_ch, pp_ch);
@@ -1752,11 +1750,11 @@ static PP_HASHENTRY *pp_predefine2(char *s, int n)
      }
   { char *name = pp_closeid();
     if (ch != '(')
-      p = (PP_HASHENTRY *)pp_alloc(PP_NOARGHASHENTRY), pp_hashnoargs_(p) = 1;
+      p = (PP_HASHENTRY *) pp_new_(PP_NOARGHASHENTRY), pp_hashnoargs_(p) = 1;
     else
     { char *sarg = s;
       int32 params = 0;
-      p = (PP_HASHENTRY *)pp_alloc(sizeof(PP_HASHENTRY));
+      p = (PP_HASHENTRY *) pp_new_(sizeof(PP_HASHENTRY));
       pp_hashnoargs_(p) = 0;
       pp_hasharglist_(p) = 0;
       do
@@ -1798,6 +1796,13 @@ illopt:
   (*pp_hashtable)[hash % PP_HASHSIZE] = p;
   if (pp_hashfirst == 0) pp_hashfirst = pp_hashlast = p;
   else pp_hashdefchain_(pp_hashlast) = p, pp_hashlast = p;
+  if (usrdbg(DBG_PP) && !pp_hashismagic_(p)) {
+    if (pp_hashnoargs_(p))
+      dbg_define(pp_hashname_(p), YES, pp_hashbody_(p), NULL, curlex.fl);
+    else
+      dbg_define(pp_hashname_(p), NO, pp_hashbody_(p),
+                 (dbg_ArgList *)pp_hasharglist_(p), curlex.fl);
+  }
   return p;
 }
 
@@ -1807,7 +1812,7 @@ static PP_ARGENTRY *pp_addtoarglist(char *id, PP_ARGENTRY *a)
     for ((p = a, q = 0);  p != 0;  (q = p, p = pp_argchain_(p)))
         if (strcmp(pp_argname_(p),id) == 0 && !seen)
             seen = 1, cc_rerr(pp_rerr_nonunique_formal, id);
-    p = (PP_ARGENTRY *)pp_alloc(sizeof(PP_ARGENTRY));
+    p = (PP_ARGENTRY *)pp_new_(sizeof(PP_ARGENTRY));
     pp_argchain_(p) = 0;
     pp_argname_(p) = id;
     pp_argactual_(p) = DUFF_OFFSET;
@@ -1844,6 +1849,8 @@ static void pp_skip_linetokens(int pp_ch)
 
 static void pp_define(int pp_ch, bool noifdef)
 { int32 i = 0, hash = 0;
+  FileLine saved_fl;
+  if (usrdbg(DBG_PP)) { saved_fl = *pp_fl; saved_fl.p = dbg_notefileline(saved_fl); }
   if (!pp_macstart(pp_ch))
   { cc_err(pp_err_missing_identifier); pp_skip_linetokens(pp_ch); return; }
   if (pp_skipping)
@@ -1867,10 +1874,10 @@ static void pp_define(int pp_ch, bool noifdef)
     int32 feature_comment = feature & FEATURE_PPCOMMENT;
     feature &= ~FEATURE_PPCOMMENT;
     if (pp_ch != '(')
-      p = (PP_HASHENTRY *)pp_alloc(PP_NOARGHASHENTRY), pp_hashnoargs_(p) = 1;
+      p = (PP_HASHENTRY *) pp_new_(PP_NOARGHASHENTRY), pp_hashnoargs_(p) = 1;
     else
     { int32 params = 0;
-      p = (PP_HASHENTRY *)pp_alloc(sizeof(PP_HASHENTRY));
+      p = (PP_HASHENTRY *) pp_new_(sizeof(PP_HASHENTRY));
       pp_hashnoargs_(p) = 0;
       pp_hasharglist_(p) = 0;
       do
@@ -1938,7 +1945,7 @@ static void pp_define(int pp_ch, bool noifdef)
                  pp_ch = pp_rdch();
                  if (pp_ch != '#')
                  { pp_stuffid_('#');
-                   state = SEEN_HASH;
+                   state = pp_hashnoargs_(p) ? NORMAL : SEEN_HASH;
                  }
                  else
                  { if (state == FIRST_TOKEN)
@@ -1956,16 +1963,28 @@ static void pp_define(int pp_ch, bool noifdef)
             pp_hashbody_(p) = pp_closeid();
             { PP_HASHENTRY *q = pp_lookup(pp_hashname_(p), hash);
               if (q)
-              { pp_hashalive_(q) = 0;   /* omit for a #define def. stack */
+              { if (usrdbg(DBG_PP)) dbg_undef(pp_hashname_(q), saved_fl);
+                pp_hashalive_(q) = 0;   /* omit for a #define def. stack */
                 if (pp_hashismagic_(q)  /* union => must be first test   */
                     || strcmp(pp_hashbody_(p), pp_hashbody_(q)) != 0
                     || pp_hashnoargs_(p) != pp_hashnoargs_(q)
                     || (!pp_hashnoargs_(p) &&
                         !pp_eqarglist(pp_hasharglist_(p),pp_hasharglist_(q))))
-                  cc_pccwarn(pp_rerr_redefinition, pp_hashname_(p));
+                {   if (suppress & D_MPWCOMPATIBLE)
+                      cc_warn(pp_rerr_redefinition, pp_hashname_(p));
+                    else
+                      cc_pccwarn(pp_rerr_redefinition, pp_hashname_(p));
+                }
                 else if (feature & (FEATURE_FUSSY|FEATURE_PREDECLARE))
                   cc_warn(pp_warn_redefinition, pp_hashname_(p));
               }
+            }
+            if (usrdbg(DBG_PP))
+            { if (pp_hashnoargs_(p))
+                dbg_define(pp_hashname_(p), YES, pp_hashbody_(p), NULL, saved_fl);
+              else
+                dbg_define(pp_hashname_(p), NO, pp_hashbody_(p),
+                           (dbg_ArgList *)pp_hasharglist_(p), saved_fl);
             }
             pp_hashchain_(p) = (*pp_hashtable)[hash % PP_HASHSIZE];
             (*pp_hashtable)[hash % PP_HASHSIZE] = p;
@@ -1996,20 +2015,31 @@ static void pp_undef(int pp_ch)
   pp_abufbase[i++] = 0;
   if (!pp_skipping)
   { PP_HASHENTRY *p = pp_lookup(pp_abufbase, hash);
-    if (p) pp_hashalive_(p) = 0;
+    if (p) {
+      pp_hashalive_(p) = 0;
+      if (usrdbg(DBG_PP)) {
+        dbg_notefileline(*pp_fl);
+        dbg_undef(pp_hashname_(p), *pp_fl);
+      }
+    }
   }
 }
 
 static void pp_addconditional(bool skipelsepart)
 { PP_IFSTACK *q = pp_freeifstack;
   if (q) pp_freeifstack = pp_ifchain_(q);
-  else q = (PP_IFSTACK *)pp_alloc(sizeof(PP_IFSTACK));
+  else q = (PP_IFSTACK *) pp_new_(sizeof(PP_IFSTACK));
   pp_ifchain_(q) = pp_ifstack;
   pp_ifseenelse_(q) = 0;
   pp_ifoldskip_(q) = pp_skipping;               /* caller pp_skipping */
   pp_ifskipelse_(q) = pp_skipping || skipelsepart;     /* 'else' part */
   pp_ifstack = q;
   pp_skipping = pp_skipping || !skipelsepart;          /* 'then' part */
+}
+
+static char *static_copy(const char *s)
+{
+    return strcpy((char *)pp_alloc(strlen(s)+1L), s);
 }
 
 static void pp_h_ifdef(int pp_ch, bool skipelsepart)
@@ -2028,6 +2058,15 @@ static void pp_h_ifdef(int pp_ch, bool skipelsepart)
       pp_unrdch(pp_ch);
       pp_abufbase[i++] = 0;
       p = pp_lookup(pp_abufbase, hash);
+      if (!skipelsepart &&                  /* #ifndef ...              */
+          !seen_pp_token &&                 /* no tokens before #ifndef */
+          pp_filestack != 0 &&              /* an included file...      */
+          pp_filestack->ifdefname == 0)     /* ifdefname not yet set    */
+      {
+          pp_filestack->ifdefname = static_copy(pp_abufbase);
+          pp_filestack->guard_ifndef = pp_ifstack;
+          seen_pp_token = 1;
+      }
 #ifdef MACH_EXTNS
       if (p != 0 && pp_noifdef_(p))
           cc_warn(pp_warn_ifvaldef, pp_abufbase);
@@ -2046,14 +2085,17 @@ static void pp_h_ifdef(int pp_ch, bool skipelsepart)
 }
 
 static void pp_h_if(int pp_ch)
-{   pp_unrdch(pp_ch);
-    {   bool oskip = pp_skipping, b;
-        pp_inhashif = oskip ? 2:1;  pp_skipping = 0;
-        b = syn_hashif();               /* always read to check syntax  */
-        pp_inhashif = 0;  pp_skipping = oskip;
-        pp_addconditional(b);
-        /* Assert: after syn_hashif(), at end of line or at end of file */
+{   bool b = YES; /* YES/NO is arbitrary */
+    if (pp_skipping)
+        pp_skip_linetokens(pp_ch);
+    else
+    {   pp_unrdch(pp_ch);
+        pp_inhashif = YES;
+        b = syn_hashif();
+        pp_inhashif = NO;
     }
+    pp_addconditional(b);
+    /* Assert: after syn_hashif(), at end of line or at end of file */
 }
 
 static void pp_h_else(int pp_ch)
@@ -2065,22 +2107,26 @@ static void pp_h_else(int pp_ch)
 }
 
 static void pp_h_elif(int pp_ch)
-{   pp_unrdch(pp_ch);
-    if (pp_ifstack == 0 || pp_ifseenelse_(pp_ifstack))
+{   if (pp_ifstack == 0 || pp_ifseenelse_(pp_ifstack))
     {   cc_rerr(pp_rerr_spurious_elif);
         pp_skip_linetokens(pp_ch);
-        return;
     }
+    else if (pp_ifskipelse_(pp_ifstack))
+    {   pp_skipping = YES;
+        pp_skip_linetokens(pp_ch);
+    }
+    else
     {   bool b;
-        pp_inhashif = pp_ifskipelse_(pp_ifstack) ? 2:1;  pp_skipping = 0;
-        b = syn_hashif();               /* always read to check syntax  */
-        pp_inhashif = 0;
+        pp_unrdch(pp_ch);
+        pp_skipping = NO;
+        pp_inhashif = YES;
+        b = syn_hashif();
+        pp_inhashif = NO;
         if (b)
-            pp_skipping = pp_ifskipelse_(pp_ifstack),
-            pp_ifskipelse_(pp_ifstack) = 1;
+            pp_ifskipelse_(pp_ifstack) = YES;
         else
-            pp_skipping = 1;
-        pp_unrdch('\n');                  /* @@@ rather nasty */
+            pp_skipping = YES;
+        /* Assert: after syn_hashif(), at end of line or at end of file */
     }
 }
 
@@ -2092,6 +2138,10 @@ static void pp_h_endif(int pp_ch)
            pp_ifchain_(pp_ifstack) = pp_freeifstack,
            pp_freeifstack = pp_ifstack;
            pp_ifstack = q;
+           if (pp_filestack != NULL && q == pp_filestack->guard_ifndef)
+           { seen_pp_token = 0;          /* reset after matching #endif */
+             pp_filestack->guard_ifndef = (PP_IFSTACK *)DUFF_ADDR;
+           }                             /* inspect (pp_process) at EOF */
          }
        }
   pp_unrdch(pp_ch);
@@ -2116,14 +2166,13 @@ static void pp_h_line(int pp_ch)
 { if (pp_skipping) { pp_skip_linetokens(pp_ch); return; }
   pp_ch = pp_directive_expand(pp_ch);
   if (isdigit(pp_ch))
-  { int32 n = 0;
+  { int n = 0;
     while (isdigit(pp_ch)) n = n*10 + pp_ch-'0', pp_ch = pp_rdch();
-    if (!(1<=n && n<=32767)) cc_warn("#line %ld out of ANSI range", (long)n);
     pp_ch = pp_skipb1(pp_ch);
     pp_ch = pp_directive_expand(pp_ch);
     if (pp_ch == '"')
     { pp_stuffstring('"',1,pp_skipping);
-      pp_fl->f = xap_filename(pp_closeid(), 1);   /* ensure done always */
+      pp_fl->f = pp_closeid();    /* ensure done always */
       pp_ch = pp_directive_expand(pp_skipb0());
     }
     /* Oh dear... this conditional is the price we pay to centralise the */
@@ -2139,6 +2188,53 @@ static void pp_h_line(int pp_ch)
   }
 }
 
+/* Code in flux -- move typedef to top or merge with pp_filestack?      */
+typedef struct file_name_list
+{   struct file_name_list *cdr;
+    char *ifdefname;
+    bool stringfile;
+    char fname[1];
+} file_name_list;
+
+static file_name_list *seen_before = NULL;
+
+static int fnameEQ(char *s, char *t)
+{   int chs, cht;
+    for (;;)
+    {   chs = *s++;
+        cht = *t++;
+#ifndef COMPILING_ON_UNIX
+        /* host file names are case INsensitive... */
+        chs = safe_tolower(chs);
+        cht = safe_tolower(cht);
+#endif
+        if (chs != cht) return 0;
+        if (chs == 0) return 1;
+    }
+}
+
+static void include_only_once(char *fname, char *ifdefname, bool stringfile)
+{   file_name_list *p;
+
+    for (p = seen_before;  p != NULL;  p = p->cdr)
+        if (p->stringfile == stringfile && fnameEQ(p->fname, fname))
+            return;
+
+    p = (file_name_list *)pp_alloc((int32)offsetof(file_name_list, fname) +
+                                   (int32)strlen(fname));
+    p->cdr = seen_before;
+    strcpy(p->fname, fname);
+    p->ifdefname = ifdefname;
+    p->stringfile = stringfile;
+    seen_before = p;
+    if (debugging(DEBUG_FILES))
+    {   if (ifdefname == NULL)
+            cc_msg("include_only_once '%s'\n", fname);
+        else
+            cc_msg("file '%s' guarded by '#ifndef %s'\n", fname, ifdefname);
+    }
+}
+
 void pp_push_include(char *fname, int lquote)
 {
   FILE *fp;
@@ -2151,9 +2247,6 @@ void pp_push_include(char *fname, int lquote)
             "assert.h", "ctype.h", "errno.h", "float.h", "limits.h",
             "locale.h", "math.h", "setjmp.h", "signal.h", "stdarg.h",
             "stddef.h", "stdio.h", "stdlib.h", "string.h", "time.h"
-#ifdef TARGET_IS_XAP
-          , "xap.h"
-#endif
       };
       bool found = 0;
       int i;
@@ -2193,18 +2286,47 @@ void pp_push_include(char *fname, int lquote)
   {
   /* the following block is notionally a recursive call to pp_process()
      but that would mean a co-routine structure if used with the cc. */
-      PP_FILESTACK *fs = pp_freefilestack;
+      PP_FILESTACK *fs;
+      file_name_list *p;
+      for (p = seen_before;  p != NULL;  p = p->cdr)
+      {   if (!fnameEQ(p->fname, hostname)) continue;
+          if (p->ifdefname != 0)
+          {   PP_HASHENTRY *h = pp_lookup_name(p->ifdefname);
+              if (h == NULL || !h->alive) break;
+          }
+          else if (p->stringfile != string_file_active)
+              break;
+          if (string_file_active)
+              string_file_active = NO;
+          else
+              fclose(fp);
+          if (debugging(DEBUG_FILES))
+          {   if (p->ifdefname == 0)
+                  cc_msg("Not including '%s' again\n", hostname);
+              else
+                  cc_msg("Not including '%s' again, guard '%s' is #defined\n", hostname, p->ifdefname);
+          }
+          pp_wrch('\n');
+          pp_inclclose(*pp_fl);
+          return;
+      }
+      if (var_cc_private_flags & 0x1000000)
+          include_only_once(hostname, NULL, string_file_active);
+      fs = pp_freefilestack;
       if (fs) pp_freefilestack = pp_filchain_(fs);
-      else fs = (PP_FILESTACK *)pp_alloc(sizeof(PP_FILESTACK));
+      else fs = (PP_FILESTACK *) pp_new_(sizeof(PP_FILESTACK));
       pp_filchain_(fs) = pp_filestack;    pp_filestack = fs;
       pp_filstream_(fs) = pp_cis;         pp_cis = fp;
       pp_fileline_(fs)  = *pp_fl;
-      pp_filefnl_(fs) = this_file_name;
       init_pp_fl(hostname);
+      fs->ifstart = pp_ifstack;
+      fs->ifdefname = 0;
+      fs->guard_ifndef = (PP_IFSTACK *)DUFF_ADDR;
+      seen_pp_token = 0;
 #ifndef NO_LISTING_OUTPUT
       pp_filenumber_(fs) = pp_filenumber;
       /* NB profile_find() sets profile_ptr & pp_filenumber */
-      pp_propoint_(fs) = profile_ptr; profile_find(hostname);
+      pp_propoint_(fs) = profile_ptr; profile_find(fname);
       /* Set MSB of pp_filenumber if listing is not wanted at this level */
       if (!((lquote != '<' && (feature & FEATURE_USERINCLUDE_LISTING)) ||
           (feature & FEATURE_SYSINCLUDE_LISTING)))
@@ -2243,20 +2365,6 @@ static void pp_include(int pp_ch)
     (void)pp_rdch();
   }
   if (pp_skipping) return;
-
-  { file_name_list *p = seen_before;
-    while (p != NULL)
-/* NB I treat "somename" and <somename> as equivalent here.             */
-/* AM: lets open the discussion as to this.                             */
-/* BEWARE: fname should really be 'hostname' in pp_push_include for     */
-/* situations where pp_inclopen changes unix to PC file names.          */
-    { if (strcmp(p->fname, fname) == 0 && p->nomore)
-      {   pp_wrch('\n');    /* retain line-no synchronisation for cc -E */
-          return;
-      }
-      else p = p->cdr;
-    }
-  }
   pp_push_include(fname, lquote);
 }
 
@@ -2321,41 +2429,13 @@ static pragma_spelling pragma_words[] =
     {"f66_iosublist",               'w', 2},
     {"f66_intrinsgo",               'w', 4},
 #endif
-#ifdef TARGET_IS_XAP
-    { "include_only_once",          'i', 1},
-#define code_seg_pragchar 'm' /* pp_pragmavec['m'-'a'] */
-    { "zcode_off",                  'm', -1},
-    { "zcode_on",                   'm', 1},
-    { "code_segment",               'm', 2},
-    { "code_segment_default",       'm', -1},
-    { "pagezero_off",               'o', 0},
-    { "pagezero_on",                'o', 0x7fff},
-    { "pagezero_bysize",            'o', -1},
-    { "allocate_auto_variables_as_static",        's', 1},
-    { "allocate_auto_variables_as_auto",          's', -1},
-    { "force_top_level",            't', 1},
-    { "check_printf_formats",       'v', 1},
-    { "check_scanf_formats",        'v', 2},
-#ifdef TARGET_IS_ECOG
-    { "interrupt_entry",            'u', 1},
-    { "interrupt_code",             'u', 2},
-    { "irq_entry",                  'u', 1},
-    { "irq_code",                   'u', 2},
-#endif
-#else /* TARGET_IS_XAP */
     { "warn_implicit_fn_decls",     'a', 1},
     { "check_memory_accesses",      'c', 1},
     { "warn_deprecated",            'd', 1},
     { "continue_after_hash_error",  'e', 1},
     { "include_only_once",          'i', 1}, /* @@@ freeze soon!        */
+    { "once",                       'i', 1}, /* common with other compilers */
     { "optimise_crossjump",         'j', 1},
-#ifdef TARGET_IS_C4P                         /* really C4P or NEC not XAP */
-#define code_seg_pragchar 'l' /* pp_pragmavec['l'-'a'] */
-    { "code_section",               'l', 2},
-    { "data_section",               'l', 3},
-    { "internalmemory_off",         'w', -1},
-    { "internalmemory_on",          'w', 1},
-#endif
 #ifdef TARGET_IS_ARM
     { "optimise_multiple_loads",    'm', 1},
 #endif
@@ -2364,41 +2444,15 @@ static pragma_spelling pragma_words[] =
 #ifdef TARGET_IS_ARM
     { "check_stack",                's', 0},
 #endif
-#ifdef TARGET_IS_NEC
-    { "pagezero_off",               'o', 0},
-    { "pagezero_on",                'o', 0x7fff},
-    { "pagezero_bysize",            'o', -1},
-    { "section",                    's', 0},
-#endif
     { "force_top_level",            't', 1}, /* @@@ freeze soon!        */
     { "check_printf_formats",       'v', 1},
     { "check_scanf_formats",        'v', 2},
     { "__compiler_msg_format_check", 'v', 3}, /* not for public use     */
     { "side_effects",               'y', 0},
     { "optimise_cse",               'z', 1}
-#endif /* TARGET_IS_XAP */
 };
 
 #define NPRAGMAS (sizeof(pragma_words)/sizeof(pragma_spelling))
-
-#ifdef TARGET_IS_NEC
-/*
- * Read a word starting with whatever non-blank character happens, but
- * following on through alphanumeric characters plus _ (plus maybe $).
- * Case fold the word that is read, and truncate it to 'n' characters.
- */
-static int pp_idpragma(int pp_ch, char *v, int n)
-{   int p = 0;
-    if (pp_ch != '\n')
-    {   do
-        {   if (p<n) v[p++] = safe_tolower(pp_ch);
-            pp_ch = pp_rdch();
-        } while (pp_cidchar(pp_ch));
-    }
-    v[p] = 0;
-    return pp_ch;
-}
-#endif
 
 /* In the medium term the following routine is moving to compiler.c     */
 /* Precondition: 'pragchar' is a lower case letter.                     */
@@ -2425,7 +2479,7 @@ case 'b':
         if (pragval) suppress &= ~D_IMPLICITCAST;
         else
         {   if (!(suppress & D_IMPLICITCAST))
-                cc_warn("#pragma -b suppresses errors (hence non-ANSI)");
+                cc_warn(pp_warn_pragma_suppress);
             suppress |= D_IMPLICITCAST;
         }
         break;
@@ -2436,6 +2490,10 @@ case 'b':
 static void pp_pragma(int pp_ch)
 {   /* note that ANSI say it is NOT an error to fail to parse a #pragma */
     /* that does not stop us warning on syntax we fail to recognise     */
+    if (pp_skipping)
+    {   pp_skip_linetokens(pp_ch);
+        return;
+    }
     for (;;)
     {   int pragchar; int32 pragval;
         pp_ch = pp_skipb1(pp_ch);
@@ -2454,134 +2512,37 @@ static void pp_pragma(int pp_ch)
                     pp_ch = pp_rdch();
                 } while (pp_cidchar(pp_ch));
                 pragma_name[p] = 0;
-                if (p > 3 && strncmp(pragma_name, "no_", 3) == 0) no = 3;
+                if (p > 3 &&
+                    pragma_name[0] == 'n' && pragma_name[1] == 'o')
+                {   no = 2;
+                    if (pragma_name[2] == '_') no = 3;
+                }
 /* For the small number of available options linear search seems OK */
                 for (p = 0; p < NPRAGMAS; p++)
                     if (strcmp(pragma_words[p].name, pragma_name+no) == 0)
                         break;
                 if (p < NPRAGMAS)
                 {   int val = pragma_words[p].value;
-                    pragchar = pragma_words[p].code;
-#ifdef TARGET_IS_XAP_OR_NEC  /* this really means XAP or C4P, not NEC */
-                    if (pragchar == code_seg_pragchar && val <= 0)
-                        strcpy(asm_codesegname, "CODE");
-                    else if (pragchar == code_seg_pragchar && val == 1)
-                        strcpy(asm_codesegname, "ZCODE");
-                    else if (pragchar == code_seg_pragchar && val == 2)
-                    {   /* ECOG #pragma code_segment xxx */
-                        pp_ch = pp_skipb1(pp_ch);
-                        pp_ch = pp_idpragma(pp_ch, asm_codesegname,
-                                                   sizeof(asm_codesegname)-2);
-                        pp_ch = pp_skipb1(pp_ch);
-                        if (debugging(DEBUG_PP))
-                            cc_msg("csection %s %d\n", asm_codesegname, pp_ch);
-                        if (pp_ch != '\n')
-                        {    cc_warn(pp_warn_bad_pragma);
-                             pp_skip_linetokens(pp_ch);
-                             break;
-                        }
-                    }
-#endif
-#ifdef TARGET_HAS_C4P_SECTS
-                    else if (pragchar == code_seg_pragchar && val == 3)
-                    {   /* i.e. #pragma data_section */
-                        int segno;
-                        pp_ch = pp_skipb1(pp_ch);
-                        pp_ch = pp_idpragma(pp_ch, pragma_name, 30);
-                        pp_ch = pp_skipb1(pp_ch);
-                        if (debugging(DEBUG_PP))
-                            cc_msg("data_section '%s'\n", pragma_name);
-                        segno = find_dataseg(pragma_name);
-                        if (segno<0)
-                        {   cc_warn(pp_warn_bad_pragma);
-                            pp_skip_linetokens(pp_ch);
-                            break;
-                        }
-                        if (pp_ch == '\n')
-                            set_dataseg(segno, 0);
-                        else
-                        {   pp_ch = pp_idpragma(pp_ch, pragma_name, 30);
-                            pp_ch = pp_skipb1(pp_ch);
-                            if (debugging(DEBUG_PP))
-                                cc_msg("section %d %s %d\n", segno, pragma_name, pp_ch);
-                            if (pp_ch == '\n')
-                                set_dataseg(segno, pragma_name);
-                            else {  cc_warn(pp_warn_bad_pragma);
-                                    pp_skip_linetokens(pp_ch);
-                                    break;
-                                 }
-                        }
-                    }
-#endif
-#ifdef TARGET_IS_NEC
-                    if (pragchar == 's')
-                    {   /* NEC #pragma section xxx [begin/end] */
-                        int i;
-                        static char *sname[] =
-                          {  "end",
-                             "data", "const", "sdata", "sconst", "sbss", "bss"
-#ifdef TARGET_HAS_NEC_SECTS
-                                   , "tidata", "sidata", "sedata", "sebss"
-#endif
-#ifdef TARGET_HAS_C4P_SECTS
-                                   , "idata", "iconst", "ibss"
-#endif
-                          };
-                        pp_ch = pp_skipb1(pp_ch);
-                        pp_ch = pp_idpragma(pp_ch, pragma_name, 30);
-                        if (debugging(DEBUG_PP))
-                            cc_msg("section '%s'\n", pragma_name);
-                        for (i=0; i<sizeof(sname)/sizeof(sname[0]); i++)
-                            if (strcmp(pragma_name, sname[i]) == 0)
-                            {   pp_ch = pp_skipb1(pp_ch);
-                                if (i != 0)  /* allow #pragma section end */
-                                { pp_ch = pp_idpragma(pp_ch, pragma_name, 30);
-                                  pp_ch = pp_skipb1(pp_ch);
-                                }
-                                if (debugging(DEBUG_PP))
-                                  cc_msg("section %d %s %d\n", i, pragma_name, pp_ch);
-                                if (pp_ch == '\n')
-                                {   if (pragma_name[0] == 0 ||
-                                        strcmp(pragma_name, "begin") == 0)
-                                    {   pragval = i; goto ok;
-                                    }
-                                    if (strcmp(pragma_name, "end") == 0)
-                                    {   pragval = 0; goto ok;
-                                    }
-                                }
-                                break;
-                            }
-                        cc_warn(pp_warn_bad_pragma);
-                        pp_skip_linetokens(pp_ch);
-                        break;
-                    ok: ;
-                        if (debugging(DEBUG_PP))
-                            cc_msg("section ok %d\n", pp_ch);
-                    }
-                    else
-#endif
 #ifdef FORTRAN
                     if (pragchar == 'x' || pragchar == 'w')
                         pragval = no ? ~val : val;
                     else
 #endif
-                        pragval = no ? !val : val;
-                    if (!pp_skipping) main_pragma_set(pragchar, pragval);
+                    pragval = no ? !val : val;
+                    pragchar = pragma_words[p].code;
+                    main_pragma_set(pragchar, pragval);
                     continue;           /* try for more pragmas on line */
                 }
                 cc_warn(pp_warn_bad_pragma);
-                pp_skip_linetokens(pp_ch);
                 break;
             }
     case '\n':
-            pp_unrdch(pp_ch);
             break;
     case '-':
             {   int32 n = 0; bool seen = 0;
                 pp_ch = pp_rdch();
                 if (isalpha(pp_ch)) pragchar = safe_tolower(pp_ch);
                 else { cc_warn(pp_warn_bad_pragma1, (int)pp_ch);
-                       pp_skip_linetokens(pp_ch);
                        break; }
                 pp_ch = pp_rdch();
                 while (isdigit(pp_ch))
@@ -2589,10 +2550,11 @@ static void pp_pragma(int pp_ch)
                     n = n*10 + (int)(pp_ch - '0'),
                     pp_ch = pp_rdch();
                 pragval = seen ? n : -1;
-                if (!pp_skipping) main_pragma_set(pragchar, pragval);
+                main_pragma_set(pragchar, pragval);
                 continue;               /* try for more pragmas on line */
             }
         }
+        pp_skip_linetokens(pp_ch);
         break;
     }
 /*
@@ -2624,7 +2586,8 @@ static void pp_pragma(int pp_ch)
  * file names onto a notional empty file the second time around.
  */
     if (var_include_once > 0)
-    {   if (this_file_name) this_file_name->nomore = 1;
+    {   include_only_once(pp_fl->f, NULL, string_file_active);
+        if (pp_filestack) pp_filestack->ifdefname = (char *)DUFF_ADDR;
         var_include_once = 0;
     }
 }
@@ -2669,8 +2632,10 @@ static void pp_directive(void)
   int32 i=0;
   int pp_ch, cpp_allows_junk=0;
   char v[PP_DIRLEN+1];
+  bool old_seen = seen_pp_token;
 
   pp_in_directive = 1;
+  seen_pp_token = 1;
   pp_ch = pp_skipb0();
   for (i=0; isalpha(pp_ch); )
   {
@@ -2698,9 +2663,15 @@ static void pp_directive(void)
     return;
   }
   else if (strcmp(v, "ifdef") == 0)   pp_h_ifdef(pp_ch, 1);
-  else if (strcmp(v, "ifndef") == 0)  pp_h_ifdef(pp_ch, 0);
+  else if (strcmp(v, "ifndef") == 0)
+      seen_pp_token = old_seen, pp_h_ifdef(pp_ch, 0);
   else if (strcmp(v, "else") == 0)    pp_h_else(pp_ch), cpp_allows_junk=1;
-  else if (strcmp(v, "elif") == 0)    pp_h_elif(pp_ch);
+  else if (strcmp(v, "elif") == 0)
+  { pp_h_elif(pp_ch);
+    /* Assert: after pp_h_elif(), at end of line or at end of file */
+    pp_in_directive = 0;
+    return;
+  }
   else if (strcmp(v, "endif") == 0)   pp_h_endif(pp_ch), cpp_allows_junk=1;
   else if (strcmp(v, "line") == 0)    pp_h_line(pp_ch);
   else if (strcmp(v, "pragma") == 0)  pp_pragma(pp_ch);
@@ -2743,7 +2714,11 @@ static void pp_directive(void)
   /* It is woeful we need to do this here instead of in pp_pragma() */
   /* but it needs to be done after the above checks. The earlier    */
   /* alterative involved fiddling with pp_fl->l, and was broken.    */
-  if (var_force_top_level > 0)
+  if (var_force_top_level > 0
+#ifdef FOR_ACORN
+      && !cplusplus_preprocessing()
+#endif
+     )
   {   pp_wrbuf("___toplevel", 11L);
       var_force_top_level = 0;
   }
@@ -2779,25 +2754,36 @@ static int pp_process(void)
     {   pp_ch = pp_rdch();
         switch (pp_ch)
         {
-    case PP_EOF: if (string_file_active) string_file_active = NO;
-              else fclose(pp_cis);    /* see pp_include() */
-#ifdef TARGET_KEEP_COMMENT
-              /* The 0x80000000 bit means 'a J_INFOLINE generated'.     */
-              if (pp_fl && pp_fl->filepos & 0x80000000) asm_listeof(pp_fl->f);
-#endif
+    case PP_EOF:
+              if (pp_filestack != 0 && pp_filestack->ifdefname != DUFF_ADDR)
+              { if (!seen_pp_token && pp_filestack->ifdefname != 0)
+                { PP_HASHENTRY* h = pp_lookup_name(pp_filestack->ifdefname);
+                  include_only_once(pp_fl->f,
+                      pp_filestack->ifdefname, string_file_active);
+                  if (h == NULL || !h->alive)
+                      cc_warn(pp_warn_guard_not_defined, pp_filestack->ifdefname);
+                }
+                else if (!(suppress & D_GUARDEDINCLUDE) &&
+                         !fnameEQ(pp_fl->f, "assert.h"))
+                  cc_warn(pp_warn_not_guarded);
+              }
+              if (string_file_active) string_file_active = NO;
+              else if (pp_cis)
+                fclose(pp_cis);    /* see pp_include() */
 /* @@@ ANSI do not specify whether #if's must match in a #include file.   */
 /* hence only check all #if's closed on real EOF.                         */
               if (pp_filestack == 0)
               { if (pp_ifstack != 0) cc_err(pp_err_endif_eof);
                 return PP_EOF;
               }
+              else if (pp_filestack->ifstart != pp_ifstack)
+                  cc_warn(pp_warn_unbalanced);
 #ifdef FORTRAN
               if (pp_stick_at_eof) return PP_EOF;
               pp_stick_at_eof = 1;
 #endif
               pp_cis = pp_filstream_(pp_filestack);
               *pp_fl = pp_fileline_(pp_filestack);
-              this_file_name = pp_filefnl_(pp_filestack);
 #ifndef NO_LISTING_OUTPUT
               profile_ptr = pp_propoint_(pp_filestack);
               pp_filenumber = pp_filenumber_(pp_filestack);
@@ -2809,6 +2795,8 @@ static int pp_process(void)
                 pp_freefilestack = pp_filestack;
                 pp_filestack = q;
               }
+              /* there is an #include in the file we've just popped to */
+              seen_pp_token = 1;
               pp_rdptr = NULL;
               pp_rdcnt = 0;
               pp_ch = '\n';             /* to set pp_lastch later...    */
@@ -2822,9 +2810,7 @@ static int pp_process(void)
     case ' ':
     case '\t':if (!pp_skipping) pp_wrch(pp_ch);
 #ifndef PASCAL_OR_FORTRAN
-              if (!(feature & FEATURE_PCC && feature & FEATURE_FUSSY))
-/* i.e. PCC mode now requires -pcc -fussy to allow ' #' not to be seen  */
-/* as a pre-processing directive.                                       */
+              if (!(feature & FEATURE_PCC))
 #endif
                   /* spaces may precede '#' only in ANSI C */
                   pp_ch = pp_lastch;
@@ -2856,6 +2842,7 @@ static int pp_process(void)
               }
         }
         pp_lastch = pp_ch;
+        if (!isspace(pp_ch)) seen_pp_token = 1;     /* significant token */
     }
     pp_abufoptr = pp_abufbase;
     return *pp_abufoptr++;
@@ -2907,7 +2894,7 @@ int pp_nextchar(void)
 
 void pp_predefine(char *s)
 {
-    (void)pp_predefine2(s,1);
+    (void)pp_predefine2(s, 1);
 }
 
 void pp_preundefine(char *s)
@@ -2924,7 +2911,10 @@ void pp_preundefine(char *s)
   if (!pp_skipping)                            /* @@@ duh? */
   {
       PP_HASHENTRY *p = pp_lookup(pp_abufbase, hash);
-      if (p) pp_hashalive_(p) = 0;
+      if (p) {
+        pp_hashalive_(p) = 0;
+        if (usrdbg(DBG_PP)) dbg_undef(pp_hashname_(p), curlex.fl);
+      }
   }
 }
 
@@ -2969,19 +2959,11 @@ void pp_tidyup(void)
 void pp_init(FileLine *fl)
 { time_t t0 = time(0);
   strncpy(pp_datetime, ctime(&t0), 26-1);   /* be cautious */
-/* The next line hacks round a bug in some ctime() implementations,     */
-/* e.g. "Mon Jan 01 ..." -> "Mon Jan  1 ..."                            */
-  if (pp_datetime[8] == '0') pp_datetime[8] = ' ';
   pp_fl = fl;
-  pp_hashtable =
-    (PP_HASHENTRY *((*)[PP_HASHSIZE])) pp_alloc(sizeof(*pp_hashtable));
+  pp_hashtable = (PP_HASHTABLE *)pp_alloc(sizeof(*pp_hashtable));
   ClearToNull((void **)pp_hashtable, sizeof(*pp_hashtable)/sizeof(void **));
   pp_hashfirst = pp_hashlast = pp_noexpand = 0;
   pp_dbufend = pp_dbufseg = pp_dbufptr = 0;
-#ifdef TARGET_KEEP_COMMENT
-  pp_cbufptr = pp_cbufbase = (char *)pp_alloc(PP_CBUFINITSIZ);
-  pp_cbufend = pp_cbufbase + PP_CBUFINITSIZ;
-#endif
   pp_ebufbase = (char *)pp_alloc(PP_EBUFINITSIZ);
   pp_ebufptr = pp_ebuftop = pp_ebufbase + PP_UNRDCHMAX;
   pp_ebufend = pp_ebufbase + PP_EBUFINITSIZ;
@@ -2990,14 +2972,14 @@ void pp_init(FileLine *fl)
   pp_scanidx = -1;
   pp_nsubsts = 0;
   pp_instring = 0;
-  pp_inhashif = 0;
+  pp_inhashif = NO;
   pp_expand_level = 0;
   pp_ifstack = 0; pp_freeifstack = 0; pp_skipping = 0;
   pp_filestack = 0; pp_freefilestack = 0;
 #ifdef FORTRAN
   pp_stick_at_eof = 1;
 #endif
-  this_file_name = seen_before = NULL;
+  seen_before = NULL;
   {   int ch;
       for (ch = 0; ch <= UCHAR_MAX; ch++)
       {   int i = 0;
@@ -3014,6 +2996,7 @@ void pp_init(FileLine *fl)
      for (i=0; i <= 'z'-'a'; i++) pp_pragmavec[i] = -1;
   }
   string_file_active = NO;
+  if (usrdbg(DBG_PP)) dbg_notefileline(curlex.fl);
   (void)pp_predefine2("__LINE__", PP__LINE);
   (void)pp_predefine2("__FILE__", PP__FILE);
   (void)pp_predefine2("__DATE__", PP__DATE);
@@ -3028,10 +3011,7 @@ void pp_init(FileLine *fl)
  * one can not go
  *    #if sizeof(xxx) == nnn
  * as a pre-processing directive.
- * Note that sizes are in 8-bit bytes, not in terms of char!
  */
-  if (sizeof_char == 1) pp_predefine("__sizeof_char=1");
-  if (sizeof_char == 2) pp_predefine("__sizeof_char=2");
   if (sizeof_int == 2) pp_predefine("__sizeof_int=2");
   if (sizeof_int == 4) pp_predefine("__sizeof_int=4");
   if (sizeof_int == 8) pp_predefine("__sizeof_int=8");
@@ -3039,8 +3019,6 @@ void pp_init(FileLine *fl)
   if (sizeof_long == 8) pp_predefine("__sizeof_long=8");
   if (sizeof_ptr == 4) pp_predefine("__sizeof_ptr=4");
   if (sizeof_ptr == 8) pp_predefine("__sizeof_ptr=8");
-  if (sizeof_double == 4) pp_predefine("__sizeof_double=4");
-  if (sizeof_double == 8) pp_predefine("__sizeof_double=8");
 }
 
 static void pp_init2(FILE *stream)
@@ -3087,10 +3065,12 @@ static void pp_init2(FILE *stream)
 #else
           (void)pp_predefine2("__STDC__", PP__ONE);
 #endif
-#ifdef CPLUSPLUS
+          if (LanguageIsCPlusPlus)
 /* [ES] requires the following to be set, note that __STDC__ is too!.   */
-          (void)pp_predefine2("__cplusplus", PP__ONE);
-#endif
+          {   (void)pp_predefine2("__cplusplus", PP__ONE);
+              if (feature & FEATURE_CFRONT)
+                  (void)pp_predefine2("__CFRONT_LIKE", PP__ONE);
+          }
       }
 #ifndef PASCAL_OR_FORTRAN
       pp_translate['?'] = PP_TOKSEP;             /* translate triglyphs */
@@ -3099,6 +3079,7 @@ static void pp_init2(FILE *stream)
   pp_lastch = '\n';
   pp_rdch1nls = pp_rdch3nls = pp_rdch_la = 0;
   pp_in_directive = 0;
+  seen_pp_token = 0;
 }
 
 /* Perhaps better another external function than partial init on        */
@@ -3111,7 +3092,6 @@ void pp_notesource(char *filename, FILE *stream)
 {
 #endif
     init_pp_fl(filename);
-    pp_fl->filepos = 0x80000000;
     pp_cis = stream;
     pp_init2(stream);
     if (stream != stdin) return; /* pre-include case.. */
@@ -3119,17 +3099,5 @@ void pp_notesource(char *filename, FILE *stream)
     profile_find(filename);      /* sets profile_ptr, pp_filenumber */
 #endif
 }
-
-#ifdef TARGET_KEEP_COMMENT
-char *pp_textcomment()
-{   /* Return a string holding comments to this point, separated by     */
-    /* newline chars.  Save until real exprs/cmds (i.e. not #if expr)   */
-    /* Caller must copy value before reading more.                      */
-    if (pp_inhashif || pp_filestack) return "";
-    pp_stuffcom(0);
-    pp_cbufptr = pp_cbufbase;
-    return pp_cbufbase;
-}
-#endif
 
 /* end of pp.c */

@@ -5,9 +5,9 @@
  */
 
 /*
- * RCS $Revision: 1.4 $
- * Checkin $Date: 93/10/07 17:40:02 $
- * Revising $Author: irickard $
+ * RCS $Revision: 1.6 $
+ * Checkin $Date: 1995/02/09 12:34:00 $
+ * Revising $Author: hmeekings $
  */
 
 #ifndef _regalloc_h
@@ -20,13 +20,8 @@
 #  include "cgdefs.h"
 #endif
 
-#ifdef REG_TO_BINDERS
-extern BindList *reg_to_binders[NMAGICREGS];
-#endif
-
 extern VRegnum vregister(RegSort type);
 extern RegSort vregsort(VRegnum r);
-extern int vregtypechar(VRegnum vr);
 extern void allocate_registers(BindList *spill_order);
 
 extern RealRegSet regmaskvec;
@@ -46,6 +41,10 @@ extern void note_slave(VRegnum slave, VRegnum master);
 extern void forget_slave(VRegnum slave, VRegnum master);
 
 extern void augment_RealRegSet(RealRegSet *, unsigned32);
+extern bool member_RealRegSet(RealRegSet const *, unsigned32);
+extern unsigned32 delete_RealRegSet(RealRegSet *, unsigned32);
+extern bool intersect_RealRegSet(RealRegSet *a, RealRegSet const *b, RealRegSet const *c);
+extern void union_RealRegSet(RealRegSet *a, RealRegSet const *b, RealRegSet const *c);
 
 extern void avoidallocating(VRegnum); /* modifications to ALLOCATION_ORDER */
 

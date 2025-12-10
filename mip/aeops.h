@@ -1,13 +1,13 @@
 /*
- * C compiler file aeops.h, Version 47
+ * C compiler file aeops.h, Version 46
  * Copyright (C) Codemist Ltd., 1988-1992.
  * Copyright Advanced RISC Machines Limited, 1990-1992.
  */
 
 /*
- * RCS $Revision: 1.20 $
- * Checkin $Date: 93/10/01 15:26:13 $
- * Revising $Author: hmeekings $
+ * RCS $Revision: 1.27 $
+ * Checkin $Date: 1995/10/16 10:05:52 $
+ * Revising $Author: amycroft $
  */
 
 #ifndef _aeops_LOADED
@@ -40,16 +40,19 @@ typedef enum AE_op {
 
 /* identifier, constants: */
     s_error,
+    s_unknown,          /* e.g. template parameter value.               */
+#define iserrororunknown_(op) ((op) <= s_unknown)
     s_identifier,
     s_integer,
     s_floatcon,
-    s_character,
+    s_boolean,          /* mainly represented by s_integer (type char)  */
+    s_character,        /* mainly represented by s_integer (type bool)  */
+    s_wcharacter,       /* mainly represented by s_integer (type wchar) */
     s_string,
 #ifdef EXTENSION_UNSIGNED_STRINGS
     s_ustring,
     s_sstring,
 #endif
-    s_wcharacter,
     s_wstring,
 /* s_binder heads binding records - see type Binder */
     s_binder,
@@ -57,7 +60,7 @@ typedef enum AE_op {
     s_member,   /*  LDS wants this too... for C++       */
 
 #define hastypefield_(op) ((s_invisible<=(op) && (op)<=s_cast))
-#define hasfileline_(op) ((op)==s_integer || hastypefield_(op))
+#define hasfileline_(op) ((op)==s_integer || (hastypefield_(op)))
 
     s_invisible,
 #define isdiad_(op)       (s_andand<=(op) && (op)<=s_assign)
@@ -89,10 +92,6 @@ typedef enum AE_op {
     s_minus,
     s_power,            /* Needed for Fortran */
     s_div,
-#ifdef EXTENSION_FRAC
-    s_xtimes,
-    s_xdiv,
-#endif
     s_leftshift,
     s_or,
     s_idiv,
@@ -112,10 +111,6 @@ typedef enum AE_op {
     s_minusequal,
     s_powerequal,       /* here for consistency - do not remove */
     s_divequal,
-#ifdef EXTENSION_FRAC
-    s_xtimesequal,      /* here for consistency - do not remove */
-    s_xdivequal,        /* here for consistency - do not remove */
-#endif
     s_leftshiftequal,
     s_orequal,
     s_idivequal,
@@ -125,6 +120,7 @@ typedef enum AE_op {
 
 #define diadneedslvalue_(op)    (s_andequal<=(op) && (op)<=s_assign)
     s_displace,         /* no repn in C,  ++ is spec case */
+    s_init,             /* initialising '=' */
     s_assign,
 
 /* unary ops.  note that the first 4 correspond (via unaryop_()) to diads */
@@ -165,7 +161,7 @@ typedef enum AE_op {
     s_rangecheck,
     s_checknot,
 #endif
-    s_init,             /* initialising '=' */
+    s_qualdot,          /* C++ expr.T::f() - no virtual call */
     s_cast,             /* see hastypefield_() above */
     s_sizeoftype,
     s_sizeofexpr,
@@ -202,11 +198,15 @@ typedef enum AE_op {
     s_typespec,
 
 /* note the next two blocks must be adjacent for the next 3 tests. */
-#define istypestarter_(x)   (s_char<=(x) && (x)<=s_volatile)
+#define istypestarter_(x)   (s_bool<=(x) && (x)<=s_lasttype)
 #define isstorageclass_(x)  (s_auto<=(x) && (x)<=s_globalfreg)
-#define isdeclstarter_(x)   (s_char<=(x) && (x)<=s_typestartsym)
-#define shiftoftype_(x)     ((x)-s_char)
-#define bitoftype_(x)       (1L<<((x)-s_char))
+#define isdeclstarter_(x)   (s_bool<=(x) && (x)<=s_typestartsym)
+#define shiftoftype_(x)     ((x)-s_bool)
+#define bitoftype_(x)       (1L<<((x)-s_bool))
+/* soon: stop bool, float, wchar being a proper type.  Map bool to      */
+/* short char, and wchar to long char.  syn.c still needs older form?   */
+    s_wchar,            /* reserved, not yet used.      */
+    s_bool,
     s_char,
     s_double,
     s_enum,
@@ -218,31 +218,26 @@ typedef enum AE_op {
 #  define CLASSBITS         (bitoftype_(s_union+1)-bitoftype_(s_struct))
 #  define ENUMORCLASSBITS   (CLASSBITS|bitoftype_(s_enum))
     s_void,
-/* Currently s_frac and s_longlong are not possible together.           */
-/* This is a temp hack to keep NUM_OF_TYPES = 17.                       */
-#ifndef EXTENSION_FRAC
     s_longlong,         /* C extension */
-#endif
     s_typedefname,
-#define NONQUALTYPEBITS (bitoftype_(s_typedefname+1)-bitoftype_(s_char))
+#define NONQUALTYPEBITS (bitoftype_(s_typedefname+1)-bitoftype_(s_bool))
 /* modifiers last (high bits for m&-m trick) */
-#ifdef EXTENSION_FRAC
-    s_frac,             /* C extension */
-#endif
     s_long,
     s_short,
     s_signed,
     s_unsigned,
 /* rework the next two lines?                                           */
-#define TYPEDEFINHIBITORS   (bitoftype_(s_unsigned+1)-bitoftype_(s_char))
-#define CVBITS              (bitoftype_(s_volatile)|bitoftype_(s_const))
+#define TYPEDEFINHIBITORS   (bitoftype_(s_unsigned+1)-bitoftype_(s_bool))
+#define CVBITS              (bitoftype_(s_unaligned+1)-bitoftype_(s_const))
     s_const,
     s_volatile,
-#define NUM_OF_TYPES        (s_volatile-s_char+1)
-    /* currently 17 */
-#define TYPEBITS            (bitoftype_(s_volatile+1)-bitoftype_(s_char))
+    s_unaligned,
+#define s_lasttype s_unaligned
+#define NUM_OF_TYPES        (s_lasttype-s_bool+1)
+    /* currently 18 */
+#define TYPEBITS            (bitoftype_(s_lasttype+1)-bitoftype_(s_bool))
 /* storage classes and qualifiers */
-#define bitofstg_(x)        (1L<<((x)-s_char-1))
+#define bitofstg_(x)        (1L<<((x)-s_auto+16))
 /* ***NOTE*** bitofstg_() is ***NOT*** the same as bitoftype_().
    Callers must be careful to use the right one.
  */
@@ -262,7 +257,7 @@ typedef enum AE_op {
 #define NUM_OF_STGBITS      (s_weak-s_auto+1)
     /* currently 10 */
     s_globalfreg,
-#define bitoffnaux_(x)      (1L<<((x)-s_pure))
+#define bitoffnaux_(x)      ((FnAuxFlags)1<<((x)-s_pure))
 #define isfnaux_(x)         (s_pure<=(x) && (x)<s_typestartsym)
     s_pure,
     s_structreg,
@@ -373,12 +368,22 @@ typedef enum AE_op {
     s_complex,          /* needed for Fortran */
 #endif
 
-    s_comment,
+#ifndef BCPL
+    s_true,
+    s_false,
+#endif
+
     s_SPARE1,
     s_SPARE2,
+    s_SPARE3,
 
     s_NUMSYMS
 } AE_op;
+
+/* Any unqualified symbol is less than s_NUMSYMS <= s_SYMMASK */
+#define s_SYMMASK       255
+/* ORR this bit in to qualify a symbol... a hack for C++...   */
+#define s_qualified     512
 
 extern char *sym_name_table[s_NUMSYMS];
 
@@ -391,6 +396,7 @@ extern char *sym_name_table[s_NUMSYMS];
 #define t_ref       s_addrof
 #define t_coloncolon  s_coloncolon
 #define t_ovld      s_ovld
+#define t_unknown   s_unknown       /* template type parameter          */
 
 #ifdef EXTENSION_UNSIGNED_STRINGS
 #  define case_s_any_string  case s_string: case s_wstring: \
