@@ -1,0 +1,12 @@
+BUGS
+----
+
+PUSHR->PUSHM amalgamation doesn't work when the registers are in the
+wrong order. I have a fix.
+
+CSE appears not to notice that PUSHR has a side effect. I have a
+fix.
+
+LSB info gets trashed in register allocator, causing a used register
+to be assumed unused. I have a workaround but can't remember where I
+left the exhibit.

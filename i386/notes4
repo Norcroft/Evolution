@@ -1,0 +1,18 @@
+ELF Core Dumps
+
+The exterior structure of an ELF core dump is very simple: an
+ordinary ELF container, with no section header table but a program
+header table. Most of the stuff in the PHT is simply areas of
+memory, making things very simple indeed.
+
+The tricky thing is the NOTE section in the PHT. This contains four
+notes, in the `namesz/descsz/type/name/desc' structure given in the
+ELF specs (page 2-5). The notes are:
+
+Name "CORE", type 1: process status.
+
+Name "CORE", type 2: process FPU state.
+
+Name "CORE", type 3: process information.
+
+Name "CORE", type 4: task structure.

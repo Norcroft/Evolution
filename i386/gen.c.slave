@@ -1,0 +1,1099 @@
+/*
+ * i386/gen.c   code generator main module for ncc/i386
+ */
+
+#ifdef __STDC__
+#  include <string.h>
+#else
+#  include <strings.h>
+#endif
+
+#include <stdlib.h>
+#include "globals.h"
+#include "builtin.h"
+#include "mcdep.h"
+#include "mcdpriv.h"
+#include "xrefs.h"
+#include "jopcode.h"
+#include "store.h"
+#include "codebuf.h"
+#include "regalloc.h"
+#include "cg.h"        /* for procflags, greatest_stackdepth */
+#include "util.h"      /* padsize */
+#include "errors.h"
+
+#include "gen.h"
+
+i386ins *funhead, *funtail;
+
+int done_rlab;			       /* do we have a .r label? */
+int casenum = 0;		       /* unique id for each case stmt */
+
+int local_off;			       /* stack offset of saved regs */
+UnsignedInteger our_regmask;	       /* saved regs for this procedure */
+
+int mmx = 0;			       /* FIXME. adjusts pipelining properties */
+
+/*
+ * Peephole optimiser function prototypes.
+ */
+static void peep386_slavereg(int dest, int source);
+static void peep386_writereg(int reg, char *val);
+static char *peep386_readregv(int reg, int flags);
+static void peep386_readreg(int reg, int flags);
+static void peep386_deadreg(int reg);
+static void peep386_predeadreg(int reg);
+static void peep386_killregs(void);
+static void peep386_clearbb(void);
+static void peep386_init(void);
+
+/*
+ * The flags word in readreg / readregv.
+ */
+#define PEEP_AGI 1		       /* a read which can suffer AGI */
+#define PEEP_CANSLAVE 2		       /* for readregv: can return a reg */
+
+/*
+ * Convenience function for FP dyadic operators.
+ */
+static void fpdiad386(char *oneway, char *otherway,
+		      RealRegister r1r, RealRegister r2r, RealRegister mr);
+
+bool alterscc(Icode *ic) {
+    return 1;			       /* nicked from alpha, prob wrong */
+}
+
+void branch_round_literals(LabelNumber *m) {
+    				       /* do nothing - stub */
+}
+
+bool immed_cmp(int32 n) {
+    return (n&0xffff?1:0);	       /* nicked from alpha */
+}
+
+int32 local_address(Binder *b) {
+    int32 p = bindaddr_(b);
+    int32 q = p & ~BINDADDR_MASK;
+
+    switch (p & BINDADDR_MASK)
+    {
+      default:
+	syserr(syserr_local_address, (long)p);
+      case BINDADDR_LOC:
+	return -(local_off+q);
+      case BINDADDR_ARG:
+	return q+8;
+    }
+}
+
+RealRegister local_base(Binder *b) {
+    return 6;			       /* use EBP instead of ESP */
+}
+
+void localcg_reinit(void) {
+    				       /* nicked from alpha */
+}
+
+void localcg_tidy(void) {
+    				       /* nicked from alpha */
+}
+
+void mcdep_init(void) {
+    peep386_init();
+}
+
+void setlabel(LabelNumber *l) {
+				       /* stub */
+}
+
+static char *v2s[] = {
+    "eax", "ecx", "edx", "esi", "edi", "ebx", "ebp", "esp",
+    "st0", "st1", "st2", "st3", "st4", "st5", "st6", "st7"
+};
+static char *v2bs[] = {
+    "al", "cl", "dl", "***", "***", "bl", "***", "***", "***"
+};
+static char *v2ws[] = {
+    "ax", "cx", "dx", "si", "di", "bx", "bp", "sp", "***"
+};
+
+static void i386_newins(int flags);
+
+void show_instruction(J_OPCODE op, VRegInt vr1, VRegInt vr2, VRegInt vm) {
+    RealRegister r1 = vr1.r, r2 = vr2.r;
+    int32 m = vm.i;
+    RealRegister r1r = r1, r2r = r2, mr = m, tr;
+    int32 opm;
+    int32 dead;
+    char *name, *val, *val2;
+    RealRegister multiplicand, result;
+    int i;
+
+    if (debugging(DEBUG_CG)) {
+	int r1dead = (op&J_DEAD_R1?'#':' ');
+        int r2dead = (op&J_DEAD_R2?'#':' ');
+        int r3dead = (op&J_DEAD_R3?'#':' ');
+        cc_msg("GEN: (%d)", op);
+        jopprint_opname(op);
+        cc_msg("%ld%c %ld%c %ld%c\n", (long)r1r, r1dead,
+               (long)r2r, r2dead,
+               (long)mr,  r3dead);
+    }
+
+    opm = op & J_TABLE_BITS;
+
+    if ((op & J_DEAD_R1) && r1r != GAP)
+	peep386_predeadreg(r1r);
+    if ((op & J_DEAD_R2) && r2r != GAP)
+	peep386_predeadreg(r2r);
+    if ((op & J_DEAD_R3) && mr != GAP)
+	peep386_predeadreg(mr);
+
+    switch (opm) {
+      case J_INIT: case J_INITD: case J_INITF: case J_NOOP:
+	peep386_clearbb();
+	break;
+      case J_USE:
+	i386_newins(PEEP_NONINSN);
+	sprintf(funtail->text, "; use %s", v2s[r1r]);
+	peep386_readreg(r1r, 0);
+	peep386_writereg(r1r, NULL);
+	break;
+      case J_USED: case J_USEF:
+	i386_newins(PEEP_FPU | PEEP_NONINSN);
+	sprintf(funtail->text, "; use %s", v2s[r1r]);
+	break;
+      case J_ENTER:
+	peep386_clearbb();
+	i386_newins(PEEP_STACK | PEEP_UPAIR | PEEP_VPAIR | PEEP_ESPI);
+	sprintf(funtail->text, "push ebp");
+	i386_newins(PEEP_UPAIR | PEEP_VPAIR);
+	sprintf(funtail->text, "mov ebp,esp");
+	local_off = 0;
+	our_regmask = (regmaskvec.map[0] &
+		       (regbit(R_V1+NVARREGS)-regbit(R_V1)));
+	for (i = R_V1; i < R_V1+NVARREGS; i++)
+	    if (our_regmask & regbit(i)) {
+		i386_newins(PEEP_STACK | PEEP_UPAIR | PEEP_VPAIR | PEEP_ESPI);
+		sprintf(funtail->text, "push %s", v2s[i]);
+		local_off += 4;
+	    }
+	done_rlab = 0;
+	break;
+      case J_CASEBRANCH:
+	i386_newins(PEEP_UPAIR | PEEP_VPAIR);
+	sprintf(funtail->text, "cmp %s,%d", v2s[r1r], m-1);
+	peep386_readreg(r1r, 0);
+	i386_newins(PEEP_NONBB);
+	sprintf(funtail->text, "jae .cc%d", casenum);
+	i386_newins(PEEP_NONBB);
+	sprintf(funtail->text, "jmp [.c%d + 4 + 4*%s]", casenum, v2s[r1r]);
+	i386_newins(PEEP_NONBB);
+	sprintf(funtail->text, ".cc%d: jmp [.c%d]", casenum, casenum);
+	i386_newins(PEEP_NONINSN | PEEP_NONBB);
+	sprintf(funtail->text, ".c%d:", casenum++);
+	break;
+      case J_BXX:
+	i386_newins(PEEP_NONBB);
+	if (vm.l == NOTALAB)
+	    sprintf(funtail->text, "%%error \"dd NOTALAB\"");
+	else if (vm.l == RETLAB)
+	    sprintf(funtail->text, "dd .r");
+	else
+	    sprintf(funtail->text, "dd .j%d", vm.l->name);
+	break;
+      case J_ENDPROC:
+	/*
+	 * We might need to include the `.r' return code if it
+	 * hasn't cropped up anywhere else (eg a procedure
+	 * containing an infinite loop and a return out of it).
+	 */
+	if (!done_rlab) {
+	    VRegInt vr1, vr2, vm;
+	    vr1.r = vr2.r = GAP;
+	    vm.l = RETLAB;
+	    show_instruction(J_B, vr1, vr2, vm);
+	}
+	/*
+	 * Clear the peepholer for the end of a basic block.
+	 */
+	peep386_clearbb();
+	/*
+	 * Now we can run the post-peepholing Pentium scheduling
+	 * pass.
+	 */
+	pentium_schedule();
+	break;
+      case J_STACK:
+	/* do nothing - we don't actually see much worthwhile in J_STACK */
+	break;
+      case J_LABEL:
+	peep386_clearbb();
+	i386_newins(PEEP_NONBB | PEEP_NONINSN);
+	sprintf(funtail->text, ".j%d:", vm.l->name);
+	break;
+      case J_B:
+	peep386_clearbb();
+	if (vm.l == NOTALAB)
+	    printf("eek! NOTALAB showed up in J_B\n");
+	else {
+	    if (vm.l == RETLAB && !(op & Q_MASK)) {
+		if (!done_rlab) {
+		    i386_newins(PEEP_NONBB | PEEP_NONINSN);
+		    sprintf(funtail->text, ".r:");
+		    done_rlab = 1;
+		}
+		if (our_regmask) {
+		    i386_newins(PEEP_UPAIR | PEEP_VPAIR
+				| PEEP_STACK | PEEP_ESPX);
+		    sprintf(funtail->text, "lea esp,[ebp-%d]", local_off);
+		    peep386_readreg(V_EBP, PEEP_AGI);
+		    for (i = R_V1+NVARREGS; --i >= R_V1 ;)
+			if (our_regmask & regbit(i)) {
+			    i386_newins(PEEP_UPAIR | PEEP_VPAIR
+					| PEEP_STACK | PEEP_ESPI);
+			    sprintf(funtail->text, "pop %s", v2s[i]);
+			}
+		    i386_newins(PEEP_UPAIR | PEEP_VPAIR
+				| PEEP_STACK | PEEP_ESPI);
+		    sprintf(funtail->text, "pop ebp");
+		} else {
+		    i386_newins(PEEP_NONBB);
+		    sprintf(funtail->text, "leave");
+		}
+		i386_newins(PEEP_NONBB);
+		sprintf(funtail->text, "ret");
+	    } else {
+		char *opcode = "jmp";
+		switch (op & Q_MASK & (~Q_UBIT)) {
+		  case Q_EQ & ~Q_UBIT: opcode = "je near";   break;
+		  case Q_NE & ~Q_UBIT: opcode = "jne near";  break;
+		  case Q_HS & ~Q_UBIT: opcode = "jae near";  break;
+		  case Q_LO & ~Q_UBIT: opcode = "jb near";   break;
+		  case Q_PL & ~Q_UBIT: opcode = "jpo near";  break;
+		  case Q_MI & ~Q_UBIT: opcode = "jmi near";  break;
+		  case Q_HI & ~Q_UBIT: opcode = "ja near";   break;
+		  case Q_LS & ~Q_UBIT: opcode = "jbe near";  break;
+		  case Q_LT & ~Q_UBIT: opcode = "jl near";   break;
+		  case Q_GT & ~Q_UBIT: opcode = "jg near";   break;
+		  case Q_LE & ~Q_UBIT: opcode = "jle near";  break;
+		  case Q_GE & ~Q_UBIT: opcode = "jge near";  break;
+		  case Q_AL & ~Q_UBIT: opcode = "jmp";       break;
+		  case Q_NOT & ~Q_UBIT: opcode = "; jnever"; break;
+		}
+		i386_newins(PEEP_NONBB);
+		if (vm.l == RETLAB)
+		    sprintf(funtail->text, "%s .r", opcode);
+		else
+		    sprintf(funtail->text, "%s .j%d ;%08x", opcode,
+			    vm.l->name, op);
+	    }
+	}
+	break;
+      case J_MOVR:
+	i386_newins(PEEP_UPAIR | PEEP_VPAIR);
+	/*
+	 * FIXME. Special case here: if mr is slaved to something,
+	 * we need to know this.
+	 */
+	val = peep386_readregv(mr, 0);
+	sprintf(funtail->text, "mov %s,%s", v2s[r1r], val ? val : v2s[mr]);
+	if (val)
+	    peep386_writereg(r1r, val);
+	else
+	    peep386_slavereg(r1r, mr);
+	break;
+      case J_EXTEND:
+	/*
+	 * MOVSX has an 0F prefix, thus pairs only in the U-pipe on
+	 * the classic Pentium. The MMX can pair it in either pipe.
+	 */
+	i386_newins(PEEP_UPAIR | (mmx ? PEEP_VPAIR : 0));
+	if (byteable(r2r) || m != 1) {
+	    sprintf(funtail->text, "movsx %s,%s", v2s[r1r],
+		    m == 1 ? v2bs[r2r] : v2ws[r2r]);
+	    peep386_readreg(r2r, 0);
+	    peep386_writereg(r1r, NULL);
+	} else {
+	    /*
+	     * This shouldn't happen, because the register
+	     * allocator has been bodged to avoid giving us this
+	     * case.
+	     */
+	    sprintf(funtail->text, "%%error \"extend from unbyteable reg\"");
+	}
+	break;
+      case J_MOVK:
+	i386_newins(PEEP_UPAIR | PEEP_VPAIR);
+	sprintf(funtail->text, "mov %s,%d", v2s[r1r], m);
+	val = 1+strchr(funtail->text, ',');   /* point to value part */
+	peep386_writereg(r1r, val);
+	break;
+      case J_LDRK: case J_LDRBK: case J_LDRWK: case J_LDRLK:
+	val = peep386_readregv(r2r, PEEP_AGI | PEEP_CANSLAVE);
+	if (opm == J_LDRK || opm == J_LDRLK) {
+	    i386_newins(PEEP_RDMEM | PEEP_UPAIR | PEEP_VPAIR);
+	    sprintf(funtail->text, "mov %s,[%s+%d]", v2s[r1r],
+		    val ? val : v2s[r2r], m);
+	} else {
+	    /*
+	     * MOVSX has an 0F prefix, thus pairs only in the
+	     * U-pipe on the classic Pentium. The MMX can pair it
+	     * in either pipe.
+	     */
+	    i386_newins(PEEP_RDMEM | PEEP_UPAIR | (mmx ? PEEP_VPAIR : 0));
+	    sprintf(funtail->text, "mov%cx %s,%s [%s+%d]",
+		    (op & Q_UBIT ? 'z' : 's'), v2s[r1r],
+		    (opm == J_LDRBK ? "byte" : "word"),
+		    val ? val : v2s[r2r], m);
+	}
+	peep386_writereg(r1r, NULL);
+	break;
+      case J_LDRFK: case J_LDRDK:
+	i386_newins(PEEP_FPU | PEEP_RDMEM);
+	val = peep386_readregv(r2r, PEEP_AGI | PEEP_CANSLAVE);
+	sprintf(funtail->text, "fld %cword [%s+%d]",
+		op == J_LDRFK ? 'd' : 'q', val ? val : v2s[r2r], m);
+	i386_newins(PEEP_FPU);
+	sprintf(funtail->text, "fstp %s", v2s[r1r+1]);
+	break;
+      case J_LDRR: case J_LDRBR: case J_LDRWR: case J_LDRLR:
+	i386_newins(PEEP_UPAIR | PEEP_VPAIR | PEEP_RDMEM);
+	val = peep386_readregv(r2r, PEEP_AGI | PEEP_CANSLAVE);
+	val2 = peep386_readregv(mr, PEEP_AGI | PEEP_CANSLAVE);
+	if (val && val2) {
+	    val2 = NULL;
+	    peep386_readreg(mr, PEEP_AGI);   /* can't have two relocatables */
+	}
+	if (opm == J_LDRR || opm == J_LDRLR)
+	    sprintf(funtail->text, "mov %s,[%s+%s]",
+		    v2s[r1r], val ? val : v2s[r2r], val2 ? val2 : v2s[mr]);
+	else
+	    sprintf(funtail->text, "mov%cx %s,%s [%s+%s]",
+		    (op & Q_UBIT ? 'z' : 's'), v2s[r1r],
+		    (opm == J_LDRBR ? "byte" : "word"),
+		    val ? val : v2s[r2r], val2 ? val2 : v2s[mr]);
+	peep386_writereg(r1r, NULL);
+	break;
+      case J_LDRFR: case J_LDRDR:
+	i386_newins(PEEP_FPU);
+	val = peep386_readregv(r2r, PEEP_AGI | PEEP_CANSLAVE);
+	val2 = peep386_readregv(mr, PEEP_AGI | PEEP_CANSLAVE);
+	if (val && val2) {
+	    val2 = NULL;
+	    peep386_readreg(mr, PEEP_AGI);   /* can't have two relocatables */
+	}
+	sprintf(funtail->text, "fld %cword [%s+%s]",
+		op == J_LDRFR ? 'd' : 'q', val ? val : v2s[r2r],
+		val2 ? val2 : v2s[mr]);
+	i386_newins(PEEP_FPU);
+	sprintf(funtail->text, "fstp %s", v2s[r1r+1]);
+	break;
+      case J_STRK: case J_STRBK: case J_STRWK: case J_STRLK:
+	/*
+	 * FIXME: sort out mov [mem],eax
+	 */
+	i386_newins(PEEP_UPAIR | (opm == J_STRWK ? 0 : PEEP_VPAIR)
+		    | PEEP_WRMEM);
+	val = peep386_readregv(r2r, PEEP_AGI | PEEP_CANSLAVE);
+	if (opm == J_STRK || opm == J_STRLK)
+	    sprintf(funtail->text, "mov [%s+%d],%s",
+		    val ? val : v2s[r2r], m, v2s[r1r]);
+	else {
+	    if (opm == J_STRBK && !byteable(r1r)) {
+		sprintf(funtail->text, "%%error \"STRBK from unbyteable %s\"",
+			v2s[r1r]);
+	    } else
+		sprintf(funtail->text, "mov [%s+%d],%s",
+			val ? val : v2s[r2r], m,
+			(opm == J_STRBK ? v2bs : v2ws)[r1r]);
+	}
+	peep386_readreg(r1r, 0);
+	break;
+      case J_STRFK: case J_STRDK:
+	if (r1r != R_F0) {
+	    i386_newins(PEEP_FPU);
+	    sprintf(funtail->text, "fld %s", v2s[r1r]);
+	}
+	i386_newins(PEEP_FPU | PEEP_WRMEM);
+	val = peep386_readregv(r2r, PEEP_AGI | PEEP_CANSLAVE);
+	sprintf(funtail->text, "fst%s %cword [%s+%d]", (r1r==R_F0 ? "" : "p"),
+		op == J_STRFK ? 'd' : 'q', val ? val : v2s[r2r], m);
+	break;
+      case J_STRR: case J_STRBR: case J_STRWR: case J_STRLR:
+	i386_newins(PEEP_UPAIR | (opm == J_STRWR ? 0 : PEEP_VPAIR)
+		    | PEEP_WRMEM);
+	val = peep386_readregv(r2r, PEEP_AGI | PEEP_CANSLAVE);
+	val2 = peep386_readregv(mr, PEEP_AGI | PEEP_CANSLAVE);
+	if (val && val2) {
+	    val2 = NULL;
+	    peep386_readreg(mr, PEEP_AGI);   /* can't have two relocatables */
+	}
+	if (opm == J_STRR || opm == J_STRLR)
+	    sprintf(funtail->text, "mov [%s+%s],%s",
+		    val ? val : v2s[r2r], val2 ? val2 : v2s[mr], v2s[r1r]);
+	else {
+	    if (opm == J_STRBR && !byteable(r1r)) {
+		sprintf(funtail->text, "%%error \"STRBR from unbyteable %s\"",
+			v2s[r1r]);
+	    }
+	    sprintf(funtail->text, "mov [%s+%s],%s",
+		    val ? val : v2s[r2r], val2 ? val2 : v2s[mr],
+		    (opm == J_STRBR ? v2bs : v2ws)[r1r]);
+	}
+	peep386_readreg(r1r, 0);
+	break;
+      case J_STRFR: case J_STRDR:
+	val = peep386_readregv(r2r, PEEP_AGI | PEEP_CANSLAVE);
+	val2 = peep386_readregv(mr, PEEP_AGI | PEEP_CANSLAVE);
+	if (val && val2) {
+	    val2 = NULL;
+	    peep386_readreg(mr, PEEP_AGI);   /* can't have two relocatables */
+	}
+	if (r1r != R_F0) {
+	    i386_newins(PEEP_FPU);
+	    sprintf(funtail->text, "fld %s", v2s[r1r]);
+	}
+	i386_newins(PEEP_FPU | PEEP_WRMEM);
+	sprintf(funtail->text, "fst%s %cword [%s+%s]", (r1r==R_F0 ? "" : "p"),
+		op == J_STRFR ? 'd' : 'q', val ? val : v2s[r2r],
+		val2 ? val2 : v2s[mr]);
+	break;
+      case J_ADDR:
+	i386_newins(PEEP_UPAIR | PEEP_VPAIR);
+	if (r1r == mr) {
+	    val = peep386_readregv(r2r, PEEP_CANSLAVE);
+	    sprintf(funtail->text, "add %s,%s", v2s[r1r],
+		    val ? val : v2s[r2r]);
+	    peep386_readreg(mr, 0);
+	} else if (r1r == r2r) {
+	    val = peep386_readregv(mr, PEEP_CANSLAVE);
+	    sprintf(funtail->text, "add %s,%s", v2s[r1r],
+		    val ? val : v2s[mr]);
+	    peep386_readreg(r2r, 0);
+	} else {
+	    val = peep386_readregv(r2r, PEEP_AGI | PEEP_CANSLAVE);
+	    val2 = peep386_readregv(mr, PEEP_AGI | PEEP_CANSLAVE);
+	    if (val && val2) {	       /* at most one relocatable */
+		val2 = NULL;
+		peep386_readreg(mr, PEEP_AGI);
+	    }
+	    sprintf(funtail->text, "lea %s,[%s+%s]",
+		    v2s[r1r], val ? val : v2s[r2r], val2 ? val2 : v2s[mr]);
+	}
+	peep386_writereg(r1r, NULL);
+	break;
+      case J_ADDK:
+	i386_newins(PEEP_UPAIR | PEEP_VPAIR);
+	if (r1r == r2r) {
+	    sprintf(funtail->text, "add %s,%d", v2s[r1r], m);
+	    peep386_readreg(r2r, 0);
+	    peep386_writereg(r1r, NULL);
+	} else {
+	    val = peep386_readregv(r2r, PEEP_AGI);
+	    if (val) {
+		sprintf(funtail->text, "mov %s,%s+%d", v2s[r1r], val, m);
+		val = 1+strchr(funtail->text, ',');  /* point to value part */
+		peep386_writereg(r1r, val);
+	    } else {
+		sprintf(funtail->text, "lea %s,[%s+%d]",
+			v2s[r1r], v2s[r2r], m);
+		peep386_writereg(r1r, NULL);
+	    }
+	}
+	break;
+      case J_ADDFR: case J_ADDDR:
+	fpdiad386("fadd", "fadd", r1r, r2r, mr);
+	break;
+      case J_SUBR:
+	i386_newins(PEEP_UPAIR | PEEP_VPAIR);
+	if (r1r == mr) {
+	    val = peep386_readregv(r2r, PEEP_CANSLAVE);
+	    sprintf(funtail->text, "sub %s,%s", v2s[r1r],
+		    val ? val : v2s[r2r]);
+	    peep386_readreg(mr, 0);
+	    peep386_writereg(r1r, NULL);
+	} else if (r1r == r2r) {
+	    val = peep386_readregv(mr, PEEP_CANSLAVE);
+	    sprintf(funtail->text, "sub %s,%s", v2s[r1r],
+		    val ? val : v2s[mr]);
+	    peep386_readreg(r2r, 0);
+	    peep386_writereg(r1r, NULL);
+	} else {
+	    val = peep386_readregv(r2r, PEEP_CANSLAVE);
+	    sprintf(funtail->text, "mov %s,%s", v2s[r1r],
+		    val ? val : v2s[r2r]);
+	    peep386_writereg(r1r, val);
+	    i386_newins(PEEP_UPAIR | PEEP_VPAIR);
+	    val = peep386_readregv(mr, PEEP_CANSLAVE);
+	    sprintf(funtail->text, "sub %s,%s", v2s[r1r],
+		    val ? val : v2s[mr]);
+	    peep386_readreg(r1r, 0);
+	    peep386_writereg(r1r, NULL);
+	}
+	break;
+      case J_SUBK:
+	i386_newins(PEEP_UPAIR | PEEP_VPAIR);
+	if (r1r == r2r) {
+	    sprintf(funtail->text, "sub %s,%d", v2s[r1r], m);
+	    peep386_readreg(r2r, 0);
+	    peep386_writereg(r1r, NULL);
+	} else {
+	    val = peep386_readregv(r2r, PEEP_AGI);
+	    if (val) {
+		sprintf(funtail->text, "mov %s,%s-%d", v2s[r1r], val, m);
+		val = 1+strchr(funtail->text, ',');  /* point to value part */
+		peep386_writereg(r1r, val);
+	    } else {
+		sprintf(funtail->text, "lea %s,[%s-%d]",
+			v2s[r1r], v2s[r2r], m);
+		peep386_writereg(r1r, NULL);
+	    }
+	}
+	break;
+      case J_SUBFR: case J_SUBDR:
+	fpdiad386("fsub", "fsubr", r1r, r2r, mr);
+	break;
+      case J_ANDR: case J_ORRR: case J_EORR:
+	i386_newins(PEEP_UPAIR | PEEP_VPAIR);
+	name = (opm == J_ANDR ? "and" : opm == J_ORRR ? "or" : "xor");
+	if (r1r == mr) {
+	    val = peep386_readregv(r2r, PEEP_CANSLAVE);
+	    sprintf(funtail->text, "%s %s,%s", name, v2s[r1r],
+		    val ? val : v2s[r2r]);
+	    peep386_readreg(mr, 0);
+	    peep386_writereg(r1r, NULL);
+	} else if (r1r == r2r) {
+	    val = peep386_readregv(mr, PEEP_CANSLAVE);
+	    sprintf(funtail->text, "%s %s,%s", name, v2s[r1r],
+		    val ? val : v2s[mr]);
+	    peep386_readreg(r2r, 0);
+	    peep386_writereg(r1r, NULL);
+	} else {
+	    val = peep386_readregv(r2r, PEEP_CANSLAVE);
+	    sprintf(funtail->text, "mov %s,%s", v2s[r1r],
+		    val ? val : v2s[r2r]);
+	    peep386_writereg(r1r, val);
+	    i386_newins(PEEP_UPAIR | PEEP_VPAIR);
+	    val = peep386_readregv(mr, PEEP_CANSLAVE);
+	    sprintf(funtail->text, "%s %s,%s", name, v2s[r1r],
+		    val ? val : v2s[mr]);
+	    peep386_readreg(r1r, 0);
+	    peep386_writereg(r1r, NULL);
+	}
+	break;
+      case J_ANDK: case J_ORRK: case J_EORK:
+	i386_newins(PEEP_UPAIR | PEEP_VPAIR);
+	name = (opm == J_ANDK ? "and" : opm == J_ORRK ? "or" : "xor");
+	if (r1r != r2r) {
+	    val = peep386_readregv(r2r, PEEP_CANSLAVE);
+	    sprintf(funtail->text, "mov %s,%s", v2s[r1r],
+		    val ? val : v2s[r2r]);
+	    peep386_writereg(r1r, val);
+	    i386_newins(PEEP_UPAIR | PEEP_VPAIR);
+	}
+	sprintf(funtail->text, "%s %s,%d", name, v2s[r1r], m);
+	peep386_readreg(r1r, 0);
+	peep386_writereg(r1r, NULL);
+	break;
+      case J_SHLK:
+	/*
+	 * FIXME: we should be able to do better than this.
+	 * Constant SHLK with 1<=m<=3 can also be done using LEA,
+	 * which can pair in the V-pipe but may also suffer AGI
+	 * stalls. We should leave the choice open until the
+	 * pipeline scheduler knows what it wants.
+	 */
+	if (r1r != r2r) {
+	    i386_newins(PEEP_UPAIR | PEEP_VPAIR);
+	    val = peep386_readregv(r2r, PEEP_CANSLAVE);
+	    sprintf(funtail->text, "mov %s,%s", v2s[r1r],
+		    val ? val : v2s[r2r]);
+	    peep386_writereg(r1r, val);
+	}
+	i386_newins(PEEP_UPAIR);
+	sprintf(funtail->text, "shl %s,%d", v2s[r1r], m);
+	peep386_readreg(r1r, 0);
+	peep386_writereg(r1r, NULL);
+	break;
+      case J_SHRK:
+	if (r1r != r2r) {
+	    i386_newins(PEEP_UPAIR | PEEP_VPAIR);
+	    val = peep386_readregv(r2r, PEEP_CANSLAVE);
+	    sprintf(funtail->text, "mov %s,%s", v2s[r1r],
+		    val ? val : v2s[r2r]);
+	    peep386_writereg(r1r, val);
+	}
+	i386_newins(PEEP_UPAIR);
+	peep386_readreg(r1r, 0);
+	sprintf(funtail->text, "s%cr %s,%d",
+		(op & J_SIGNED ? 'a' : 'h'), v2s[r1r], m);
+	peep386_writereg(r1r, NULL);
+	break;
+      case J_SHLR: case J_SHRR:
+	/*
+	 * The register allocator has a bodge so it knows ECX gets
+	 * corrupted by attempting to do this. Hence we can play
+	 * with ECX...
+	 */
+	name = (opm == J_SHLR ? "shl" : op & J_SIGNED ? "sar" : "shr");
+	if (mr != V_ECX) {
+	    i386_newins(PEEP_NONINSN);
+	    sprintf(funtail->text, "%%error \"shift count not ecx: %s\"",
+		    v2s[mr]);
+	}
+	if (r1r != r2r) {
+	    i386_newins(PEEP_UPAIR | PEEP_VPAIR);
+	    val = peep386_readregv(r2r, PEEP_CANSLAVE);
+	    sprintf(funtail->text, "mov %s,%s", v2s[r1r],
+		    val ? val : v2s[r2r]);
+	    peep386_writereg(r1r, val);
+	}
+	i386_newins(0);
+	sprintf(funtail->text, "%s %s,cl", name, v2s[r1r]);
+	peep386_readreg(r1r, 0);
+	peep386_readreg(mr, 0);
+	peep386_writereg(r1r, NULL);
+	break;
+      case J_NEGR: case J_NOTR:
+	/*
+	 * FIXME: NOT should be replaced with a pairable constant
+	 * XOR. NEG may well usually be better off being subtract-
+	 * from-zero; certainly MOV R1,R2 / NEG R1 is far inferior
+	 * to XOR R1,R1 / SUB R1,R2. Not sure what happens when
+	 * R1==R2 though.
+	 */
+	if (r1r != mr) {
+	    i386_newins(PEEP_UPAIR | PEEP_VPAIR);
+	    val = peep386_readregv(mr, PEEP_CANSLAVE);
+	    sprintf(funtail->text, "mov %s,%s", v2s[r1r],
+		    val ? val : v2s[mr]);
+	    peep386_writereg(r1r, val);
+	}
+	i386_newins(0);
+	sprintf(funtail->text, "%s %s", (opm == J_NEGR ? "neg" : "not"),
+		v2s[r1r]);
+	peep386_readreg(r1r, 0);
+	peep386_writereg(r1r, NULL);
+	break;
+      case J_DIVR: case J_REMR:
+	/*
+	 * The register allocator has been bodged so that it should
+	 * give us r2 == EAX and r1 == (either EAX or EDX whichever
+	 * is right for the opcode). Thus we need do very little:
+	 * extend EAX to EDX:EAX (by clearing EDX or using CDQ
+	 * depending on signedness), and perform the division.
+	 */
+	i386_newins(op & Q_UBIT ? PEEP_UPAIR | PEEP_VPAIR : 0);
+	if (op & Q_UBIT)
+	    sprintf(funtail->text, "mov edx,0");
+	else {
+	    sprintf(funtail->text, "cdq");
+	    peep386_readreg(V_EAX, 0);
+	}
+	peep386_writereg(V_EDX, NULL);
+	i386_newins(0);
+	sprintf(funtail->text, "%sdiv %s", (op & Q_UBIT ? "" : "i"), v2s[mr]);
+	peep386_readreg(V_EAX, 0);
+	peep386_readreg(V_EDX, 0);
+	peep386_readreg(mr, 0);
+	result = (opm == J_REMR ? V_EDX : V_EAX);
+	if (r1r != result) {
+	    i386_newins(PEEP_NONINSN);
+	    sprintf(funtail->text, "%%error \"%s should be %s in divr/remr\"",
+		    v2s[r1r], v2s[result]);
+	}
+	peep386_deadreg(V_EAX);
+	peep386_deadreg(V_EDX);
+	peep386_writereg(result, NULL);
+	break;
+      case J_DIVFR: case J_DIVDR:
+	fpdiad386("fdiv", "fdivr", r1r, r2r, mr);
+	break;
+      case J_MULR:
+	/*
+	 * The register allocator knows we're corrupting EDX, so we
+	 * need not bother to save it. We also know r1 == r2 ==
+	 * EAX.
+	 */
+	if (r1r != V_EAX || r2r != V_EAX) {
+	    i386_newins(PEEP_NONINSN);
+	    sprintf(funtail->text, "%%error \"r1r=%s r2r=%s in mulr\"",
+		    v2s[r1r], v2s[r2r]);
+	}
+	i386_newins(0);
+	sprintf(funtail->text, "%smul %s",
+		op & Q_UBIT ? "" : "i", v2s[mr]);
+	peep386_readreg(V_EAX, 0);
+	peep386_readreg(mr, 0);
+	peep386_writereg(V_EAX, NULL);
+	peep386_deadreg(V_EDX);
+	break;
+      case J_MULFR: case J_MULDR:
+	fpdiad386("fmul", "fmul", r1r, r2r, mr);
+	break;
+      case J_MOVFR: case J_MOVDR: case J_MOVFDR: case J_MOVDFR:
+	if (mr != R_F0) {
+	    i386_newins(PEEP_FPU);
+	    sprintf(funtail->text, "fld %s", v2s[mr]);
+	}
+	i386_newins(PEEP_FPU);
+	sprintf(funtail->text, "fst%s %s", (mr==R_F0 ? "" : "p"), v2s[r1r+1]);
+	break;
+      case J_CMPR:
+	i386_newins(PEEP_UPAIR | PEEP_VPAIR);
+	val = peep386_readregv(mr, PEEP_CANSLAVE);
+	sprintf(funtail->text, "cmp %s,%s", v2s[r2r], val ? val : v2s[mr]);
+	peep386_readreg(r2r, 0);
+	break;
+      case J_CMPK:
+	i386_newins(PEEP_UPAIR | PEEP_VPAIR);
+	sprintf(funtail->text, "cmp %s,%d", v2s[r2r], m);
+	peep386_readreg(r2r, 0);
+	break;
+      case J_CMPFR: case J_CMPDR:
+	if (r2r != R_F0) {
+	    i386_newins(PEEP_FPU);
+	    sprintf(funtail->text, "fld %s", v2s[r2r]);
+	}
+	i386_newins(PEEP_FPU);
+	sprintf(funtail->text, "fcom%s %s", (r2r==R_F0 ? "" : "p"),
+		v2s[mr+1]);
+	i386_newins(PEEP_STACK | PEEP_UPAIR | PEEP_VPAIR | PEEP_ESPI);
+	sprintf(funtail->text, "push eax");
+	peep386_readreg(V_EAX, 0);
+	i386_newins(PEEP_FPU);
+	sprintf(funtail->text, "fnstsw ax");
+	i386_newins(PEEP_UPAIR | PEEP_VPAIR);
+	sprintf(funtail->text, "and ah,0x41");
+	peep386_writereg(V_EAX, NULL);
+	i386_newins(PEEP_UPAIR | PEEP_VPAIR);
+	sprintf(funtail->text, "add ah,0x7F");
+	peep386_readreg(V_EAX, 0);
+	peep386_writereg(V_EAX, NULL);
+	i386_newins(PEEP_UPAIR | PEEP_VPAIR);
+	sprintf(funtail->text, "cmp ah,0xBF");
+	peep386_readreg(V_EAX, 0);
+	peep386_writereg(V_EAX, NULL);
+	i386_newins(PEEP_UPAIR | PEEP_VPAIR | PEEP_STACK | PEEP_ESPI);
+	sprintf(funtail->text, "pop eax");
+	peep386_writereg(V_EAX, NULL);
+	break;
+      case J_FLTDR: case J_FLTFR:
+	i386_newins(PEEP_UPAIR | PEEP_VPAIR | PEEP_STACK | PEEP_ESPI);
+	sprintf(funtail->text, "push %s", v2s[mr]);
+	peep386_readreg(mr, 0);
+	i386_newins(PEEP_FPU | PEEP_STACK);
+	sprintf(funtail->text, "fild dword [esp]");
+	peep386_readreg(V_ESP, PEEP_AGI);
+	i386_newins(PEEP_UPAIR | PEEP_VPAIR | PEEP_STACK | PEEP_ESPX);
+	sprintf(funtail->text, "add esp,byte 4");
+	i386_newins(PEEP_FPU);
+	sprintf(funtail->text, "fstp %s", v2s[r1r+1]);
+	break;
+      case J_FIXDR: case J_FIXFR:
+	i386_newins(PEEP_UPAIR | PEEP_VPAIR | PEEP_STACK | PEEP_ESPX);
+	sprintf(funtail->text, "sub esp,byte 4");
+	if (mr != R_F0) {
+	    i386_newins(PEEP_FPU);
+	    sprintf(funtail->text, "fld %s", v2s[mr]);
+	}
+	i386_newins(PEEP_FPU | PEEP_STACK);
+	sprintf(funtail->text, "fst%s dword [esp]", (mr==R_F0 ? "" : "p"));
+	peep386_readreg(V_ESP, PEEP_AGI);
+	i386_newins(PEEP_UPAIR | PEEP_VPAIR | PEEP_STACK | PEEP_ESPI);
+	sprintf(funtail->text, "pop %s", v2s[r1r]);
+	peep386_writereg(r1r, NULL);
+	break;
+      case J_NEGFR: case J_NEGDR:
+	if (mr != R_F0) {
+	    i386_newins(PEEP_FPU);
+	    sprintf(funtail->text, "fld %s", v2s[mr]);
+	}
+	i386_newins(PEEP_FPU);
+	sprintf(funtail->text, "fchs");
+	if (r1r != R_F0 || mr != R_F0) {
+	    i386_newins(PEEP_FPU);
+	    sprintf(funtail->text, "fst%s %s", (mr==R_F0 ? "" : "p"),
+		    v2s[r1r+1]);
+	}
+	break;
+      case J_PUSHM:
+	for (i=NINTREGS; i-- ;) if (m & regbit(i)) {
+	    i386_newins(PEEP_UPAIR | PEEP_VPAIR | PEEP_STACK | PEEP_ESPI);
+	    val = peep386_readregv(i, PEEP_CANSLAVE);
+	    if (val) {
+		sprintf(funtail->text, "push dword %s", val);
+	    } else {
+		sprintf(funtail->text, "push %s", v2s[i]);
+	    }
+	}
+	break;
+      case J_PUSHF:
+	i386_newins(PEEP_UPAIR | PEEP_VPAIR | PEEP_STACK | PEEP_ESPX);
+	sprintf(funtail->text, "sub esp,byte 4");
+	i386_newins(PEEP_FPU);
+	sprintf(funtail->text, "fld %s", v2s[r1r]);
+	i386_newins(PEEP_FPU | PEEP_STACK);
+	sprintf(funtail->text, "fstp dword [esp]");
+	peep386_readreg(V_ESP, PEEP_AGI);
+	break;
+      case J_PUSHD:
+	i386_newins(PEEP_UPAIR | PEEP_VPAIR | PEEP_STACK | PEEP_ESPX);
+	sprintf(funtail->text, "sub esp,byte 8");
+	i386_newins(PEEP_FPU);
+	sprintf(funtail->text, "fld %s", v2s[r1r]);
+	i386_newins(PEEP_FPU | PEEP_STACK);
+	sprintf(funtail->text, "fstp qword [esp]");
+	peep386_readreg(V_ESP, PEEP_AGI);
+	break;
+      case J_SETSP:
+	i386_newins(PEEP_UPAIR | PEEP_VPAIR | PEEP_STACK | PEEP_ESPX);
+	sprintf(funtail->text, "add esp,%d ; SETSP, old=%d, new=%d",
+		vr2.i-m, vr2.i, m);
+	break;
+      case J_ADCON:
+	i386_newins(PEEP_UPAIR | PEEP_VPAIR);
+	sprintf(funtail->text, "mov %s,%d+$%s",
+		v2s[r1r], vr2.i, symname_(vm.sym));
+	val = 1+strchr(funtail->text, ',');   /* point to value part */
+	peep386_writereg(r1r, val);
+	break;
+      case J_CALLK:
+	i386_newins(PEEP_NONBB);
+	sprintf(funtail->text, "call $%s", symname_(vm.sym));
+	peep386_clearbb();
+	break;
+      case J_CALLR:
+	i386_newins(PEEP_NONBB);
+	sprintf(funtail->text, "call %s", v2s[mr]);
+	peep386_readreg(mr, 0);
+	peep386_clearbb();
+	break;
+      default:
+	i386_newins(PEEP_NONINSN);
+	sprintf(funtail->text, "%%error \"opcode %d (%s)\"", opm,
+		joptable[opm].name);
+	break;
+    }
+
+    peep386_killregs();
+}
+
+static void i386_newins(int flags) {
+    i386ins *temp = (i386ins *)malloc(sizeof(*temp));
+
+    if (funtail)
+	funtail->next = temp;
+    else
+	funhead = temp;
+    temp->prev = funtail;
+    funtail = temp;
+    temp->next = NULL;
+
+    funtail->peepflags = flags;
+    memset(funtail->readreg, 0, sizeof(funtail->readreg));
+    memset(funtail->writereg, 0, sizeof(funtail->writereg));
+}
+
+static void fpdiad386(char *oneway, char *otherway,
+		      RealRegister r1r, RealRegister r2r, RealRegister mr) {
+    if (r1r == R_F0 && r2r == R_F0) {
+	/*
+	 * F0 := F0 <op> mr
+	 */
+	i386_newins(PEEP_FPU);
+	sprintf(funtail->text, "%s %s", oneway, v2s[mr]);
+    } else if (r1r == R_F0 && mr == R_F0) {
+	/*
+	 * F0 := mr <op> F0
+	 */
+	i386_newins(PEEP_FPU);
+	sprintf(funtail->text, "%s %s", otherway, v2s[r2r]);
+    } else if (r1r == r2r) {
+	/*
+	 * push mr; r1r := r1r <op> F0 and pop
+	 */
+	i386_newins(PEEP_FPU);
+	sprintf(funtail->text, "fld %s", v2s[mr]);
+	i386_newins(PEEP_FPU);
+	sprintf(funtail->text, "%sp %s", oneway, v2s[r1r+1]);
+    } else if (r1r == mr) {
+	/*
+	 * push r2r; r1r := F0 <op> r1r and pop
+	 */
+	i386_newins(PEEP_FPU);
+	sprintf(funtail->text, "fld %s", v2s[r2r]);
+	i386_newins(PEEP_FPU);
+	sprintf(funtail->text, "%sp %s", otherway, v2s[r1r+1]);
+    } else {
+	/*
+	 * push r2r; F0 := F0 <op> mr; pop to r1r
+	 */
+	i386_newins(PEEP_FPU);
+	sprintf(funtail->text, "fld %s", v2s[r2r]);
+	i386_newins(PEEP_FPU);
+	sprintf(funtail->text, "%s %s", oneway, v2s[mr+1]);
+	i386_newins(PEEP_FPU);
+	sprintf(funtail->text, "fstp %s", v2s[r1r+1]);
+    }
+}
+
+/*
+ * Peephole optimiser.
+ * -------------------
+ */
+
+static char *peep386_contents[NINTREGS];
+static i386ins *peep386_setat[NINTREGS];
+static int peep386_predead[NINTREGS];
+static int peep386_slave[NINTREGS];
+
+#define NOREG -1		       /* the null value in peep386_slave[] */
+
+static void peep386_slavereg(int dest, int source) {
+    char *text;
+
+    if (dest < 0 || dest >= NINTREGS) {
+	return;			       /* probably an FP reg; ignore */
+    }
+    if (dest == source) {
+	printf("Yikes!");
+	return;
+    }
+
+    /*
+     * Trash the old value.
+     */
+    peep386_deadreg(dest);
+    if (peep386_contents[dest])
+	free(peep386_contents[dest]);
+
+    /*
+     * Set the new value up.
+     */
+    text = malloc(4);
+    strcpy(text, v2s[source]);
+    peep386_contents[dest] = text;
+    peep386_setat[dest] = funtail;
+    peep386_predead[dest] = 0;
+    peep386_slave[dest] = source;
+}
+
+static void peep386_writereg(int reg, char *val) {
+    char *text;
+
+    if (reg < 0 || reg >= NINTREGS) {
+	return;			       /* probably an FP reg; ignore */
+    }
+
+    /*
+     * Get the value we're going to use.
+     */
+    if (val) {
+	text = malloc(3+strlen(val));
+	text[0] = '(';
+	strcpy(text+1, val);
+	strcat(text, ")");
+    } else
+	text = NULL;
+
+    /*
+     * Trash the old value.
+     */
+    peep386_deadreg(reg);
+    if (peep386_contents[reg])
+	free(peep386_contents[reg]);
+
+    /*
+     * Set the new value up.
+     */
+    peep386_contents[reg] = text;
+    peep386_setat[reg] = funtail;
+    peep386_predead[reg] = 0;
+    peep386_slave[reg] = NOREG;
+}
+
+static char *peep386_readregv(int reg, int flags) {
+    if (reg < 0 || reg >= NINTREGS) {
+	return NULL;		       /* probably an FP reg; ignore */
+    }
+    if (peep386_contents[reg] &&
+	((flags & PEEP_CANSLAVE) || peep386_slave[reg] == NOREG)) {
+	if (peep386_slave[reg] != NOREG) {
+	    peep386_readreg(peep386_slave[reg], flags);
+	}
+	return peep386_contents[reg];  /* short cut */
+    } else {
+	peep386_readreg(reg, flags);
+	return NULL;
+    }
+}
+
+static void peep386_readreg(int reg, int flags) {
+    if (reg < 0 || reg >= NINTREGS) {
+	return;			       /* probably an FP reg; ignore */
+    }
+    if (peep386_setat[reg])
+	peep386_setat[reg]->peepflags |= PEEP_NECESSARY;
+    funtail->readreg[reg] = (flags & PEEP_AGI ? 2 : 1);
+}
+
+static void peep386_predeadreg(int reg) {
+    if (reg < 0 || reg >= NINTREGS) {
+	return;			       /* probably an FP reg; ignore */
+    }
+    peep386_predead[reg] = 1;
+}
+
+static void peep386_killregs(void) {
+    int i;
+
+    for (i=0; i<NINTREGS; i++)
+	if (peep386_predead[i])
+	    peep386_deadreg(i);
+}
+
+static void peep386_deadreg(int reg) {
+    int i;
+
+    if (reg < 0 || reg >= NINTREGS) {
+	return;			       /* probably an FP reg; ignore */
+    }
+    if (peep386_setat[reg] &&
+	!(peep386_setat[reg]->peepflags & PEEP_NECESSARY))
+	peep386_setat[reg]->peepflags |= PEEP_DISCARDED;
+    for (i=0; i<NINTREGS; i++)
+	if (peep386_slave[i] == reg) {
+	    if (peep386_contents[i]) {
+		free(peep386_contents[i]);
+/*printf("freeing %p\n", peep386_contents[i]);*/
+		peep386_contents[i] = NULL;
+	    }
+	    peep386_slave[i] = NOREG;
+	}
+}
+
+static void peep386_clearbb(void) {
+    int i;
+
+    peep386_killregs();
+
+    for (i=0; i<NINTREGS; i++) {
+	if (peep386_contents[i])
+	    free(peep386_contents[i]);
+	peep386_contents[i] = NULL;
+	peep386_setat[i] = NULL;
+	peep386_slave[i] = NOREG;
+    }
+}
+
+static void peep386_init(void) {
+    int i;
+
+    for (i=0; i<NINTREGS; i++) {
+	peep386_contents[i] = NULL;
+	peep386_setat[i] = NULL;
+	peep386_slave[i] = NOREG;
+    }
+}

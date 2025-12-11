@@ -1,0 +1,458 @@
+Notes on target.h
+-----------------
+
+TARGET_HAS_ELF if the desired output is ELF. Not yet sure what this
+does: it may actually do ELF output, or it may simply flip the
+switch that governs the placing of leading underscores on C symbol
+names.
+
+TARGET_HAS_BSS presumably caters for weird architectures which don't
+support BSS sections.
+
+TARGET_IS_LITTLE_ENDIAN is obvious.
+
+TARGET_HAS_DEBUGGER also.
+
+TARGET_HAS_IEEE likewise.
+
+TARGET_HAS_MULTIPLY too.
+
+TARGET_HAS_DIVIDE as well.
+
+TARGET_HAS_TAILCALL. Not sure what this is. Possibly the ability to
+turn one function call into another, to save on stack when doing the
+sequence `call <somewhereelse> / ret'? Intel can do that if we munge
+the stack frame enough; we may want to use this feature.
+
+TARGET_LINKER_OMITS_DOLLAR. What bloody dollar? Where? Better
+investigate the rest of the sources to see what difference that
+define makes.
+
+TARGET_HAS_SCALED_ADDRESSING. I _think_ this is the one for Intel,
+as opposed to the next option.
+
+TARGET_HAS_SCALED_ADD. I imagine Alpha can do SCALED_ADD but not
+SCALED_ADDRESSING, so that addressing is faked. Intel does scaled
+addressing, but can use LEA with that to fake a scaled add...
+
+# define target_scalable(n, len) ((len) >= 0 && ((n) == 2 || (n) == 3))
+Not sure quite what that means... is n the bit shift for the
+scaling? Do Alpha S4ADD, S8ADD require positive scaled operands
+hence len>=0?
+
+/* #define TARGET_LACKS_MULDIV_LITERALS 1 */
+Must find out what this is.
+
+#define TARGET_LACKS_UNSIGNED_FIX 1
+And this.
+
+#define TARGET_LACKS_3WAY_COMPARE 1 /* This is probably a fair statement */
+And this too.
+
+/* #define TARGET_HAS_SWITCH_BRANCHTABLE 1 */
+Not to mention this.
+
+#define TARGET_HAS_BLOCKMOVE 1
+Block move instructions _will_ be fun. I can write a compiler which
+makes use of MMX! Cheer!
+
+#define TARGET_HAS_SCCK 1
+Who?
+
+#define TARGET_HAS_OTHER_IEEE_ORDER 1
+When?
+
+#define TARGET_FP_ARGS_CALLSTD2 1
+Whether?
+
+#define TARGET_FP_LITS_FROM_MEMORY 1
+Hmm. We _can_, but do we want to?
+
+#define TARGET_LITERALS_IN_DATASEG 1
+How do I handle the fact that in general we don't _need_ a literal
+pool?
+
+#define TARGET_LDRK_MAX  (0x7fffL)
+#define TARGET_LDRK_MIN (-TARGET_LDRK_MAX-1)
+
+#define TARGET_HAS_CONST_R_ZERO 1
+#  define R_ZERO 0            /* mapped by back-end */
+#define TARGET_HAS_CONST_R_FZERO 1
+#  define R_FZERO 32          /* mapped by back-end */
+Oh no we don't.
+
+#define NO_INSTORE_FILES 1
+Wibble?!
+
+#define _v2p(v) ((v)== 0L? 31L: (v)== 1L? 28L: (v)== 2L? 16L: (v)== 3L? 17L: \
+		 (v)== 4L? 18L: (v)== 5L? 19L: (v)== 6L? 20L: (v)== 7L? 21L: \
+		 (v)== 8L?  0L: (v)== 9L?  1L: (v)==10L?  2L: (v)==11L?  3L: \
+		 (v)==12L?  4L: (v)==13L?  5L: (v)==14L?  6L: (v)==15L?  7L: \
+		 (v)==16L?  8L: (v)==17L? 22L: (v)==18L? 23L: (v)==19L? 24L: \
+		 (v)==20L? 25L: (v)==21L? 27L: (v)==22L?  9L: (v)==23L? 10L: \
+		 (v)==24L? 11L: (v)==25L? 12L: (v)==26L? 13L: (v)==27L? 14L: \
+		 (v)==28L? 15L: (v)==29L? 29L: (v)==30L? 30L: (v)==31L? 26L: \
+		 v2p(v))
+
+Virt-to-phys mapping. Don't like the look of that - looks as if we
+won't be quite so easily able to fiddle the v2p mapping in
+mid-compile...
+
+#define R_TM0      18L          /* used by division & remainder */
+Ooh. Can I flag EDX here as being a pain wrt mul/div?
+
+#define R_IP       19L          /* universal temporary (r24)  */
+#define R_TM1      20L          /* another temporary (t11) */
+#define R_TM2      21L          /* another temporary (t12) */
+/* NB TM2 == PV, but PV is a name only used when calling a function */
+#define R_LR       31L          /* Link register (r26) */
+Don't _have_ a link register. This is going to be _fun_...
+
+#define R_A1  2L
+#define NARGREGS 6L      /* virtual 2-7,   physical 16-21 */
+No argregs on Intel...
+
+#define R_A1result 8L    /* virtual 8,     physical 0 */
+#define R_T1  8L
+#define NTEMPREGS 11L    /* virtual 8-18,  physical 0-8,22-23 */
+#define R_V1  22L
+#define R_GP  29L
+#define R_PV  21L
+#define NVARREGS 7L      /* virtual 22-28, physical 9-14 */
+I wonder which regs need saving across calls?
+
+#define NINTREGS 32L
+
+/* Make Floating point a straight copy */
+#define R_FA1 34L
+#define NFLTARGREGS 6L   /* 34-39, f2  - f7  */
+#define R_FA1result 40L  /* 40,    f8        */
+#define R_FT1 41L
+#define NFLTTEMPREGS 12L /* 41-52, f9  - f20 */
+#define R_FIP 33L        /* 33,    f1        */
+#define R_FV1 54L
+#define NFLTVARREGS 7L   /* 54-60, f22 - f28 */
+#define NFLTREGS 32L
+And FP will be _such_ fun *yikes*
+
+#define MAXGLOBINTREG 8L               /* OK? */
+#define MAXGLOBFLTREG 8L               /* OK? */
+I dunno. _Are_ they OK? And what do they do?
+
+#define R_SP	30L
+#define R_F0	32L		/* the lowest float reg */
+
+#define ALLOCATION_ORDER { 2, 3, 4, 5, 6, 7,            /*args */	\
+      8,						/*result */     \
+      9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 1,	/*tmp*/ 	\
+      22, 23, 24, 25, 26, 27, 28,			/*var*/		\
+      34, 35, 36, 37, 38, 39,                           /*fargs */	\
+      40,						/*fresult */	\
+      41, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 	/*ftemps */	\
+      54, 55, 56, 57, 58, 59, 60,			/*fvars */	\
+      255}
+Oh. Nice. Leave EDX until last, for example. Sweet.
+
+#define sizeof_int      4
+#define alignof_int     4       /* default! */
+All sane.
+
+#ifndef PTR_IS_32_BITS_EVEN_ON_ALPHA
+/*
+ * If you do not define sizeof_long to be 8 here (etc) they default to 4.
+ * At an early stage in bootstrapping the Alpha compiler we had a version
+ * that used 4-byte pointers and longs, but that requires a special
+ * trick version of the header files and libraries and is not supported
+ * for general use.
+ */
+#define sizeof_long     8
+#define sizeof_ptr      8
+#define alignof_long    8
+#define alignof_ptr     8
+#endif
+#define alignof_double  8
+#define alignof_toplevel  8
+#define alignof_struct  1
+
+#endif
+
+Looks as if I can leave that section out totally _anyway_!
+
+/* end of x86/target.h */
+
+------------------------------------
+
+TARGET_ADDRESSES_UNSIGNED: define if pointers, when implicitly
+converted to integers, become unsigned as opposed to signed
+integers. This seems to be a semantic issue in the C front end,
+resolved to everyone's satisfaction before even reaching the
+optimiser.
+
+TARGET_ALIGNS_DOUBLES: define if doublewords should be aligned on
+8-byte boundaries. Not sure it's actually tested anywhere - use
+`alignof_double' instead.
+
+TARGET_ALLOWS_COMPARE_CSES: define if we want to be able to do CSE
+between comparison expressions. Not convinced this requires any work
+in the back end, necessarily: we just define it, or don't define it,
+and see which gives better code/performance. It's probably related
+to the difference between Intel/ARM/etc having a CCR and Alpha
+having to make do with ordinary registers (thus, presumably, making
+it easier to buffer compare results in spare registers to re-use
+later).
+
+TARGET_CALL_USES_DESCRIPTOR: not entirely sure what this does, but
+from the name, I'd guess I don't have to worry about it.
+
+TARGET_CORRUPTS_SWITCH_REGISTER: define if the J_CASEBRANCH pseudo-
+op corrupts r1. FIXME: what does that actually mean?
+
+TARGET_COUNT_IS_PROC: define if J_COUNT is implemented as a
+procedure call. I don't know what J_COUNT _does_, but it's listed in
+jopcode.h as `not used at present', so I'm going to ignore it.
+
+TARGET_ENDIANNESS_CONFIGURABLE: fairly obvious.
+
+TARGET_FLAGS_VA_CALLS: don't know.
+
+TARGET_FP_ARGS_CALLSTD2
+TARGET_FP_ARGS_IN_FP_REGS
+ I wonder what these call standard things are. I can't remember the
+Intel calling standard for FP arguments _anyway_.
+
+TARGET_FP_LITS_FROM_MEMORY: I _think_ we define this if FP literals
+must be loaded from memory area. Intel does this, but I have no idea
+if it does it the same way FP_LITS would like it to.
+
+TARGET_GEN_NEEDS_VOLATILE_INFO: appears to do virtually nothing.
+
+TARGET_HAS_2ADDRESS_CODE: (FIXME: this is a guess) define if the
+target requires one source register to be the destination register
+in arithmetic operation instructions.
+
+TARGET_HAS_ADCON_AREA: if I knew what an adcon was, I'd know what
+this was about. But I don't. So I don't.
+
+TARGET_HAS_AOUT: define if a.out output is to be supported. Doesn't
+seem to do much.
+
+TARGET_HAS_BLOCKMOVE: this doesn't quite seem to do what I'd expect,
+in that in most of the places where it's tested with ifdef, the code
+conditional on it is also conditional on TARGET_IS_ARM. Short-
+sightedness in the middle end, or just plain weird? I don't know.
+
+TARGET_HAS_BSS: I'd guess some architectures can't handle BSS
+sections, so we define this if we can.
+
+TARGET_HAS_BYTE_INSTRUCTIONS: (presumably) define if we can handle
+operations on a byte at a time.
+
+TARGET_HAS_COFF: define if COFF output is to be supported. Doesn't
+seem to actually do a great deal.
+
+TARGET_HAS_COND_EXEC: define if we have conditional execution on
+ordinary instructions. Could be fun for Intel, given that PPro and
+above _can_ do it but only for MOV.
+
+TARGET_HAS_CONST_R_FZERO: define if there's a constant FP register
+hardwired to zero. Given the FLDZ instruction on Intel, we might
+actually want to pretend this exists.
+
+TARGET_HAS_CONST_R_ZERO: define if there's a constant integer
+register hardwired to zero.
+
+TARGET_HAS_DEBUGGER: define if it does.
+
+TARGET_HAS_DIVIDE: define if a hardware integer divide instruction
+exists.
+
+TARGET_HAS_DIVREM_FUNCTION: define if the division (function?
+instruction? does this only apply if !defined TARGET_HAS_DIVIDE?)
+returns both quotient and remainder, so that CSE can occur in
+expressions such as `a%100 + a/100'.
+
+TARGET_HAS_DIV_10_FUNCTION: apparently, define if there's a function
+to divide things by ten. Bizarre.
+
+TARGET_HAS_EBCDIC: pretty obvious, and yikes and yuck ;-)
+
+TARGET_HAS_ELF: define if ELF output is to be supported. Seems to do
+nothing: you'd expect it to at least toggle the leading-underscore
+behaviour on C symbol names, but apparently not.
+
+TARGET_HAS_FP_LITERALS: appears to assert the target's ability to
+use a literal operand in an FP instruction. FSVO literal, in Intel's
+case: maybe a literal pool _would_ be a nice idea after all...
+
+TARGET_HAS_HALFWORD_INSTRUCTIONS: (presumably) define if we can
+handle operations on a halfword at a time.
+
+TARGET_HAS_HARVARD_SEGS: yikes, I don't understand this at all. It
+seems to be related to fiddly things like literal pools, in which
+case we don't need to worry about it for Intel. Phew.
+
+TARGET_HAS_LINKER_NAME_LIMIT: define if the linker requires the
+ANSI-specified case-insensitive six-character semantics to be
+enforced on external variable names.
+
+TARGET_HAS_MULTIPLE_CODE_AREAS: don't know.
+
+TARGET_HAS_MULTIPLY: define if there's a hardware integer multiply
+instruction.
+
+TARGET_HAS_NEGATIVE_INDEXING: define if (presumably) you can index
+backwards from a base address.
+
+TARGET_HAS_NONFORTRAN_DIVIDE: apparently can be defined as an
+alternative to TARGET_HAS_DIVIDE. Seems to make no difference which
+one is defined.
+
+TARGET_HAS_NON_DBX_DEBUGGER: define if a debugger other than
+dbx-type is in use. Appears to be a MIPS thing?
+
+TARGET_HAS_OTHER_IEEE_ORDER: to do with the storage of IEEE 8-byte
+floats. Alpha leaves this alone so I guess I do too.
+
+TARGET_HAS_PROFILE: define for profiling support. [aaargh...]
+
+TARGET_HAS_RISING_STACK: seems obvious. We don't have one.
+
+TARGET_HAS_ROTATE: define if we have bit rotate instruction. Which
+we do. I wonder what it gets used for?
+
+TARGET_HAS_SCALED_ADD
+TARGET_HAS_SCALED_ADDRESSING
+TARGET_HAS_SCALED_OPS
+  Need to investigate these quite carefully to find out what's what.
+
+TARGET_HAS_SCCK: whazzat?
+
+TARGET_HAS_SEPARATE_CODE_DATA_SEGS: define if it's _required_ that
+everything other than actual instructions be put in the data
+segment. (We would need this, for example, if we were using a
+non-flat memory model and needed everything DS-relative except
+instructions.)
+
+TARGET_HAS_SIGN_EXTEND: we've got that, yeah.
+
+TARGET_HAS_SWITCH_BRANCHTABLE: seems to be documentary of stuff
+_inside_ the target backend. It appears to advise the middle end
+that the back end will generate branch tables for switches, and this
+allows the middle end to do things ever so slightly differently...
+
+TARGET_HAS_TAILCALL: I'd guess this asserts the target's ability to
+transform one function call into another (akin to `call foo / ret'
+but saves on stack by destroying the stack frame that the ret would
+destroy _before_ generating the one the call would generate). We can
+probably do that, and it's probably a Good Thing if we do.
+
+TARGET_HAS_TAILCALLR: my guess would be TAILCALL with address given
+by a register. Makes no difference to whether we can/should do it,
+IMO.
+
+TARGET_INLINES_MONADS: now if I knew what a monad was...
+
+TARGET_IS_BIG_ENDIAN: obvious.
+
+TARGET_IS_LITTLE_ENDIAN: obvious.
+
+TARGET_IS_*: we want I386 since this is referenced already in the
+COFF module. Let's keep the terminology we're given, and use
+TARGET_IS_I386 and not TARGET_IS_X86 or TARGET_IS_INTEL or anything
+odd.
+
+TARGET_KEEP_COMMENT: appears to relate to comment fields in the
+j-code.
+
+TARGET_LACKS_3WAY_COMPARE: define if you have to compare a specific
+condition (such as >=) rather than being able to issue one compare
+instruction and then be able to know whether you got <, = or >.
+
+TARGET_LACKS_DIVIDE_LITERALS: define if the target can't issue a
+divide instruction with an immediate operand.
+
+TARGET_LACKS_FP_DIVIDE: seems obvious.
+
+TARGET_LACKS_HALFWORD_STORE: so does this.
+
+TARGET_LACKS_MULDIV_LITERALS: define as a shorthand for defining
+both TARGET_LACKS_MULTIPLY_LITERALS and TARGET_LACKS_DIVIDE_LITERALS.
+
+TARGET_LACKS_MULTIPLY_LITERALS: define if the target can't issue a
+multiply instruction with an immediate operand.
+
+TARGET_LACKS_REMAINDER: obvious.
+
+TARGET_LACKS_RIGHTSHIFT: still obvious.
+
+TARGET_LACKS_ROL: apparently causes ROL to be faked by ROR'ing
+through 32-n places. This is supposedly Good, since it's done on ARM
+even though it doesn't have to be. Will investigate further.
+
+TARGET_LACKS_RR_STORE: seems to be some addressing mode or other.
+Not sure what or what it does.
+
+TARGET_LACKS_SIGNED_SHIFT: we've got one. Rock.
+
+TARGET_LACKS_UNSIGNED_FIX: looks float-related and somewhat odd.
+
+TARGET_LDRFK_MAX
+TARGET_LDRFK_MIN
+  Immediate float constants? We don't have 'em.
+
+TARGET_LDRK_MAX
+TARGET_LDRK_MIN
+This'll be a large number for Intel then. If it is indeed giving the
+maximum constant we can load at once as I believe it to be.
+
+TARGET_LDRK_QUANTUM: define if your target implements a function
+called `target_ldrk_quantum' which (FIXME) I don't know the purpose
+of.
+
+TARGET_LINKER_OMITS_DOLLAR: if not defined, certain standard
+routines come up with names like `x$multiply'. Otherwise we get
+`__multiply'. Presumably depends on whether your linker can handle
+it.
+
+TARGET_MACHINE: define to be a text description of the target, eg
+"Intel x86".
+
+TARGET_NOT_YET_J_ALIGNMENT: this is only checked once and commented
+"removed soon". Will ignore.
+
+TARGET_NULL_BITPATTERN: defined to be the bit pattern for a null
+pointer. Leaving it undefined makes it zero.
+
+TARGET_PREDEFINES: defined to be a string-array initialiser giving
+the pre-defined macros. Eg { "__i386__", "__CLK_TCK=FIXME",
+"__JMP_BUF_SIZE=FIXME"}.
+
+TARGET_RIGHTSHIFT(a,b): define if it is not ((a)>>(b)), ie if right
+shifts need to be done oddly. No idea what this is designed to
+allow.
+
+TARGET_SHARES_INTEGER_AND_FP_REGISTERS: we don't.
+
+TARGET_SPECIAL_ARG_REG: appears to define a special register used
+for some kind of argument.
+
+TARGET_STACKS_LINK: wibble. No idea.
+
+TARGET_STACK_MOVES_ONCE: yikes, appears to be to do with what
+happens _while_ things are being stacked at the start/end of
+functions. I suppose I just ignore it unless it bites me and then
+wonder what to do about it if that happens.
+
+TARGET_STRUCT_RESULT_REGISTER: the register in which small structs
+are returned from functions.
+
+TARGET_SWITCH_isdense: appears to give a target-specific function to
+determine whether a switch statement should be done densely or not.
+Tuneable, so we can make it trivial until we optimise. Eep, though.
+
+TARGET_SYSTEM: something like "Unix" or similar.
+
+TARGET_VTAB_ELTSIZE: defaults to 12, but I dunno what it is.
+
+TARGET_WANTS_FUNCTION_NAMES: may be to do with whether static
+functions have their names kept in the object file. Or it may not.

@@ -1,0 +1,469 @@
+Notes on middle/back end interface
+----------------------------------
+
+Functions that I was required to export from various modules:
+
+bool alterscc(Icode *)
+
+  Presumably tells whether some instruction alters the condition
+  codes or not. The alpha backend returns 1 always for this, which I
+  don't quite understand as the alpha doesn't even _have_ condition
+  codes.
+
+void branch_round_literals(LabelNumber *)
+
+  The purpose is obvious, but where it's supposed to send its output
+  to is far from obvious.
+
+bool immed_cmp(int32)
+
+  May well return true iff the supplied integer is one you can use
+  as an operand to an immediate compare. Not sure why this is
+  necessarily distinct from things like LDRK_MAX, but I'm willing to
+  believe it.
+
+int32 local_address(Binder *)
+
+  No idea what this one does.
+
+RealRegister local_base(Binder *)
+
+  Again, don't know.
+
+void localcg_reinit(void)
+void localcg_tidy(void)
+
+  Presumably allows local initialisation of something or other.
+  Possibly some functions in the backend are called from the code
+  generator and may want to init and cleanup around calls to the
+  code generator? The alpha backend stubs these to empty functions,
+  which seems sane to me until I work out what kinds of thing are
+  worth putting in there.
+
+void mcdep_init(void)
+
+  General init function, I assume. Got to come in handy at some
+  stage. Better check whether this function really is called before
+  _anything_ else in the backend.
+
+void setlabel(LabelNumber *)
+
+  Don't know.
+
+void show_instruction(J_OPCODE, VRegInt, VRegInt, VRegInt)
+
+  The main one. It passes in a j-code instruction that came from the
+  code generator. We're supposed to turn it into one (or more,
+  potentially) actual machine instructions and pass it on to
+  somewhere else. Precisely where is somewhat unclear, given that it
+  may go to the obj output stuff or the asm output stuff. We may be
+  able to hack it instead, given that we're _only_ doing asm and
+  don't need the full flexibility and generality, but it would be
+  nice to at least _try_ to use the prescribed interfaces.
+
+void asm_header(void)
+void asm_trailer(void)
+void display_assembly_code(Symstr *)
+
+  The asm backend. Presumably stuff coming out of show_instruction()
+  has to go to some other general place, which in turn will pass
+  Symstrs to either the asm or the obj backend, which must then
+  output useful things.
+
+void obj_init(void)
+void obj_header(void)
+void obj_trailer(void)
+int32 obj_symref(Symstr *, int, int32)
+void obj_codewrite(Symstr *)
+
+  The obj backend. Gets Symstrs in presumably exactly the same way,
+  and from the same place, as the asm backend does.
+
+bool mcdep_config_option(char, char [])
+
+  Configurable options in the back end? That's got to be useful, if
+  that's what it does, because here's where we put in target CPU
+  (486, 586, 686) for conditional-move capability and instruction
+  scheduler stuff.
+
+void config_init(void)
+
+  Another init function. When does this one get called, and what's
+  it supposed to initialise?
+
+KW_Status mcdep_keyword(const char *, int *, char **)
+
+  You what? What does that do? Alpha doesn't use it at all, so I'd
+  guess I don't have to either if I don't want to; but what _does_
+  it do?
+
+Types I've had to make use of:
+
+Binder
+bool           (easy)
+Icode
+int32          (easy)
+LabelNumber
+Symstr
+
+J-opcodes:
+
+  J-opcodes are divided into several fields.
+
+    J_TABLE_BITS (0x3ff) masks off the opcode number - there's room
+    for over 1000 distinct operations here.
+
+    J_WBIT (one bit) apparently qualifies the operation as being
+    `short' (I assume this is to do with short ints, or short
+    floats).
+
+    J_SIGNED (one bit) and J_UNSIGNED (one bit) qualify further.
+
+    J_ALIGNMENT (two bits, use this mask and then shift by
+    J_ALIGNPOS) defines alignment, though it's not clear of what.
+
+    J_NEGINDEX (one bit) qualifies loads and stores, presumably
+    allowing negative indexing from a base register in EA
+    calculation.
+
+    J_SHIFTMASK (eight bits, use this mask and shift by J_SHIFTPOS)
+    gives an eight-bit shift modifier. The actual shift count is
+    given by SHIFT_MASK (0x3f); further flags are SHIFT_ARITH (0x40)
+    and SHIFT_RIGHT (0x80).
+
+  The actual opcodes:
+
+    J_NOOP  (_J_GAP1+_J_GAP2)      - obvious.
+    J_LABEL  (_J_GAP1+_J_GAP2)     - apparently _defines_ a label.
+                                   - expects `LabelNumber *' in m.
+    J_B  (_J_GAP1+_J_GAP2)         - branch; may be conditional.
+                                   - expects `LabelNumber *' in m.
+    J_BXX  (_J_GAP1+_J_GAP2)       - branch to go in case table.
+                                   - expects `LabelNumber *' in m.
+
+    J_(LD|ST)R(|B|W|L|F|D)(K|R|VK|V):
+        - load/store to/from memory.
+        - Expects register number to load/store in r1
+	- r2 contains a base address for the load/store
+	- m contains either another register or a constant
+	- Suffix R means m is a register. K means m is constant.
+	  V/VK isn't clear to me since alpha doesn't use it. Nor
+	  does sparc. Both have J_STACKREF though.
+
+    J_LDR(|B|W|L|F|D)V1  (_jm(MEM_I)+_J_SET_R1+_J_STACKREF+_J_GAP2)
+        - It's got a V and a J_STACKREF, so I'm going to assume it's
+          incomprehensible.
+
+    J_PUSH(|B|W|L|F|D)R  (_J_READ_R1+_J_GAP2)
+        - My guess is that it pushes r1.
+    J_MOV(|B|W|L|F|D)K  (_J_SET_R1)
+    J_MOV(|B|W|L|F|D)R  (_J_READ_R3+_J_SET_R1+_J_REGMOVE+_J_GAP2)
+
+    J_(AND|ORR|EOR|ADD|MUL|SUB|DIV|RSB|REM|SHL|SHR)(K|R):
+        - The obvious operations.
+	- r1 is target, r2 and r3 are sources
+	- r3 can be constant (K) or register (R)
+	- all operations from SUB onwards get the J_ASYMDIAD flag,
+	  so presumably they want to make sure we know they're
+	  asymmetric
+
+    J_CMP(K|R): compare. Works like the SUB operations, presumably,
+          but has no destination. Destination goes to a condition
+	  code register - the alpha fakes one since it doesn't have
+	  a real one. This is painful but will at least work.
+
+    J_(ADD|SUB|MUL|DIV)(F|D)(K|R):
+        - Floating operations. As the integer variants, but operate
+          on FP registers. F/D is float/double.
+
+    J_CMP(F|D)(K|R): floating compare. Like CMP.
+
+    J_CALLK  (_J_SET_R1)
+    J_CALLR  (_J_READ_R3+_J_SET_R1)
+        - Apparently CALLR gets address from r3; CALLK expects
+	  `Symstr *' in m. Not sure what SET_R1 is all about, since
+	  AFAICT the Alpha version doesn't, particularly?
+
+    J_OPSYSK  (_J_SET_R1)
+        - What the hell does this do then? Why should a C compiler
+	  want to generate operating system traps?
+
+    J_CHK(NEF|NED|NE|L|U)(K|R)
+        - Seems to be range and bounds checking stuff; we apparently
+	  aren't required to do anything about them, so we can
+	  legitimately pretend we didn't see them.
+
+    CSE_LOADR  (_J_SET_R1)
+    CSE_WORD1  (_J_DOUBLE+_J_READ_R3+_J_SET_R1)
+    CSE_WORD2  (_J_DOUBLE+_J_READ_R3+_J_SET_R1)
+        - These don't seem to be real jopcodes: they seem to be used
+	  internally within the CSE code to act as placeholders, and
+	  it's just convenient to have them in the same numberspace
+	  as the jopcode set. We can ignore.
+
+    J_INIT  (_J_SET_R1+_J_GAP2)
+	- Alpha doesn't use this. What is it?
+
+    J_ENTER  (_J_GAP1+_J_GAP2)
+    J_ENDPROC  (_J_GAP1+_J_GAP2)
+	- Function entry/exit sequences.
+
+    J_ADCON  (_J_MEMA+_J_SET_R1)
+    J_ADCONF  (_J_MEMA+_J_SET_R1)
+    J_ADCOND  (_J_MEMA+_J_SET_R1)
+    J_ADCONV  (_J_MEMA+_J_SET_R1+_J_STACKREF)
+        - Apparently ADCON means `let r1 become r2 plus
+          value-of-symbol'. Expects Symstr * in m.
+	- ADCON[FD] are presumably floating, though not sure what
+          kind of floating.
+	- ADCONV I'm assuming is yet another of these mystical V
+	  references.
+
+    J_INLINE1  (_J_READ_R2+_J_SET_R1)
+    J_INLINE1F  (_J_FLOATING+_J_READ_R2+_J_SET_R1)
+    J_INLINE1D  (_J_DOUBLE+_J_READ_R2+_J_SET_R1)
+        - Have no idea what they are; but they appear to only happen
+          if TARGET_INLINES_MONADS, which (as it happens) I don't.
+
+    J_STRING  (_J_SET_R1)
+        - AFAICT, loads r1 with the address of a string. Needs a
+          StringSegList * in m, I think, but alpha doesn't use it so
+          it's fairly hard to pinpoint.
+
+    J_NEGR  (_J_READ_R3+_J_SET_R1+_J_GAP2)
+        - Set r1 to minus r3.
+
+    J_NOTR  (_J_READ_R3+_J_SET_R1+_J_GAP2)
+        - Set r1 to ~r3.
+
+    J_USEF  (_J_FLOATING+_J_READ_R1+_J_GAP2)
+    J_INITF  (_J_FLOATING+_J_SET_R1+_J_GAP2)
+    J_NEGFR  (_J_FLOATING+_J_READ_R3+_J_SET_R1+_J_GAP2)
+    J_FLTFR  (_J_FLOATING+_J_READ_R3+_J_SET_R1+_J_GAP2)
+    J_FIXFR  (_J_FLOATING+_J_READ_R3+_J_SET_R1+_J_GAP2)
+    J_MOVDFR  (_J_FLOATING+_J_READ_R3+_J_SET_R1+_J_GAP2)
+    J_MOVIFR  (_J_FLOATING+_J_READ_R3+_J_SET_R1)
+    J_USED  (_J_DOUBLE+_J_READ_R1+_J_GAP2)
+    J_INITD  (_J_DOUBLE+_J_SET_R1+_J_GAP2)
+    J_MOVIDR  (_J_DOUBLE+_J_READ_R3+_J_READ_R2+_J_SET_R1)
+    J_FLTDR  (_J_DOUBLE+_J_READ_R3+_J_SET_R1+_J_GAP2)
+    J_FIXDR  (_J_DOUBLE+_J_READ_R3+_J_SET_R1+_J_GAP2)
+    J_MOVFDR  (_J_DOUBLE+_J_READ_R3+_J_SET_R1+_J_GAP2)
+
+/*
+ * Things from here on are not needed for all targets.
+ */
+
+    J_CLRC  (_J_READ_R1)
+    J_MOVC  (_J_READ_R2+_J_READ_R1)
+    J_TAILCALLK  (_J_SET_R1)
+    J_TAILCALLR  (_J_READ_R3+_J_SET_R1)
+
+/* The following are not used at present, but may be sometime - when they
+ * are the numbering of jopcodes will probably need rearranging to fit these
+ * in somewhere better than at the end. Indeed some of these MAY be used now...
+ * but sort of experimentally!
+ */
+    J_COUNT  (_J_GAP1+_J_GAP2)
+    J_INFOLINE  (0)
+    J_INFOSCOPE  (_J_GAP1+_J_GAP2)
+    J_INFOBODY  (0)
+    J_RESULT2  (_J_READ_R3+_J_SET_R1)
+    J_FNCON  (_J_MEMA+_J_SET_R1)
+    J_MOVDIR  (_J_SET_R1+_J_SET_R2+_J_READ_R3)
+    J_MOVFIR  (_J_SET_R1+_J_READ_R3+_J_GAP2)
+    J_THUNKTABLE  (_J_GAP1)
+    J_EXTEND  (_J_SET_R1+_J_READ_R2)
+
+    J_RORK  (_J_READ_R2+_J_SET_R1+_J_ASYMDIAD)
+    J_RORR  (_J_READ_R3+_J_READ_R2+_J_SET_R1+_J_ASYMDIAD)
+
+    J_ORG  (_J_GAP1+_J_GAP2)
+    J_INFOCOM  (0)
+    J_PUSHM  (_J_GAP1+_J_GAP2)
+    J_POPMX  (_J_GAP1+_J_GAP2)
+    J_WORD  (_J_GAP1+_J_GAP2)
+    J_CONDEXEC  (_J_GAP1+_J_GAP2)
+    J_VSTORE  (_J_GAP1+_J_GAP2)
+    J_MOVLIR  (_J_SET_R1+_J_SET_R2+_J_READ_R3)
+    J_MOVILR  (_J_SET_R1+_J_READ_R2+_J_READ_R3)
+    J_SETSPGOTO  (_J_GAP1+_J_GAP2)
+    J_SETSP  (_J_GAP1)
+    J_CASEBRANCH  (_J_READ_R1)
+    J_USE  (_J_READ_R1+_J_GAP2)
+
+    J_SCCK  (_J_SET_R1)
+    J_BZ  (_J_READ_R2)
+
+/* #ifdef EXTENSION_FRAC */
+    J_XMULK  (_J_READ_R2+_J_SET_R1)
+    J_XMULR  (_J_READ_R3+_J_READ_R2+_J_SET_R1)
+    J_XDIVK  (_J_READ_R2+_J_SET_R1)
+    J_XDIVR  (_J_READ_R3+_J_READ_R2+_J_SET_R1)
+/* #endif EXTENSION_FRAC */
+    J_STACK  (_J_GAP1+_J_GAP2)
+    J_SETSPENV  (_J_GAP1+_J_GAP2)
+    J_MOVWIR  (_J_READ_R3+_J_SET_R1+_J_GAP2)
+    J_MOVI0WR  (_J_READ_R3+_J_SET_R1+_J_GAP2)
+    J_MOVI1WR  (_J_READ_R3+_J_SET_R1+_J_GAP2)
+    J_WSTRING  (_J_SET_R1)
+
+Flow of data
+------------
+
+Notes taken from alpha backend.
+
+Compiled code, in the form of jopcodes, finds its way into
+show_instruction. This calls:
+
+   correct_stack()   calls imm_op()
+   flush_adcon()   calls outRext()
+   outRext()     calls insert_one_peep()
+   outrelref()   calls outA32() and imm_op()
+   imm_op()      calls outA32()
+   outA32()      calls insert_one_peep()
+
+So it seems show_instruction basically always ends up calling
+insert_one_peep(). Which, in turn, does very little other than
+adding to some linked lists. I think we have a linked list of basic
+blocks, each of which contains a doubly linked list of mcpeepdata
+structures, which give the instruction along with things like
+dependency, register usage, etc. And show_instruction() just adds to
+this, through a variety of subfunctions.
+
+So once those have been generated, what reads them back and
+processes them further?
+
+Looks as if the big ones are flush_peepholer() and emit_code(),
+called at various points but notably at J_ENDPROC (ie we only buffer
+stuff in the above linked lists on a function-granular basis, and
+clear ourselves at the end of a function). flush_peepholer() appears
+to be a red herring, which doesn't actually emit anything but just
+reorganises and schedules things inside the linked lists (including
+re-linking them in a different order to take advantage of multiple
+issue, apparently, though it's slightly hard to tell).
+
+So emit_code() is it. emit_code() calls emit_one_peeped(), which
+passes things _back_ into the middle end through:
+
+   outcodeword()      which is a special case of ...
+   outcodewordaux()
+   gendcI()
+
+---------------------------------
+
+Special values for `LabelNumber *' variables: NOTALAB and RETLAB. Be
+aware of them.
+
+---------------------------------
+
+PEEPHOLING
+
+First priority: eliminate unnecessary register loads.
+
+   mov ecx,$SomeSymbol
+   mov edx,[ecx]
+
+should become
+
+   mov ecx,$SomeSymbol
+   mov edx,[$SomeSymbol]
+
+and then, provided the `dead' flag was set on that lot,
+ 
+   mov edx,[$SomeSymbol]   ; trashed the ECX load
+
+So. On some register writes (ADCON springs to mind in particular;
+possibly MOVR if that's easy; just conceivably ADDK/SUBK), we want
+to record that register {foo} contains a known value stored at
+{bar}.
+
+Then, next time that register is referenced for certain purposes
+(and it really is _certain purposes_, not just any old time, because
+it's better to use the register if we've got it in most cases), we
+can use the known value where possible.
+
+----------------------------------------------
+
+PENTIUM PIPELINING
+
+For each instruction we generate, we must have flags:
+
+(*) pairable in U pipe
+(*) pairable in V pipe
+(*) reads/writes memory-held data (load/store)
+(*) accesses stack (push/pop plus the specials in FIX/FLT)
+
+(neither means not pairable at all)
+
+Note that `accesses memory-held data' might actually access the
+stack part of RAM. But it won't be accessing the temporary stuff
+pushed and popped on the stack in the course of generating code,
+which is the distinction we actually draw.
+
+Then, for each instruction, we can build dependencies:
+
+(*) any insn reading a register is dependent on the last insn that
+    wrote that register, if that took place within the current bb
+
+(*) any insn _writing_ a register is dependent on the last insn that
+    read or wrote that register, to prevent causality problems...
+
+(*) any insn reading memory-held data is deemed dependent on the
+    last insn that wrote it (simple but effective, I suspect;
+    certainly more likely to work right than doing the job the
+    complex way and keeping track of writes to strange parts of the
+    data segment)
+
+(*) similarly, any insn writing memory-held data is deemed dependent
+    on the last insn that read or wrote it
+
+(*) any insn accessing the stack is deemed dependent on the last
+    such insn
+
+Now we reorder insns within a bb, after first trashing any insns
+discarded by the initial peephole pass, by means of:
+
+(*) Maintain a counter saying which pipe we're currently in: starts
+    at U.
+
+(*) At every stage, build up a list of the insns we _could_ issue
+    next, ie those insns with no unissued dependencies.
+
+(*) Choose one of those insns to issue next. This should be done
+    using some form of weighting: for example, if we're in the U
+    pipe, preference should be given to insns which can _only_ pair
+    in the U pipe. Also possibly preference should be given
+    depending on how much the order of execution is disrupted
+    (disrupting a little might be good; disrupting as much as
+    possible might _also_ be good on grounds of minimising the
+    chance of future AGIs). Finally, of course, give preference
+    based on the delay: `good' insns should pair in the correct
+    pipe, not access registers the previous U-insn has written if
+    they're being considered for the V pipe, and not suffer AGIs.
+    Preference scores may be lexicographically ordered; dunno what
+    will work well, really.
+
+(*) Issue that insn, update the `pipe counter', and go back to the
+    start.
+
+This is simple and quick; it gives what will hopefully be a `quite
+good' ordering, and by no means an optimal one. Optimality seems to
+be a hard problem, particularly given the vast array of arbitrary
+and unpleasant rules imposed on which insns pair with which in the
+Pentium. So `quite good' is probably the best we can hope to
+achieve.
+
+Notes on Pentium pairing:
+-------------------------
+
+  (*) mov [mem],eax pairs as if it writes to EAX due to a bug. Can
+      work around this if we code the non-short form of the
+      instruction (using a proper r/m), but this will require
+      modifying NASM.
+
+  (*) LEA reg,[reg*4] is an alternative to SHL reg,2. The latter
+      pairs only in the U-pipe, but the former may suffer AGI
+      stalls. You takes yer choice.
+
+  (*) MOVSX/MOVZX only pair in the U pipe _unless_ MMX is present.
