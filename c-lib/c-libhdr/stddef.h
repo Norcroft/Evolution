@@ -1,6 +1,3 @@
-#pragma force_top_level
-#pragma include_only_once
-
 /* stddef.h: ANSI 'C' (X3J11 Oct 88) library header, section 4.1.4 */
 /* Copyright (C) Codemist Ltd. */
 /* version 0.05 */
@@ -43,8 +40,13 @@ typedef int wchar_t;                         /* also in <stdlib.h> */
    /* null pointer constant. */
 #endif
 
+#ifdef _Codemist
+#define offsetof(type, member) \
+    ((size_t)((char *)&(((type *)0)->member) - (char *)0))
+#else
 #define offsetof(type, member) \
     ((size_t)((char *)&(((___type type *)0)->member) - (char *)0))
+#endif
    /*
     * expands to an integral constant expression that has type size_t, the
     * value of which is the offset in bytes, from the beginning of a structure

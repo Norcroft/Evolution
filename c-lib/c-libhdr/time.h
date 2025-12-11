@@ -1,6 +1,3 @@
-#pragma force_top_level
-#pragma include_only_once
-
 /* time.h: ANSI 'C' (X3J11 Oct 88) library header, section 4.12 */
 /* Copyright (C) Codemist Ltd. */
 /* version 0.02 */
@@ -30,8 +27,8 @@ typedef unsigned int size_t;   /* from <stddef.h> */
 #  define CLK_TCK         __CLK_TCK    /* Pre-Dec 88 Draft; under threat */
 #  define CLOCKS_PER_SEC  __CLK_TCK    /* Dec 1988 Draft                 */
 #else
-#  define CLK_TCK         100          /* for the BBC                    */
-#  define CLOCKS_PER_SEC  100          /* for the BBC                    */
+#  define CLK_TCK         1000000      /* unix microsec clock().         */
+#  define CLOCKS_PER_SEC  1000000      /* unix microsec clock().         */
    /* the number per second of the value returned by the clock function. */
 #endif
 

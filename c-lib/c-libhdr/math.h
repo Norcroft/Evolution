@@ -1,6 +1,3 @@
-#pragma force_top_level
-#pragma include_only_once
-
 /* math.h: ANSI 'C' (X3J11 Oct 88) library header, section 4.5 */
 /* Copyright (C) Codemist Ltd. */
 /* version 0.02 */
@@ -121,6 +118,40 @@ extern double fmod(double /*x*/, double /*y*/);
    /*          nonzero, the result has the same sign as x and magnitude */
    /*          less than the magnitude of y. If y is zero, a domain error */
    /*          occurs and -HUGE_VAL is returned. */
+
+/*
+ * Now single precision floating point versions
+ */
+
+extern float acosf(float /*x*/);
+extern float asinf(float /*x*/);
+extern float atanf(float /*x*/);
+extern float atan2f(float /*x*/, float /*y*/);
+extern float cosf(float /*x*/);
+extern float sinf(float /*x*/);
+extern float tanf(float /*x*/);
+extern float coshf(float /*x*/);
+extern float sinhf(float /*x*/);
+extern float tanhf(float /*x*/);
+extern float expf(float /*x*/);
+extern float frexpf(float /*value*/, int * /*exp*/);
+extern float ldexpf(float /*x*/, int /*exp*/);
+extern float logf(float /*x*/);
+extern float log10f(float /*x*/);
+extern float modff(float /*value*/, float * /*iptr*/);
+extern float powf(float /*x*/, float /*y*/);
+extern float sqrtf(float /*x*/);
+extern float ceilf(float /*x*/);
+extern float fabsf(float /*x*/);
+extern float floorf(float /*d*/);
+extern float fmodf(float /*x*/, float /*y*/);
+
+/*
+ * A couple of explicitly long double versions.
+ */
+
+extern long double _frexpl(long double /*value*/, int * /*exp*/);
+extern long double _ldexpl(long double /*x*/, int /*exp*/);
 
 #endif
 

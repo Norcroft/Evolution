@@ -1,5 +1,3 @@
-#pragma force_top_level
-#pragma include_only_once
 
 /* assert.h: ANSI 'C' (X3J11 Oct 88) library header, section 4.2 */
 /* Copyright (C) Codemist Ltd. */

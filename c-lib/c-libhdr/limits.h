@@ -1,6 +1,3 @@
-#pragma force_top_level
-#pragma include_only_once
-
 /* limits.h: ANSI 'C' (X3J11 Oct 88) library header, section 2.2.4.2 */
 /* Copyright (C) Codemist Ltd., 1988 */
 /* version 0.01 */

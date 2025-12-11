@@ -1,6 +1,3 @@
-#pragma force_top_level
-#pragma include_only_once
-
 /* stdarg.h: ANSI 'C' (X3J11 Oct 88) library header, section 4.8 */
 /* Copyright (C) Codemist Ltd. */
 /* version 3 */
@@ -31,6 +28,9 @@ typedef char *va_list;       /* see <stdio.h> */
 /* 'static', 'register', 'const' etc except that it has no effect! Its    */
 /* purpose is to indicate when a type is being introduced and thus        */
 /* help (a bit) when the user gets the args to va_arg the wrong way round */
+#ifdef _Codemist
+#define ___type
+#endif
 #ifdef __sparc
 #define __alignof(type) 4       /* all (incl. double) args are 4-aligned  */
 #else
@@ -43,10 +43,15 @@ typedef char *va_list;       /* see <stdio.h> */
    ((char *)((int)(ptr) + (__alignof(type)-1) & ~(__alignof(type)-1)))
 
 
+#ifdef _Codemist
+#define va_start(ap,parmN) \
+    (void)((ap) = (char *)&(parmN) + sizeof(parmN))
+#else
 #define va_start(ap,parmN) \
    (___assert((___typeof(parmN) & 0x481) == 0, \
               "Illegal type of 2nd argument to va_start"), \
     (void)((ap) = (char *)&(parmN) + sizeof(parmN)))
+#endif
    /*
     * The va_start macro shall be executed before any access to the unnamed
     * arguments. The parameter ap points to an object that has type va_list.
@@ -60,11 +65,17 @@ typedef char *va_list;       /* see <stdio.h> */
     * Returns: no value.
     */
 
+#ifdef _Codemist
+#define va_arg(ap,type) \
+   *(type *)(((ap)=__alignuptotype((ap),type)+sizeof(type))-\
+                     sizeof(___type type))
+#else
 #define va_arg(ap,type) \
    (___assert((___typeof(___type type) & 0x481) == 0, \
               "Illegal type used with va_arg"), \
    *(___type type *)(((ap)=__alignuptotype((ap),type)+sizeof(___type type))-\
                      sizeof(___type type)))
+#endif
    /*
     * The va_arg macro expands to an expression that has the type and value of
     * the next argument in the call. The parameter ap shall be the same as the

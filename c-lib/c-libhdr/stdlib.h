@@ -1,6 +1,3 @@
-#pragma force_top_level
-#pragma include_only_once
-
 /* stdlib.h: ANSI draft (X3J11 May 88) library header, section 4.10 */
 /* Copyright (C) Codemist Ltd. */
 /* Copyright (C) Acorn Computers Ltd., 1988 */

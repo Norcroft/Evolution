@@ -1,4 +1,3 @@
-
 /* signal.h: ANSI 'C' (X3J11 Oct 88) library header, section 4.7 */
 /* Copyright (C) Codemist Ltd. */
 /* version 0.03 */

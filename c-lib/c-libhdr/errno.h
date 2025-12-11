@@ -1,6 +1,3 @@
-#pragma force_top_level
-#pragma include_only_once
-
 /* errno.h: ANSI 'C' (X3J11 Oct 88) library header, section 4.1.3 */
 /* Copyright (C) Codemist Ltd. */
 /* version 1 */

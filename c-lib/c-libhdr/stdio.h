@@ -1,9 +1,12 @@
-#pragma force_top_level
-#pragma include_only_once
-
 /* stdio.h: ANSI 'C' (X3J11 Oct 88) library header, section 4.9 */
 /* Copyright (C) Codemist Ltd. */
-/* Copyright (C) Acorn Computers Ltd., 1988 */
+
+
+/* /* REVIEW THIS */
+          /* Copyright (C) Acorn Computers Ltd., 1988 */
+
+
+
 /* version 0.07 */
 
 /* AM July-88 changes to all prototypes so that                         */
@@ -20,6 +23,12 @@
 #define __stdio_h
 
 #ifdef __nec850
+
+#if 1
+/*
+ * This is a platform-specific option that relates to what underpinning the
+ * library is provided with.
+ */
 #define __system_io 1
 #endif
 
