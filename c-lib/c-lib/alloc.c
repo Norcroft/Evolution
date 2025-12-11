@@ -1,0 +1,167 @@
+/*
+  Title:        alloc - Storage management (dynamic allocation/deallocation)
+  $Revision: 1.1 $  John Fitch Oct 1990
+
+  Copyright (C) Codemist Ltd., 1990
+*/
+
+/*
+ * This version is for UNIX only.  It make assumptions about the use of SBRK
+ * but not much else.  Mechanism is first-fit, with lazy amalgamation of
+ * continguous free blocks.
+ */
+
+#include "hostsys.h"
+#include <string.h>
+#include <stdlib.h>
+
+#undef DEBUG
+
+typedef struct BlockStruct {
+  int			flag;
+  int			size;
+  struct BlockStruct	*cdr;
+} Block, *BlockP;
+
+#define FREEBIT		(1<<28)
+#define ACTIVEBIT	(2<<28)
+#define END_OF_HUNK	(4<<28)
+#define BYTES2WORDS(n)	((n)>>2)
+#define SIZE		BYTES2WORDS(sizeof(Block))
+
+#ifdef DEBUG
+#define _monitor(s) _ttywrite(s,sizeof(s),NULL)
+static int fd_n, fd_d, xxx;
+#define FD(i, b) {fd_n = i; fd_d = 1; \
+        while (fd_n >= b) {fd_d *= b; fd_n /= b;} fd_n = i; \
+	while(fd_d) {if ((fd_n/fd_d) > 9) { xxx = fd_n/fd_d+'a'-10; \
+			           _syscall3(SYS_write,0,(int)&xxx,1);} \
+                  else { xxx = fd_n/fd_d+'0'; \
+			 _syscall3(SYS_write,0,(int)&xxx,1);} \
+                  fd_n = fd_n-(fd_n/fd_d)*fd_d; fd_d /= b;}}
+#endif
+
+extern void* _sbrk(size_t);
+static BlockP heaps;
+static BlockP end_of_heap;
+
+void _init_alloc(void)
+{
+  heaps = NULL;
+  end_of_heap = NULL;
+}
+
+static char sys_message[60];
+
+static void _alloc_die(message)
+char *message;
+{
+  strcpy(sys_message, message);
+  _sysdie(sys_message);
+}
+
+void* malloc(size_t n)
+{
+  BlockP next = heaps;
+  BlockP *last = NULL;
+  int words = BYTES2WORDS(n+3);
+  if (n==0) return NULL;
+#ifdef DEBUG
+  _monitor("Malloc called "); FD(n,16) _monitor(" ");
+                              FD(words,16) _monitor("\n");
+#endif
+  if (words<0 || words>4*1024*1024) _sysdie("Too large an allocation\n");
+  while (next != NULL) {
+#ifdef DEBUG
+    _monitor("Next is "); FD((int)next,16) _monitor("\n");
+#endif
+    if (next->flag == FREEBIT && next->cdr->flag == FREEBIT &&
+	(int)next->cdr == ((int*)&next->cdr)[1+next->size]) {
+#ifdef DEBUG
+      _monitor("Amalgamate two chunks\n");
+#endif
+      next->size += next->cdr->size + SIZE;
+    }
+    else if (next->flag == FREEBIT && next->size == words) {
+#ifdef DEBUG
+      _monitor("Exact size found\n");
+#endif
+      next->size = ACTIVEBIT;
+      return &((int*)&next->cdr)[1];
+    }
+    else if (next->flag == FREEBIT &&
+	     next->size > words + SIZE) {
+				/* Split the block */
+      BlockP ans = (BlockP) ((int*)next->cdr)[next->size - words - SIZE];
+      next->size -= words + SIZE;
+      ans->cdr = next->cdr;
+      ans->size = words;
+      ans->flag = ACTIVEBIT;
+      return &((int*)&ans->cdr)[1];
+    }
+    else {
+      last = (BlockP*)next;
+      next = next->cdr;
+    }
+  }
+#ifdef DEBUG
+  _monitor("Getting more store\n");
+#endif
+  next = (BlockP)_sbrk(n+sizeof(Block));
+  if (next == (void*)-1) return (void*)0; /* Failed to get memory */
+  next->flag = ACTIVEBIT;
+  next->size = words;
+  next->cdr = NULL;
+  if (last == NULL) heaps = next;
+  else *last = next;
+  return &((int*)&next->cdr)[1];
+}
+
+void free(void* vblk)
+{
+  BlockP blk = (BlockP)vblk;
+  blk->flag = FREEBIT;
+/*   _monitor("Free called on "); FD((int)blk, 16) _monitor("\n"); */
+}
+
+extern void* calloc(count, size)
+size_t count;
+size_t size;
+{ void* r;
+/*
+ * This miserable code computes a full 64-bit product for count & size
+ * just so that it can verify that the said product really is in range
+ * for handing to malloc.
+ */
+  unsigned h = (count>>16)*(size>>16);
+  unsigned m1 = (count>>16)*(size&0xffff);
+  unsigned m2 = (count&0xffff)*(size>>16);
+  unsigned l = (count&0xffff)*(size&0xffff);
+  h += (m1>>16) + (m2>>16);
+  m1 = (m1&0xffff) + (m2&0xffff) + (l>>16);
+  l = (l&0xffff) | (m1<<16);
+  h += m1>>16;
+  if (h) l = (unsigned)(-1);
+  if (l >= 4*1024*1024) _sysdie("calloc called for too much");
+  r = malloc(l);
+  if (r != NULL) memset(r, 0, l);
+  return r;
+}
+
+void* _sys_alloc(size_t n)
+{
+  void *ans = malloc(n);
+  if (ans != NULL) return ans;
+  _alloc_die("No store left for I/O buffer or the like");
+  return 0;
+}
+
+void* realloc(void *p, size_t size)
+{
+  void *newp;
+/*  _monitor("Realloc\n"); */
+  newp = malloc(size);
+  if (p == NULL) return newp;
+  memcpy(newp, p, size);
+  return newp;
+}
